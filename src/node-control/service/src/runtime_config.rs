@@ -8,16 +8,20 @@
  */
 use anyhow::Context;
 use common::{
-    app_config::{AppConfig, KeyConfig, PoolConfig, WalletConfig},
+    app_config::{AppConfig, ElectionsConfig, KeyConfig, PoolConfig, WalletConfig},
     time_format,
+    ton_utils::extract_max_factor,
     vault_signer::VaultSigner,
 };
 use contracts::{
-    NominatorWrapper, NominatorWrapperImpl, TonWallet, WalletContract, contract_provider,
+    NominatorWrapper, SingleNominatorWrapper, TonCoreNominatorRouter, TonCoreNominatorWrapper,
+    TonWallet, WalletContract, contract_provider,
 };
 use secrets_vault::{
+    crypto::factory::CryptoFactory,
     types::{algorithm::Algorithm, secret_id::SecretId, secret_spec::SecretSpec},
     vault::SecretVault,
+    vault_block::BlockCryptoFactory,
     vault_builder::SecretVaultBuilder,
 };
 use std::{
@@ -37,8 +41,9 @@ pub struct RuntimeConfigStore {
     state: RwLock<Arc<RuntimeState>>,
     /// Unix timestamp of the last config mutation (seconds).
     updated_at: AtomicU64,
-    /// Path to the config file on disk, used for save/reload.
-    config_path: String,
+    /// Path to the config file on disk, used for save/reload. `None` in tests
+    /// that construct an in-memory store via [`Self::from_app_config`].
+    config_path: Option<String>,
     /// Hash of the last config file content we loaded, to detect external changes.
     last_file_hash: Mutex<Option<u64>>,
 }
@@ -71,6 +76,33 @@ impl std::fmt::Display for RuntimeConfigError {
 
 impl std::error::Error for RuntimeConfigError {}
 
+/// Error from [`RuntimeConfigStore::try_update_and_save`]: validation rejected the mutation (HTTP 400)
+/// or persistence / lock failure (HTTP 500).
+#[derive(Debug)]
+pub enum TryUpdateSaveError {
+    /// Closure rejected the update (e.g. merged config failed validation).
+    Rejected(String),
+    Persist(anyhow::Error),
+}
+
+impl std::fmt::Display for TryUpdateSaveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TryUpdateSaveError::Rejected(s) => f.write_str(s),
+            TryUpdateSaveError::Persist(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
+impl std::error::Error for TryUpdateSaveError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            TryUpdateSaveError::Persist(e) => Some(e.as_ref()),
+            TryUpdateSaveError::Rejected(_) => None,
+        }
+    }
+}
+
 // Public API for the runtime config
 pub trait RuntimeConfig: Send + Sync {
     fn get(&self) -> Arc<AppConfig>;
@@ -79,8 +111,10 @@ pub trait RuntimeConfig: Send + Sync {
     fn wallets(&self) -> Arc<HashMap<String, Arc<dyn TonWallet>>>;
     fn rpc_client(&self) -> Arc<ClientJsonRpc>;
     fn vault(&self) -> Option<Arc<SecretVault>>;
-    fn update_config(&self, f: Box<dyn FnOnce(&mut AppConfig) + Send>) -> anyhow::Result<()>;
-    fn save_to_file(&self);
+    /// Atomically applies the mutation and persists the resulting config.
+    /// Disk write happens before the in-memory swap, so a persistence failure
+    /// leaves the live runtime state unchanged.
+    fn update_and_save(&self, f: Box<dyn FnOnce(&mut AppConfig) + Send>) -> anyhow::Result<()>;
 }
 
 impl RuntimeConfigStore {
@@ -91,8 +125,11 @@ impl RuntimeConfigStore {
     pub async fn initialize(app_cfg: Arc<AppConfig>, config_path: String) -> anyhow::Result<Self> {
         let hash = Self::hash_file(&Path::new(&config_path));
 
-        let vault = Some(SecretVaultBuilder::from_env().await?);
+        let vault = Some(SecretVaultBuilder::from_env(BlockCryptoFactory {}.new_crypto()?).await?);
         let rpc_client = Self::load_rpc_client(&app_cfg).await?;
+        if let Some(elections) = app_cfg.elections.as_ref() {
+            Self::validate_max_factor(&rpc_client, elections).await?;
+        }
         let master_wallet =
             Self::load_master_wallet(&app_cfg, rpc_client.clone(), vault.clone()).await?;
         let wallets = Self::load_wallets(&app_cfg, rpc_client.clone(), vault.clone()).await?;
@@ -108,31 +145,53 @@ impl RuntimeConfigStore {
                 master_wallet,
             })),
             updated_at: AtomicU64::new(time_format::now()),
-            config_path,
+            config_path: Some(config_path),
             last_file_hash: Mutex::new(hash),
         })
     }
 
-    async fn reload(&self, new_config: AppConfig) -> anyhow::Result<()> {
-        let vault = SecretVaultBuilder::from_env().await.context("failed to reopen vault")?;
-        let rpc_client = Self::load_rpc_client(&new_config).await?;
+    async fn reload_state(&self) -> anyhow::Result<()> {
+        let cfg = self.get();
+        let vault = SecretVaultBuilder::from_env(BlockCryptoFactory {}.new_crypto()?)
+            .await
+            .context("failed to reopen vault")?;
+        let rpc_client = Self::load_rpc_client(&cfg).await?;
+        if let Some(elections) = cfg.elections.as_ref() {
+            Self::validate_max_factor(&rpc_client, elections).await?;
+        }
         let master_wallet =
-            Self::load_master_wallet(&new_config, rpc_client.clone(), Some(vault.clone())).await?;
-        let wallets =
-            Self::load_wallets(&new_config, rpc_client.clone(), Some(vault.clone())).await?;
-        let pools = Self::load_pools(&new_config, rpc_client.clone(), &wallets).await?;
+            Self::load_master_wallet(&cfg, rpc_client.clone(), Some(vault.clone())).await?;
+        let wallets = Self::load_wallets(&cfg, rpc_client.clone(), Some(vault.clone())).await?;
+        let pools = Self::load_pools(&cfg, rpc_client.clone(), &wallets).await?;
 
-        let new_state = Arc::new(RuntimeState {
-            config: Arc::new(new_config),
+        let mut guard =
+            self.state.write().map_err(|e| anyhow::anyhow!("state lock poisoned: {e}"))?;
+        *guard = Arc::new(RuntimeState {
+            config: guard.config.clone(),
             vault: Some(vault),
             pools,
             wallets,
             rpc_client,
             master_wallet,
         });
-        *self.state.write().map_err(|e| anyhow::anyhow!("state lock poisoned: {e}"))? = new_state;
         self.updated_at.store(time_format::now(), Ordering::Relaxed);
         Ok(())
+    }
+
+    async fn validate_max_factor(
+        rpc_client: &ClientJsonRpc,
+        elections: &ElectionsConfig,
+    ) -> anyhow::Result<()> {
+        match rpc_client.get_config_param(17).await.and_then(extract_max_factor) {
+            Ok(network_max_factor) => elections.validate(Some(network_max_factor)),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "cannot validate max_factor: failed to get config param 17; max_factor may be clamped"
+                );
+                elections.validate(None)
+            }
+        }
     }
 
     #[cfg(test)]
@@ -143,8 +202,8 @@ impl RuntimeConfigStore {
         struct NoopWallet;
         #[async_trait::async_trait]
         impl SmartContract for NoopWallet {
-            fn address(&self) -> MsgAddressInt {
-                MsgAddressInt::with_standart(None, 0, [0u8; 32].into()).unwrap()
+            async fn address(&self) -> anyhow::Result<MsgAddressInt> {
+                Ok(MsgAddressInt::with_standart(None, 0, [0u8; 32].into()).unwrap())
             }
             async fn balance(&self) -> anyhow::Result<u64> {
                 Ok(0)
@@ -183,6 +242,8 @@ impl RuntimeConfigStore {
             ClientJsonRpc::connect_many(
                 app_config.ton_http_api.resolved_endpoints(),
                 app_config.ton_http_api.api_key.clone(),
+                app_config.ton_http_api.resolved_timeouts(),
+                app_config.ton_http_api.resolved_freshness(),
             )
             .unwrap(),
         );
@@ -196,13 +257,49 @@ impl RuntimeConfigStore {
                 rpc_client,
             })),
             updated_at: AtomicU64::new(time_format::now()),
-            config_path: "noop".to_string(),
+            config_path: None,
             last_file_hash: Mutex::new(None),
         }
     }
 
+    /// Test-only: enable on-disk persistence for an in-memory store. Use when a test
+    /// needs to assert the saved JSON after `update_and_save`.
+    #[cfg(test)]
+    pub fn with_path(mut self, path: impl Into<String>) -> Self {
+        self.config_path = Some(path.into());
+        self
+    }
+
     pub fn updated_at(&self) -> u64 {
         self.updated_at.load(Ordering::Relaxed)
+    }
+
+    /// Resolves ADNL client configs for all configured nodes concurrently.
+    pub async fn node_adnl_configs(&self) -> HashMap<String, adnl::client::AdnlClientConfig> {
+        let config = self.get();
+        let vault = self.vault();
+
+        let mut set = tokio::task::JoinSet::new();
+        let mut sorted_nodes: Vec<_> =
+            config.nodes.iter().map(|(name, cfg)| (name.clone(), cfg.clone())).collect();
+        sorted_nodes.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+        for (node_id, cfg) in sorted_nodes {
+            let vault = vault.clone();
+            set.spawn(async move { (node_id, cfg.to_node_adnl_config(vault).await) });
+        }
+
+        set.join_all()
+            .await
+            .into_iter()
+            .filter_map(|(node_id, result)| match result {
+                Ok(config) => Some((node_id, config)),
+                Err(e) => {
+                    tracing::error!("node [{}] has wrong ADNL config: {}", node_id, e);
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Updates the config by cloning the current state, applying the mutation
@@ -228,42 +325,109 @@ impl RuntimeConfigStore {
         Ok(())
     }
 
-    /// Save the current in-memory config to the config file if it has changed.
-    /// Only saves the `bindings` `enable` field and `elections` section.
-    pub fn save_to_file(&self) {
-        let path = Path::new(&self.config_path);
-        let config = self.get();
-        match serde_json::to_string_pretty(&*config) {
-            Ok(json) => {
-                let current_hash = Self::hash_bytes(&json.as_bytes());
-                let last_hash = *self.last_file_hash.lock().expect("last_file_hash lock");
-                if Some(current_hash) == last_hash {
-                    return;
-                }
-                if let Err(e) = std::fs::write(path, &json) {
-                    tracing::error!("save config error: path='{}' error={}", path.display(), e);
-                } else {
-                    tracing::debug!("config saved to '{}'", path.display());
-                    // Update the file hash so we don't treat our own write as an external change.
-                    *self.last_file_hash.lock().expect("last_file_hash lock") = Some(current_hash);
-                }
-            }
-            Err(e) => {
-                tracing::error!("serialize config error: {}", e);
-            }
+    /// Serializes the given config and persists it to the config file if it
+    /// differs from the last write. Called from `update_and_save` so
+    /// the disk write happens before the in-memory swap.
+    fn save_to_file(&self, cfg: &AppConfig) -> anyhow::Result<()> {
+        let Some(path) = self.config_path.as_deref() else {
+            return Ok(());
+        };
+        let path = Path::new(path);
+        let json = serde_json::to_string_pretty(cfg)
+            .map_err(|e| anyhow::anyhow!("serialize config error: {e}"))?;
+        let current_hash = Self::hash_bytes(json.as_bytes());
+        let last_hash = *self.last_file_hash.lock().expect("last_file_hash lock");
+        if Some(current_hash) == last_hash {
+            return Ok(());
         }
+        std::fs::write(path, &json).map_err(|e| {
+            anyhow::anyhow!("save config error: path='{}' error={e}", path.display())
+        })?;
+        tracing::debug!("config saved to '{}'", path.display());
+        // Update the file hash so we don't treat our own write as an external change.
+        *self.last_file_hash.lock().expect("last_file_hash lock") = Some(current_hash);
+        Ok(())
+    }
+
+    /// Like [`Self::update_and_save`], but the mutation can abort without persisting or swapping
+    /// state. Use this when merging partial REST patches so concurrent readers see a consistent
+    /// baseline under the config lock (avoids lost-update races).
+    pub fn try_update_and_save<F>(&self, f: F) -> Result<(), TryUpdateSaveError>
+    where
+        F: FnOnce(&mut AppConfig) -> Result<(), String> + Send,
+    {
+        let mut guard = self.state.write().map_err(|e| {
+            TryUpdateSaveError::Persist(anyhow::anyhow!("state lock poisoned: {e}"))
+        })?;
+        let old = Arc::clone(&guard);
+        let mut cfg = (*old.config).clone();
+        f(&mut cfg).map_err(TryUpdateSaveError::Rejected)?;
+
+        self.save_to_file(&cfg).map_err(TryUpdateSaveError::Persist)?;
+
+        *guard = Arc::new(RuntimeState {
+            config: Arc::new(cfg),
+            vault: old.vault.clone(),
+            pools: Arc::clone(&old.pools),
+            wallets: Arc::clone(&old.wallets),
+            rpc_client: Arc::clone(&old.rpc_client),
+            master_wallet: Arc::clone(&old.master_wallet),
+        });
+        self.updated_at.store(time_format::now(), Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Atomically applies the mutation and persists the resulting config.
+    /// Disk write happens before the in-memory swap, so if persistence fails
+    /// the live runtime state is left unchanged (and the error is returned).
+    pub fn update_and_save<F>(&self, f: F) -> anyhow::Result<()>
+    where
+        F: FnOnce(&mut AppConfig) + Send,
+    {
+        match self.try_update_and_save(move |cfg| {
+            f(cfg);
+            Ok(())
+        }) {
+            Ok(()) => Ok(()),
+            Err(TryUpdateSaveError::Rejected(msg)) => Err(anyhow::anyhow!(
+                "unexpected rejection from infallible update_and_save closure: {msg}"
+            )),
+            Err(TryUpdateSaveError::Persist(e)) => Err(e),
+        }
+    }
+
+    /// Rebuild all cached runtime objects (vault, RPC client, wallets, pools)
+    /// from the current in-memory config. Does not read from disk.
+    ///
+    /// Use after REST mutations that change structural config (entities, endpoints).
+    pub async fn force_reload(&self) -> anyhow::Result<()> {
+        self.reload_state().await?;
+        Ok(())
+    }
+
+    /// Rebuild all cached runtime objects (vault, RPC client, wallets, pools)
+    /// from the given config. Does not read from disk.
+    ///
+    /// Use after config file has changed externally.
+    pub async fn reload(&self, config: AppConfig) -> anyhow::Result<()> {
+        let _ = self.update_with(|cfg| *cfg = config)?;
+        self.reload_state().await?;
+        Ok(())
     }
 
     /// Reload config from the file if it has changed externally.
     pub async fn reload_from_file(&self) -> bool {
-        let current_hash = Self::hash_file(&Path::new(&self.config_path));
+        let Some(path) = self.config_path.as_deref() else {
+            return false;
+        };
+        let current_hash = Self::hash_file(Path::new(path));
         let last_hash = *self.last_file_hash.lock().expect("last_file_hash lock");
         if current_hash == last_hash {
             return false;
         }
 
-        tracing::info!("config changed, reloading from '{}'", self.config_path);
-        match AppConfig::load(Path::new(&self.config_path)) {
+        tracing::info!("config changed, reloading from '{}'", path);
+        match AppConfig::load(Path::new(path)) {
             Ok(file_cfg) => match self.reload(file_cfg).await {
                 Ok(()) => {
                     *self.last_file_hash.lock().expect("last_file_hash lock") = current_hash;
@@ -275,7 +439,7 @@ impl RuntimeConfigStore {
                 }
             },
             Err(e) => {
-                tracing::error!("reload config error: path='{}' error={:#}", self.config_path, e);
+                tracing::error!("reload config error: path='{}' error={:#}", path, e);
                 false
             }
         }
@@ -295,8 +459,13 @@ impl RuntimeConfigStore {
     async fn load_rpc_client(app_cfg: &AppConfig) -> anyhow::Result<Arc<ClientJsonRpc>> {
         let resolved = app_cfg.ton_http_api.resolved_endpoints();
         let rpc_client = Arc::new(
-            ClientJsonRpc::connect_many(resolved.clone(), app_cfg.ton_http_api.api_key.clone())
-                .context("ton api connection error")?,
+            ClientJsonRpc::connect_many(
+                resolved.clone(),
+                app_cfg.ton_http_api.api_key.clone(),
+                app_cfg.ton_http_api.resolved_timeouts(),
+                app_cfg.ton_http_api.resolved_freshness(),
+            )
+            .context("ton api connection error")?,
         );
         let urls: Vec<&str> = resolved.iter().map(|(u, _)| u.as_str()).collect();
         tracing::info!("connected to ton api endpoints: {}", urls.join(", "));
@@ -316,7 +485,10 @@ impl RuntimeConfigStore {
         let master_wallet = open_wallet(&master_config, rpc_client, vault, true)
             .await
             .context("open master wallet")?;
-        tracing::info!("master wallet opened: address={}", master_wallet.address().to_string());
+        tracing::info!(
+            "master wallet opened: address={}",
+            master_wallet.address().await?.to_string()
+        );
         Ok(master_wallet)
     }
 
@@ -335,16 +507,18 @@ impl RuntimeConfigStore {
                 let validator_address = wallets
                     .get(node_name)
                     .context(format!("validator wallet not found: {}", node_name))?
-                    .address();
+                    .address()
+                    .await?;
                 let pool = open_nominator_pool(cfg, rpc_client.clone(), &validator_address)
                     .map_err(|e| {
                         anyhow::anyhow!("node [{}] open nominator pool error: {:#}", node_name, e)
                     })?;
-                tracing::info!(
-                    "[{}] opened nominator pool: address={}",
-                    node_name,
-                    pool.address().to_string()
-                );
+                let inner_pools = pool.inner_pools();
+                let mut addrs = Vec::with_capacity(inner_pools.len());
+                for p in inner_pools {
+                    addrs.push(p.address().await?.to_string());
+                }
+                tracing::info!("[{}] opened nominator pool(s): {}", node_name, addrs.join(", "));
                 map.insert(node_name.to_owned(), pool);
             }
         }
@@ -369,7 +543,7 @@ impl RuntimeConfigStore {
             tracing::info!(
                 "[{}] opened wallet: address={}",
                 node_name,
-                wallet.address().to_string()
+                wallet.address().await?.to_string()
             );
             map.insert(node_name.to_owned(), wallet);
         }
@@ -410,16 +584,12 @@ impl RuntimeConfig for RuntimeConfigStore {
         state.vault.clone()
     }
 
-    fn update_config(&self, f: Box<dyn FnOnce(&mut AppConfig) + Send>) -> anyhow::Result<()> {
-        self.update_with(f)
-    }
-
-    fn save_to_file(&self) {
-        RuntimeConfigStore::save_to_file(self)
+    fn update_and_save(&self, f: Box<dyn FnOnce(&mut AppConfig) + Send>) -> anyhow::Result<()> {
+        RuntimeConfigStore::update_and_save(self, f)
     }
 }
 
-async fn open_wallet(
+pub(crate) async fn open_wallet(
     wallet_config: &WalletConfig,
     rpc_client: Arc<ClientJsonRpc>,
     vault: Option<Arc<SecretVault>>,
@@ -476,14 +646,14 @@ fn open_nominator_pool(
                         .context(format!("invalid pool address: {}", address))?;
                     let owner_addr = MsgAddressInt::from_str(owner)
                         .context(format!("invalid pool owner address: {}", owner))?;
-                    let pool = NominatorWrapperImpl::from_init_data(
+                    let pool = SingleNominatorWrapper::from_init_data(
                         contract_provider!(rpc_client.clone()),
                         &owner_addr,
                         validator_addr,
                         -1,
                     )?;
                     let calculated_addr =
-                        NominatorWrapperImpl::calculate_address(-1, &owner_addr, validator_addr)?;
+                        SingleNominatorWrapper::calculate_address(-1, &owner_addr, validator_addr)?;
                     if calculated_addr != addr {
                         anyhow::bail!(
                             "calculated pool address does not match the defined address: defined={}, calculated={}",
@@ -496,7 +666,7 @@ fn open_nominator_pool(
                 (None, Some(owner)) => {
                     let owner_addr = MsgAddressInt::from_str(owner)
                         .context(format!("invalid pool owner address: {}", owner))?;
-                    NominatorWrapperImpl::from_init_data(
+                    SingleNominatorWrapper::from_init_data(
                         contract_provider!(rpc_client.clone()),
                         &owner_addr,
                         validator_addr,
@@ -506,7 +676,7 @@ fn open_nominator_pool(
                 (Some(address), None) => {
                     let addr = MsgAddressInt::from_str(address)
                         .context(format!("invalid pool address: {}", address))?;
-                    NominatorWrapperImpl::new(contract_provider!(rpc_client.clone()), addr)
+                    SingleNominatorWrapper::new(contract_provider!(rpc_client.clone()), addr)
                 }
                 (None, None) => {
                     anyhow::bail!("pool has neither address nor owner configured");
@@ -514,6 +684,55 @@ fn open_nominator_pool(
             };
             Ok(Arc::new(pool))
         }
-        _ => anyhow::bail!("unsupported pool kind"),
+        PoolConfig::TONCore { pools } => {
+            let provider = contract_provider!(rpc_client.clone());
+            let open_slot = |i: usize| -> anyhow::Result<Option<Arc<dyn NominatorWrapper>>> {
+                let Some(cfg) = &pools[i] else {
+                    return Ok(None);
+                };
+                match (&cfg.address, &cfg.params) {
+                    (Some(addr_str), None) => {
+                        let addr = MsgAddressInt::from_str(addr_str)
+                            .context(format!("invalid TONCore pool address: {addr_str}"))?;
+                        Ok(Some(Arc::new(TonCoreNominatorWrapper::new(provider.clone(), addr))
+                            as Arc<dyn NominatorWrapper>))
+                    }
+                    (_, Some(params)) => {
+                        if let Some(addr_str) = &cfg.address {
+                            let explicit = MsgAddressInt::from_str(addr_str)
+                                .context(format!("invalid TONCore pool address: {addr_str}"))?;
+                            let derived = TonCoreNominatorWrapper::calculate_address(
+                                validator_addr,
+                                params,
+                                cfg.deploy_mode,
+                            )?;
+                            anyhow::ensure!(
+                                explicit == derived,
+                                "TONCore pool address ({}) does not match derived address ({})",
+                                explicit,
+                                derived
+                            );
+                        }
+                        Ok(Some(Arc::new(TonCoreNominatorWrapper::from_init_data(
+                            provider.clone(),
+                            validator_addr,
+                            params,
+                            cfg.deploy_mode,
+                        )?) as Arc<dyn NominatorWrapper>))
+                    }
+                    (None, None) => {
+                        anyhow::bail!("TONCore pool slot {} has neither address nor params", i)
+                    }
+                }
+            };
+            let w0 = open_slot(0)?;
+            let w1 = open_slot(1)?;
+            if w0.is_none() && w1.is_none() {
+                anyhow::bail!(
+                    "TONCore pool has no configured slots; at least one pool slot must be configured"
+                );
+            }
+            Ok(Arc::new(TonCoreNominatorRouter::from_wrappers([w0, w1])))
+        }
     }
 }

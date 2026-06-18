@@ -252,6 +252,28 @@ pub enum CppCommand {
         hash: String,
     },
 
+    #[serde(rename = "compute_block_sync_overlay_id")]
+    ComputeBlockSyncOverlayId {
+        /// 32-byte validator session_id as hex
+        session_id: String,
+    },
+
+    #[serde(rename = "parse_simplex_config_v2")]
+    ParseSimplexConfigV2 {
+        /// base64-encoded standard BOC of a simplex_config_v2#22 cell
+        data: String,
+    },
+
+    #[serde(rename = "build_simplex_config_v2")]
+    BuildSimplexConfigV2 { enable_observers: bool, use_quic: bool, slots_per_leader_window: u32 },
+
+    #[serde(rename = "compute_block_sync_overlay_members")]
+    ComputeBlockSyncOverlayMembers {
+        prev: Vec<BlockSyncValidatorDescr>,
+        curr: Vec<BlockSyncValidatorDescr>,
+        next: Vec<BlockSyncValidatorDescr>,
+    },
+
     #[serde(rename = "enable_quic")]
     EnableQuic {},
 
@@ -270,8 +292,43 @@ pub enum CppCommand {
         timeout_ms: i64,
     },
 
+    #[serde(rename = "raptorq_encode")]
+    RaptorqEncode {
+        /// base64-encoded data to encode
+        data: String,
+        symbol_size: u32,
+        repair_count: u32,
+    },
+
+    #[serde(rename = "raptorq_decode")]
+    RaptorqDecode {
+        data_size: u32,
+        symbol_size: u32,
+        symbols_count: u32,
+        symbols: Vec<EncodedSymbol>,
+    },
+
     #[serde(rename = "shutdown")]
     Shutdown,
+}
+
+/// A single RaptorQ encoded symbol (id + base64 data)
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EncodedSymbol {
+    pub id: u32,
+    pub data: String, // base64
+}
+
+/// Minimal validator descriptor for `compute_block_sync_overlay_members`
+///
+/// Empty `addr` falls back to the pubkey short id (C++ `manager.cpp:2452`)
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BlockSyncValidatorDescr {
+    /// Raw 32-byte Ed25519 public key, hex-encoded
+    pub key: String,
+    /// 32-byte ADNL address (hex). Empty string means addr.is_zero() ->
+    /// derive from pubkey short id
+    pub addr: String,
 }
 
 /// Ready response from C++ node
@@ -309,6 +366,15 @@ pub struct ReceivedMessage {
     pub size: usize,
     pub data: String, // base64 encoded
     pub timestamp: i32,
+}
+
+/// Result from RaptorQ encode command
+#[derive(Debug, Clone)]
+pub struct RaptorqEncodeResult {
+    pub data_size: u32,
+    pub symbol_size: u32,
+    pub symbols_count: u32,
+    pub symbols: Vec<EncodedSymbol>,
 }
 
 /// Info about the C++ node
@@ -433,11 +499,20 @@ impl CppTestNode {
 
     /// Send a command and get response
     pub fn send_command(&mut self, cmd: &CppCommand) -> Result<CppResponse> {
+        self.send_command_with_timeout(cmd, DEFAULT_COMMAND_TIMEOUT)
+    }
+
+    /// Send a command and get response with a custom timeout
+    pub fn send_command_with_timeout(
+        &mut self,
+        cmd: &CppCommand,
+        timeout: Duration,
+    ) -> Result<CppResponse> {
         let json = serde_json::to_string(cmd)?;
         writeln!(self.stdin, "{}", json)?;
         self.stdin.flush()?;
 
-        let line = self.recv_line(DEFAULT_COMMAND_TIMEOUT)?;
+        let line = self.recv_line(timeout)?;
 
         if line.is_empty() {
             return Err(CompatTestError::InvalidResponse(
@@ -451,7 +526,16 @@ impl CppTestNode {
 
     /// Extract result value, returning error if response is an error
     fn expect_result(&mut self, cmd: &CppCommand) -> Result<serde_json::Value> {
-        let response = self.send_command(cmd)?;
+        self.expect_result_with_timeout(cmd, DEFAULT_COMMAND_TIMEOUT)
+    }
+
+    /// Extract result value with a custom timeout
+    fn expect_result_with_timeout(
+        &mut self,
+        cmd: &CppCommand,
+        timeout: Duration,
+    ) -> Result<serde_json::Value> {
+        let response = self.send_command_with_timeout(cmd, timeout)?;
         match response {
             CppResponse::Result { result } => Ok(result),
             CppResponse::Error { error } => Err(CompatTestError::CommandFailed(error)),
@@ -817,6 +901,90 @@ impl CppTestNode {
             .map_err(|e| CompatTestError::InvalidResponse(format!("Invalid base64 data: {}", e)))
     }
 
+    /// Compute the C++ side's `consensus.blockSyncOverlayId{session_id}` seed bytes
+    /// and the resulting OverlayIdShort. Returns `(seed_bytes, short_id_hex)`.
+    pub fn compute_block_sync_overlay_id(
+        &mut self,
+        session_id_hex: &str,
+    ) -> Result<(Vec<u8>, String)> {
+        let result = self.expect_result(&CppCommand::ComputeBlockSyncOverlayId {
+            session_id: session_id_hex.to_string(),
+        })?;
+        let seed_b64 = result["seed"]
+            .as_str()
+            .ok_or_else(|| CompatTestError::InvalidResponse("Expected 'seed'".to_string()))?;
+        let overlay_id = result["overlay_id"]
+            .as_str()
+            .ok_or_else(|| CompatTestError::InvalidResponse("Expected 'overlay_id'".to_string()))?
+            .to_string();
+        let seed = b64_decode(seed_b64)
+            .map_err(|e| CompatTestError::InvalidResponse(format!("Invalid base64 seed: {}", e)))?;
+        Ok((seed, overlay_id))
+    }
+
+    /// Ask C++ to unpack a `simplex_config_v2#22` cell. Returns the critical
+    /// fields the wire-format test cares about
+    pub fn parse_simplex_config_v2(&mut self, boc_b64: &str) -> Result<(bool, bool, u32)> {
+        let result =
+            self.expect_result(&CppCommand::ParseSimplexConfigV2 { data: boc_b64.to_string() })?;
+        let enable_observers = result["enable_observers"].as_bool().ok_or_else(|| {
+            CompatTestError::InvalidResponse("Expected 'enable_observers'".to_string())
+        })?;
+        let use_quic = result["use_quic"]
+            .as_bool()
+            .ok_or_else(|| CompatTestError::InvalidResponse("Expected 'use_quic'".to_string()))?;
+        let slots = result["slots_per_leader_window"].as_u64().ok_or_else(|| {
+            CompatTestError::InvalidResponse("Expected 'slots_per_leader_window'".to_string())
+        })?;
+        Ok((enable_observers, use_quic, slots as u32))
+    }
+
+    /// Ask C++ to build a `simplex_config_v2#22` cell from the given fields
+    /// and return the resulting standard-BOC bytes (base64)
+    pub fn build_simplex_config_v2(
+        &mut self,
+        enable_observers: bool,
+        use_quic: bool,
+        slots_per_leader_window: u32,
+    ) -> Result<Vec<u8>> {
+        let result = self.expect_result(&CppCommand::BuildSimplexConfigV2 {
+            enable_observers,
+            use_quic,
+            slots_per_leader_window,
+        })?;
+        let data_b64 = result["data"]
+            .as_str()
+            .ok_or_else(|| CompatTestError::InvalidResponse("Expected 'data'".to_string()))?;
+        b64_decode(data_b64)
+            .map_err(|e| CompatTestError::InvalidResponse(format!("Invalid base64 data: {}", e)))
+    }
+
+    /// Ask C++ to derive the sorted-unique ADNL id union from prev|curr|next sets
+    /// (C++ `manager.cpp:2440-2461`)
+    pub fn compute_block_sync_overlay_members(
+        &mut self,
+        prev: Vec<BlockSyncValidatorDescr>,
+        curr: Vec<BlockSyncValidatorDescr>,
+        next: Vec<BlockSyncValidatorDescr>,
+    ) -> Result<Vec<String>> {
+        let result =
+            self.expect_result(&CppCommand::ComputeBlockSyncOverlayMembers { prev, curr, next })?;
+        let arr = result["members"]
+            .as_array()
+            .ok_or_else(|| CompatTestError::InvalidResponse("Expected 'members'".to_string()))?;
+        let mut out = Vec::with_capacity(arr.len());
+        for v in arr {
+            let s = v
+                .as_str()
+                .ok_or_else(|| {
+                    CompatTestError::InvalidResponse("members[] entry must be string".to_string())
+                })?
+                .to_string();
+            out.push(s);
+        }
+        Ok(out)
+    }
+
     // ---- QUIC ----
 
     /// Enable QUIC transport (creates QuicSender, listens on udp_port + 1000)
@@ -854,6 +1022,65 @@ impl CppTestNode {
             .ok_or_else(|| CompatTestError::InvalidResponse("Expected answer".to_string()))?;
         b64_decode(answer_b64)
             .map_err(|e| CompatTestError::InvalidResponse(format!("Invalid base64 answer: {}", e)))
+    }
+
+    // ---- RaptorQ ----
+
+    /// Longer timeout for RaptorQ commands that transfer large base64 payloads.
+    const RAPTORQ_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+
+    /// Encode data using C++ RaptorQ encoder.
+    /// Returns (params, symbols) where params = (data_size, symbol_size, symbols_count).
+    pub fn raptorq_encode(
+        &mut self,
+        data: &[u8],
+        symbol_size: u32,
+        repair_count: u32,
+    ) -> Result<RaptorqEncodeResult> {
+        let result = self.expect_result_with_timeout(
+            &CppCommand::RaptorqEncode { data: b64_encode(data), symbol_size, repair_count },
+            Self::RAPTORQ_COMMAND_TIMEOUT,
+        )?;
+        let data_size = result["data_size"]
+            .as_u64()
+            .ok_or_else(|| CompatTestError::InvalidResponse("Missing data_size".into()))?
+            as u32;
+        let sym_size = result["symbol_size"]
+            .as_u64()
+            .ok_or_else(|| CompatTestError::InvalidResponse("Missing symbol_size".into()))?
+            as u32;
+        let symbols_count = result["symbols_count"]
+            .as_u64()
+            .ok_or_else(|| CompatTestError::InvalidResponse("Missing symbols_count".into()))?
+            as u32;
+        let symbols: Vec<EncodedSymbol> = serde_json::from_value(result["symbols"].clone())
+            .map_err(|e| CompatTestError::InvalidResponse(format!("Bad symbols: {}", e)))?;
+        Ok(RaptorqEncodeResult { data_size, symbol_size: sym_size, symbols_count, symbols })
+    }
+
+    /// Decode symbols using C++ RaptorQ decoder.
+    /// Returns decoded data bytes.
+    pub fn raptorq_decode(
+        &mut self,
+        data_size: u32,
+        symbol_size: u32,
+        symbols_count: u32,
+        symbols: &[EncodedSymbol],
+    ) -> Result<Vec<u8>> {
+        let result = self.expect_result_with_timeout(
+            &CppCommand::RaptorqDecode {
+                data_size,
+                symbol_size,
+                symbols_count,
+                symbols: symbols.to_vec(),
+            },
+            Self::RAPTORQ_COMMAND_TIMEOUT,
+        )?;
+        let data_b64 = result["data"]
+            .as_str()
+            .ok_or_else(|| CompatTestError::InvalidResponse("Expected 'data'".to_string()))?;
+        b64_decode(data_b64)
+            .map_err(|e| CompatTestError::InvalidResponse(format!("Invalid base64: {}", e)))
     }
 
     // ---- Lifecycle ----

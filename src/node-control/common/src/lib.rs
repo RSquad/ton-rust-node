@@ -8,6 +8,7 @@
  */
 pub mod app_config;
 pub mod clap_utils;
+pub mod clock;
 pub mod log;
 pub mod os_signals;
 pub mod password;

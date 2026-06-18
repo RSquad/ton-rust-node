@@ -52,10 +52,10 @@ pub(super) fn execute_extra_balance(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("GETEXTRABALANCE"))?;
     fetch_stack(engine, 1)?;
     let index = engine.cmd.var(0).as_integer_value(0..=u32::MAX)?;
-    let extra = engine.smci_param(7)?.tuple_item_ref(7)?.as_dict()?;
+    let extra = engine.smci_param(7)?.tuple_item_ref(1)?.as_dict()?;
     let dict = HashmapE::with_hashmap(32, extra.cloned());
     let key = index.write_to_bitstring()?;
-    let value = if let Some(mut slice) = dict.get(key)? {
+    let value = if let Some(mut slice) = dict.get_with_gas(key, engine)? {
         StackItem::int(VarUInteger32::construct_from(&mut slice)?.inner())
     } else {
         StackItem::int(0)
@@ -260,12 +260,9 @@ pub(super) fn execute_calc_storage_fee(engine: &mut Engine) -> Status {
         engine.cc.stack.push(StackItem::int(0));
     } else {
         let prices = StoragePrices::construct_from(&mut slice.clone())?;
-        engine.cc.stack.push(StackItem::int(prices.calc_storage_fee(
-            cells,
-            bits,
-            delta,
-            is_masterchain,
-        )));
+        let fee = prices.calc_storage_fee_part(cells, bits, delta, is_masterchain);
+        let fee = (fee + 0xffffu32) >> 16;
+        engine.cc.stack.push(StackItem::int(fee));
     }
     Ok(())
 }

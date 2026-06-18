@@ -7,7 +7,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::{
-    utils::MetricsHandle, BlockPayloadPtr, ConsensusNode, ConsensusOverlay,
+    utils::MetricsHandle, BlockPayloadPtr, ConsensusCommonFactory, ConsensusNode, ConsensusOverlay,
     ConsensusOverlayListenerPtr, ConsensusOverlayLogReplayListenerPtr, ConsensusOverlayManager,
     ConsensusOverlayManagerPtr, ConsensusOverlayPtr, OverlayTransportType, PrivateKey,
     PublicKeyHash, QueryResponseCallback, Result,
@@ -18,16 +18,18 @@ use adnl::{
         TimedAnswer, Wait,
     },
     node::{AdnlNode, AdnlSendMethod},
-    CatchainData, DhtNode, NetworkStack, OverlayNode, OverlayParams, PrivateOverlayShortId,
+    BroadcastCheck, CatchainData, DhtNode, NetworkStack, OverlayNode, OverlayParams,
+    PrivateOverlayShortId,
 };
 use std::{
     any::Any,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Weak,
+        Arc, Mutex, Weak,
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -36,7 +38,10 @@ use ton_api::{
     deserialize_boxed, serialize_bare, serialize_boxed, serialize_boxed_append,
     ton::{
         catchain::BroadcastWrapper,
-        consensus::simplex::{Certificate as SimplexCertificate, Vote as SimplexVote},
+        consensus::{
+            simplex::{Certificate as SimplexCertificate, Vote as SimplexVote},
+            RequestError as ConsensusRequestError,
+        },
         overlay::{
             broadcast::BroadcastTwostepSimple, broadcast_twostep::id::Id as BroadcastTwostepId,
             broadcast_twostep_simple::tosign::ToSign as BroadcastTwostepSimpleToSign,
@@ -48,6 +53,26 @@ use ton_api::{
 use ton_block::{error, fail, sha256_digest, KeyId, KeyOption, UInt256};
 
 const LOG_TARGET: &str = "consensus_adnl_overlay";
+
+fn describe_query_response_error(error: &ConsensusRequestError) -> &'static str {
+    match error {
+        ConsensusRequestError::Consensus_RequestError => "consensus.requestError",
+    }
+}
+
+fn extract_query_response_error(data: &[u8]) -> Option<String> {
+    let message = deserialize_boxed(data).ok()?;
+    let error = message.downcast::<ConsensusRequestError>().ok()?;
+    Some(describe_query_response_error(&error).to_string())
+}
+
+fn normalize_query_response_payload(data: Vec<u8>) -> Result<BlockPayloadPtr> {
+    if let Some(error_name) = extract_query_response_error(data.as_slice()) {
+        return Err(error!("Peer returned {}", error_name));
+    }
+
+    Ok(ConsensusCommonFactory::create_block_payload(data))
+}
 
 /// Stream tags for task processor routing in ADNL overlay
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -591,7 +616,7 @@ impl Peer {
                         }
 
                         // Add new address
-                        let add_result = self.overlay_node.add_private_peers(
+                        let add_result = self.overlay_node.add_private_peers_to_adnl(
                             &self.src_adnl_addr,
                             vec![(adnl_addr, quic_addr, key)],
                         );
@@ -691,12 +716,12 @@ impl Drop for Peer {
 */
 
 struct PeerStorage {
-    peers: Arc<std::sync::Mutex<HashMap<(Arc<KeyId>, Arc<KeyId>), Weak<Peer>>>>,
+    peers: Arc<Mutex<HashMap<(Arc<KeyId>, Arc<KeyId>), Weak<Peer>>>>,
 }
 
 impl PeerStorage {
     fn new() -> Self {
-        Self { peers: Arc::new(std::sync::Mutex::new(HashMap::new())) }
+        Self { peers: Arc::new(Mutex::new(HashMap::new())) }
     }
 
     /// Get or create peer for given src/dst ADNL addresses
@@ -866,7 +891,7 @@ struct AdnlOverlay {
     local_id: PublicKeyHash,                 //local validator key hash
     local_validator_key: Arc<dyn KeyOption>, //local validator key for signing broadcasts
     local_adnl_key: Arc<dyn KeyOption>,      //local ADNL key for two-step broadcast signing
-    adnl_to_validator: HashMap<PublicKeyHash, PublicKeyHash>, //ADNL key hash → validator key hash
+    adnl_to_validator: HashMap<PublicKeyHash, PublicKeyHash>, //ADNL key hash to validator key hash
     all_node_ids: Vec<PublicKeyHash>, //all node ADNL IDs in the overlay for multicast emulation of broadcast messages
     listener: ConsensusOverlayListenerPtr, //consensus overlay listener for incoming events
     stop_requested: Arc<AtomicBool>,  //atomic flag indicating if overlay stop is requested
@@ -877,10 +902,103 @@ struct AdnlOverlay {
     is_tcp_available: bool,           //flag indicating if TCP or QUIC is available for multicast
     is_quic_available: bool,          //flag indicating if QUIC transport is available
     task_processor_manager: TaskProcessorManager, //task processor manager for sequential processing
+    /// Short id of the parallel block-sync overlay; `Some` when `enable_observers=true`
+    /// routes candidate broadcasts here instead of the consensus private overlay
+    block_sync_overlay_id: Option<Arc<PrivateOverlayShortId>>,
+    /// Consumer for the block-sync overlay (paired with `block_sync_overlay_id`)
+    block_sync_consumer: Option<Arc<AdnlOverlayConsumer>>,
+    /// ADNL pubkey hashes of the current validator set; sender check on receive
+    block_sync_authorized: HashSet<PublicKeyHash>,
+    /// Cumulative counters for the block-sync overlay; `Some` together with `block_sync_overlay_id`
+    block_sync_stats: Option<Arc<crate::BlockSyncStats>>,
+}
+
+/// Broadcast auth for the block-sync overlay (C++ `OverlayPrivacyRules`).
+pub struct BlockSyncCheck {
+    pub overlay_id: Arc<PrivateOverlayShortId>,
+    pub authorized: HashSet<PublicKeyHash>,
+    pub max_payload_size: u32,
+    /// Ordered current-set ADNL pubkey hashes; index gives the leader for a slot bucket
+    pub current_set: Vec<PublicKeyHash>,
+    /// simplex_config_v2.slots_per_leader_window
+    pub slots_per_leader_window: u32,
+    /// Optional counters; bumped on every Err return and on leader-schedule mismatch
+    pub stats: Option<Arc<crate::BlockSyncStats>>,
+}
+
+impl BlockSyncCheck {
+    fn drop_with(&self, reason: String) -> Result<()> {
+        if let Some(stats) = &self.stats {
+            stats.bump_precheck_drop();
+        }
+        fail!("BlockSync overlay {}: {reason}", self.overlay_id)
+    }
+}
+
+impl BroadcastCheck for BlockSyncCheck {
+    fn on_send(&self, src: &Arc<KeyId>, payload_size: usize) -> Result<()> {
+        if !self.authorized.contains(src) {
+            return self.drop_with(format!("sender {src} not authorized to originate broadcasts"));
+        }
+        if payload_size as u64 > self.max_payload_size as u64 {
+            return self.drop_with(format!(
+                "payload size {payload_size} exceeds authorized cap {}",
+                self.max_payload_size
+            ));
+        }
+        Ok(())
+    }
+
+    fn on_recv(&self, src: &Arc<KeyId>, extra: Option<&[u8]>) -> Result<()> {
+        // (1) sender authority check
+        if !self.authorized.contains(src) {
+            return self.drop_with(format!("sender {src} not in current-set authorized_keys"));
+        }
+        // (2) parse extra as consensus.broadcastExtra
+        let Some(extra_bytes) = extra else {
+            return self.drop_with("missing broadcastExtra".to_string());
+        };
+        let extra_obj: ton_api::ton::consensus::BroadcastExtra =
+            match ton_api::deserialize_boxed(extra_bytes) {
+                Ok(obj) => match obj.downcast() {
+                    Ok(e) => e,
+                    Err(_) => {
+                        return self.drop_with(
+                            "broadcastExtra deserialization wrong constructor".to_string(),
+                        );
+                    }
+                },
+                Err(e) => return self.drop_with(format!("broadcastExtra parse failed: {e}")),
+            };
+        let slot = *extra_obj.slot();
+        if slot < 0 {
+            return self.drop_with(format!("broadcastExtra.slot={slot} is negative"));
+        }
+        // (3) expected leader check (defensive guards on empty/zero schedule)
+        if self.current_set.is_empty() || (self.slots_per_leader_window == 0) {
+            return Ok(());
+        }
+        let leader_idx = ((slot as u64) / (self.slots_per_leader_window as u64))
+            % (self.current_set.len() as u64);
+        let expected = &self.current_set[leader_idx as usize];
+        if src != expected {
+            if let Some(stats) = &self.stats {
+                stats.bump_leader_mismatch();
+            }
+            return self.drop_with(format!(
+                "leader-schedule mismatch: sender {src} != expected {expected} for slot {slot} \
+                 (leader_idx={leader_idx}, window={}, N={})",
+                self.slots_per_leader_window,
+                self.current_set.len(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl AdnlOverlay {
     /// Create new overlay implementation
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         runtime_handle: tokio::runtime::Handle,
         stack: Arc<NetworkStack>,
@@ -892,18 +1010,19 @@ impl AdnlOverlay {
         track_private_peers: bool,
         peer_storage: Arc<PeerStorage>,
         transport_type: OverlayTransportType,
+        block_sync_params: Option<crate::BlockSyncOverlayParams>,
     ) -> Result<Arc<Self>> {
+        // Set by simplex via with_overlay_id; None = no block-sync overlay.
+        let block_sync_overlay_id = block_sync_params.as_ref().and_then(|p| p.overlay_id.clone());
         let local_id = local_validator_key.id();
         let allow_tcp_communication = transport_type.allow_tcp();
         let use_quic = transport_type.use_quic();
 
         log::debug!(
             target: LOG_TARGET,
-            "Creating new AdnlOverlay: overlay_id={}, local_id={}, nodes_count={}, transport={:?}",
-            overlay_id,
-            local_id,
-            nodes.len(),
-            transport_type,
+            "Creating new AdnlOverlay: overlay_id={overlay_id}, local_id={local_id}, \
+            nodes_count={}, transport={transport_type:?}",
+            nodes.len()
         );
 
         // Find local ADNL key from nodes by matching local_id
@@ -916,8 +1035,7 @@ impl AdnlOverlay {
                 local_adnl_key = Some(stack.adnl.key_by_id(&node.adnl_id)?);
                 log::trace!(
                     target: LOG_TARGET,
-                    "Found local ADNL key: local_id={}, adnl_id={}",
-                    local_id,
+                    "Found local ADNL key: local_id={local_id}, adnl_id={}",
                     node.adnl_id
                 );
                 continue; // Skip adding local node to peers
@@ -939,7 +1057,6 @@ impl AdnlOverlay {
         let quic_enabled = if use_quic {
             if let Some(quic) = &stack.quic {
                 // Register local validator's ADNL key as a TLS identity on a per-port endpoint
-                let key_bytes: [u8; 32] = *local_adnl_key.pvt_key()?;
                 let ip_addr = stack.adnl.ip_address_adnl();
                 let quic_port =
                     ip_addr.port().checked_add(adnl::QuicNode::OFFSET_PORT).ok_or_else(|| {
@@ -949,11 +1066,12 @@ impl AdnlOverlay {
                             adnl::QuicNode::OFFSET_PORT
                         )
                     })?;
-                let bind_addr = std::net::SocketAddr::new(
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                    quic_port,
-                );
-                quic.add_key(&key_bytes, local_adnl_key.id(), bind_addr)?;
+                let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), quic_port);
+                quic.add_key(
+                    (&local_adnl_key.pvt_key()?.lock()? as &[u8]).try_into()?,
+                    local_adnl_key.id(),
+                    bind_addr,
+                )?;
                 log::info!(
                     target: LOG_TARGET,
                     "Registered QUIC key for local ADNL id={}",
@@ -983,7 +1101,69 @@ impl AdnlOverlay {
             overlay_id: &overlay_id,
             runtime: Some(runtime_handle.clone()),
         };
-        stack.overlay.add_private_overlay(params, &local_adnl_key, &peers, use_quic)?;
+        stack.overlay.add_private_overlay(params, &local_adnl_key, &peers, use_quic, None)?;
+
+        // create the parallel block-sync overlay when enable_observers=true.
+        // Membership is the prev|curr|next mc validator union (block_sync_params.members),
+        // separate from the consensus session's `peers` (which is the current session subset).
+        // Authorized senders are the current set only with per-key payload caps
+        let (block_sync_overlay_id, block_sync_authorized, block_sync_stats) = match (
+            block_sync_overlay_id,
+            block_sync_params,
+        ) {
+            (Some(bs_id), Some(bs_params)) => {
+                // Skip overlay creation if our ADNL key isn't in any of prev|curr|next
+                if !bs_params.members.contains(local_adnl_key.id()) {
+                    log::warn!(
+                        target: LOG_TARGET,
+                        "BlockSync: local ADNL key {} not in block-sync members; skipping overlay creation",
+                        local_adnl_key.id()
+                    );
+                    (None, HashSet::new(), None)
+                } else {
+                    let bs_params_for_log =
+                        (bs_params.members.len(), bs_params.authorized_keys.len());
+                    let bs_authorized: HashSet<PublicKeyHash> =
+                        bs_params.authorized_keys.keys().cloned().collect();
+                    let stats = crate::BlockSyncStats::new(
+                        bs_id.clone(),
+                        crate::BlockSyncRole::Validator,
+                        bs_params.shard.clone(),
+                        bs_params.session_id.clone(),
+                    );
+                    let check: Arc<dyn BroadcastCheck> = Arc::new(BlockSyncCheck {
+                        overlay_id: bs_id.clone(),
+                        authorized: bs_authorized.clone(),
+                        max_payload_size: bs_params.max_broadcast_size,
+                        current_set: bs_params.current_set.clone(),
+                        slots_per_leader_window: bs_params.slots_per_leader_window,
+                        stats: Some(stats.clone()),
+                    });
+                    let bs_overlay_params = OverlayParams {
+                        flags: 0,
+                        hops: broadcast_hops,
+                        overlay_id: &bs_id,
+                        runtime: Some(runtime_handle.clone()),
+                    };
+                    stack.overlay.add_private_overlay(
+                        bs_overlay_params,
+                        &local_adnl_key,
+                        &bs_params.members,
+                        use_quic,
+                        Some(check),
+                    )?;
+                    log::info!(
+                        target: LOG_TARGET,
+                        "created block-sync overlay {bs_id} (members={}, authorized={}, \
+                         leader_window={}, current_set_len={})",
+                        bs_params_for_log.0, bs_params_for_log.1,
+                        bs_params.slots_per_leader_window, bs_params.current_set.len(),
+                    );
+                    (Some(bs_id), bs_authorized, Some(stats))
+                }
+            }
+            _ => (None, HashSet::new(), None),
+        };
 
         let stop_requested = Arc::new(AtomicBool::new(false));
 
@@ -1012,6 +1192,8 @@ impl AdnlOverlay {
 
         // Create overlay instance (without consumer)
         let local_id = local_id.clone();
+        let block_sync_overlay_id_for_cyclic = block_sync_overlay_id.clone();
+        let block_sync_stats_for_cyclic = block_sync_stats.clone();
         let overlay = Arc::new_cyclic(|weak_overlay| {
             // Create consumer with weak reference to overlay
             let consumer = Arc::new(AdnlOverlayConsumer::new(
@@ -1019,6 +1201,15 @@ impl AdnlOverlay {
                 weak_overlay.clone(),
                 stop_requested.clone(),
             ));
+
+            // Paired consumer for the block-sync overlay; same dispatcher as the consensus one
+            let block_sync_consumer = block_sync_overlay_id_for_cyclic.as_ref().map(|bs_id| {
+                Arc::new(AdnlOverlayConsumer::new(
+                    bs_id.clone(),
+                    weak_overlay.clone(),
+                    stop_requested.clone(),
+                ))
+            });
 
             // Point-to-point multicast is used for broadcasts when TCP transport is available
             let is_tcp_available = stack.is_tcp_available() && allow_tcp_communication;
@@ -1070,11 +1261,26 @@ impl AdnlOverlay {
                 is_quic_available: quic_enabled,
                 all_node_ids: all_node_ids,
                 task_processor_manager,
+                block_sync_overlay_id: block_sync_overlay_id_for_cyclic.clone(),
+                block_sync_consumer,
+                block_sync_authorized,
+                block_sync_stats: block_sync_stats_for_cyclic.clone(),
             }
         });
 
         // Add consumer to overlay node for message handling
         overlay.stack.overlay.add_consumer(&overlay_id, overlay.consumer.clone())?;
+
+        if let (Some(bs_id), Some(bs_consumer)) =
+            (&overlay.block_sync_overlay_id, &overlay.block_sync_consumer)
+        {
+            overlay.stack.overlay.add_consumer(bs_id, bs_consumer.clone())?;
+        }
+
+        // Periodic stats dump (lives as long as the overlay's stop flag is unset)
+        if let Some(stats) = &overlay.block_sync_stats {
+            stats.clone().spawn_ticker(runtime_handle.clone(), overlay.stop_requested.clone());
+        }
 
         log::debug!(
             target: LOG_TARGET,
@@ -1102,17 +1308,31 @@ impl AdnlOverlay {
             return; // Already stopped
         }
 
+        // Final telemetry dump so short-lived sessions always log at least once
+        if let Some(stats) = &self.block_sync_stats {
+            stats.dump();
+        }
+
         // Stop task processor manager synchronously
         self.task_processor_manager.stop();
 
         // Delete private overlay from ADNL node within tokio runtime context
         let overlay_node = self.stack.overlay.clone();
         let overlay_id = self.overlay_id.clone();
+        let block_sync_overlay_id = self.block_sync_overlay_id.clone();
 
         // Use the stored runtime handle to run in proper tokio context
         self.runtime_handle.block_on(async move {
             if let Err(e) = overlay_node.delete_private_overlay(&overlay_id) {
                 log::warn!(target: LOG_TARGET, "Error deleting private overlay: {:?}", e);
+            }
+            if let Some(bs_id) = block_sync_overlay_id {
+                if let Err(e) = overlay_node.delete_private_overlay(&bs_id) {
+                    log::warn!(
+                        target: LOG_TARGET,
+                        "Error deleting block-sync overlay {bs_id}: {:?}", e,
+                    );
+                }
             }
         });
 
@@ -1230,25 +1450,30 @@ impl AdnlOverlay {
         Ok(QueryResult::Consumed(QueryAnswer::Pending(handle)))
     }
 
-    /// Process incoming broadcast data — deliver directly to listener.
+    /// Process incoming broadcast data - deliver directly to listener.
+    /// Called from BroadcastWrapper (catchain-style) on the consensus overlay
     fn validate_and_process_broadcast(self: Arc<Self>, recv_from: PublicKeyHash, data: &[u8]) {
         let payload = crate::ConsensusCommonFactory::create_block_payload(data.to_vec());
-        self.process_broadcast(recv_from, payload);
+        self.process_broadcast(recv_from, payload, crate::BroadcastSource::ConsensusOverlay);
     }
 
-    /// Process incoming broadcast.
-    /// `recv_from` may be an ADNL key hash (from two-step broadcasts) or a
-    /// validator key hash (from BroadcastWrapper).  Translate to validator key
-    /// hash when possible so the consensus layer sees a consistent identifier.
-    fn process_broadcast(self: Arc<Self>, recv_from: PublicKeyHash, data: BlockPayloadPtr) {
+    /// Process incoming broadcast; translate `recv_from` (ADNL or validator key hash)
+    /// to validator key hash when possible. `source` tells the listener which
+    /// overlay the broadcast arrived on
+    fn process_broadcast(
+        self: Arc<Self>,
+        recv_from: PublicKeyHash,
+        data: BlockPayloadPtr,
+        source_overlay: crate::BroadcastSource,
+    ) {
         let source =
             self.adnl_to_validator.get(&recv_from).cloned().unwrap_or_else(|| recv_from.clone());
         log::trace!(
             target: LOG_TARGET,
-            "AdnlOverlay: private overlay broadcast received (recv_from={recv_from}, source={source})"
+            "AdnlOverlay: {source_overlay:?} broadcast received (recv_from={recv_from}, source={source})"
         );
         if let Some(listener) = self.listener.upgrade() {
-            listener.on_broadcast(source, &data);
+            listener.on_broadcast(source, &data, source_overlay);
         }
     }
 
@@ -1261,6 +1486,87 @@ impl AdnlOverlay {
     }
 
     /// Start broadcast listeners (similar to CatchainClient::run_wait_broadcast)
+    /// Drain inbound broadcasts on the block-sync overlay (no-op when not configured)
+    pub fn run_wait_block_sync_broadcast(self: Arc<Self>) {
+        let Some(bs_id) = self.block_sync_overlay_id.clone() else {
+            return;
+        };
+        log::trace!(
+            target: LOG_TARGET,
+            "BlockSync: starting block-sync broadcast listener for overlay_id={bs_id}"
+        );
+        let overlay_weak = Arc::downgrade(&self);
+        let overlay_node = self.stack.overlay.clone();
+        let stop_requested = self.stop_requested.clone();
+        self.runtime_handle.spawn(async move {
+            loop {
+                if stop_requested.load(Ordering::Relaxed) {
+                    log::trace!(
+                        target: LOG_TARGET,
+                        "BlockSync: block-sync broadcast listener stopping for overlay_id={bs_id}"
+                    );
+                    break;
+                }
+                match overlay_node.wait_for_broadcast(&bs_id).await {
+                    Ok(Some(message)) => {
+                        log::trace!(
+                            target: LOG_TARGET,
+                            "BlockSync: block-sync broadcast received \
+                             data_len={} recv_from={} overlay={bs_id}",
+                            message.data.len(), message.recv_from,
+                        );
+                        if let Some(overlay) = overlay_weak.upgrade() {
+                            // Drop self-broadcasts and senders not in the current-set
+                            // authorized_keys (C++ `block-sync-overlay.cpp:120-123`)
+                            if message.recv_from == *overlay.local_adnl_key.id() {
+                                log::trace!(
+                                    target: LOG_TARGET,
+                                    "BlockSync: block-sync self-broadcast dropped (recv_from=local)"
+                                );
+                                continue;
+                            }
+                            if !overlay.block_sync_authorized.contains(&message.recv_from) {
+                                if let Some(stats) = &overlay.block_sync_stats {
+                                    stats.bump_auth_drop();
+                                }
+                                log::warn!(
+                                    target: LOG_TARGET,
+                                    "BlockSync: block-sync broadcast from non-validator {} dropped \
+                                     (not in current-set authorized_keys)",
+                                    message.recv_from
+                                );
+                                continue;
+                            }
+                            if let Some(stats) = &overlay.block_sync_stats {
+                                stats.bump_recv();
+                            }
+                            let payload =
+                                crate::ConsensusCommonFactory::create_block_payload(message.data);
+                            overlay.process_broadcast(
+                                message.recv_from,
+                                payload,
+                                crate::BroadcastSource::BlockSyncOverlay,
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        log::trace!(
+                            target: LOG_TARGET,
+                            "BlockSync: block-sync broadcast listener finished for overlay_id={bs_id}"
+                        );
+                        break;
+                    }
+                    Err(e) => {
+                        log::error!(
+                            target: LOG_TARGET,
+                            "BlockSync: block-sync overlay broadcast error: {e}"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     pub fn run_wait_broadcast(self: Arc<Self>) {
         log::trace!(
             target: LOG_TARGET,
@@ -1305,7 +1611,11 @@ impl AdnlOverlay {
                         if let Some(overlay) = overlay.upgrade() {
                             let payload =
                                 crate::ConsensusCommonFactory::create_block_payload(message.data);
-                            overlay.process_broadcast(message.recv_from, payload);
+                            overlay.process_broadcast(
+                                message.recv_from,
+                                payload,
+                                crate::BroadcastSource::ConsensusOverlay,
+                            );
                         }
                     }
                     Ok(None) => {
@@ -1577,9 +1887,7 @@ impl ConsensusOverlay for AdnlOverlay {
 
                 let result = result.ok_or_else(|| error!("answer is None!"))?;
                 let data = serialize_boxed(&result)?;
-                let data = crate::ConsensusCommonFactory::create_block_payload(data);
-
-                Ok(data)
+                normalize_query_response_payload(data)
             }
             .await;
 
@@ -1595,7 +1903,10 @@ impl ConsensusOverlay for AdnlOverlay {
         });
     }
 
-    /// Send query via RLDP for large messages
+    /// Send query via RLDP for large messages.
+    /// On QUIC-enabled overlays (simplex+quic) the query is routed through QUIC
+    /// bi-directional streams instead, since QUIC handles flow control natively
+    /// and doesn't need `max_answer_size`.
     fn send_query_via_rldp(
         &self,
         dst_adnl_id: PublicKeyHash,
@@ -1610,6 +1921,7 @@ impl ConsensusOverlay for AdnlOverlay {
         let overlay_node = self.stack.overlay.clone();
         let stop_requested = self.stop_requested.clone();
         let runtime_handle = self.runtime_handle.clone();
+        let is_quic = self.is_quic_available;
 
         if stop_requested.load(Ordering::Relaxed) {
             log::warn!(target: LOG_TARGET, "AdnlOverlay: Overlay {} was stopped!", &overlay_id);
@@ -1622,28 +1934,40 @@ impl ConsensusOverlay for AdnlOverlay {
                 return;
             }
 
-            // Execute RLDP query
             let result = async {
                 let query_body = deserialize_boxed(query.data())?;
-                let mut query_data = overlay_node.get_query_prefix(&overlay_id)?;
-                serialize_boxed_append(&mut query_data, &query_body)?;
 
-                let (data, _) = overlay_node
-                    .query_via_rldp(
-                        &dst_adnl_id,
-                        &TaggedByteSlice {
-                            object: &query_data[..],
-                            #[cfg(feature = "telemetry")]
-                            tag: query_body.bare_object().constructor(),
-                        },
-                        &overlay_id,
-                        Some(max_answer_size),
-                        v2,
-                        None,
-                    )
-                    .await?;
-                let data = data.ok_or_else(|| error!("answer is None!"))?;
-                Ok(crate::ConsensusCommonFactory::create_block_payload(data))
+                if is_quic {
+                    // QUIC path: use bi-directional stream query (no max_answer_size needed)
+                    let tagged: TaggedTlObject = query_body.into();
+                    let result = overlay_node
+                        .query_via_quic(&dst_adnl_id, &tagged, &overlay_id, None)
+                        .await?;
+                    let result = result.ok_or_else(|| error!("QUIC query answer is None!"))?;
+                    let data = serialize_boxed(&result)?;
+                    normalize_query_response_payload(data)
+                } else {
+                    // RLDP path: traditional large-message query
+                    let mut query_data = overlay_node.get_query_prefix(&overlay_id)?;
+                    serialize_boxed_append(&mut query_data, &query_body)?;
+
+                    let (data, _) = overlay_node
+                        .query_via_rldp(
+                            &dst_adnl_id,
+                            &TaggedByteSlice {
+                                object: &query_data[..],
+                                #[cfg(feature = "telemetry")]
+                                tag: query_body.bare_object().constructor(),
+                            },
+                            &overlay_id,
+                            Some(max_answer_size),
+                            v2,
+                            None,
+                        )
+                        .await?;
+                    let data = data.ok_or_else(|| error!("answer is None!"))?;
+                    normalize_query_response_payload(data)
+                }
             }
             .await;
 
@@ -1669,7 +1993,13 @@ impl ConsensusOverlay for AdnlOverlay {
         payload: BlockPayloadPtr,
         extra: Option<Vec<u8>>,
     ) {
-        let overlay_id = self.overlay_id.clone();
+        // Only candidate broadcasts (with `extra`) go through block-sync overlay.
+        let use_block_sync = extra.is_some() && self.block_sync_overlay_id.is_some();
+        let overlay_id = if use_block_sync {
+            self.block_sync_overlay_id.clone().unwrap()
+        } else {
+            self.overlay_id.clone()
+        };
         let stop_requested = self.stop_requested.clone();
 
         if stop_requested.load(Ordering::Relaxed) {
@@ -1677,14 +2007,22 @@ impl ConsensusOverlay for AdnlOverlay {
             return;
         }
 
-        if self.is_quic_available || !self.is_tcp_available {
+        if self.is_quic_available || !self.is_tcp_available || use_block_sync {
             // QUIC or ADNL/UDP path
-            // If extra given, use two-step broadcast via QUIC/RLDP
-            // Otherwise use canonic broadcast via ADNL
             let msg = payload.clone();
             let overlay_node = self.stack.overlay.clone();
-            let local_validator_key = self.local_validator_key.clone();
+            // block-sync signs by ADNL pubkey (block-sync-overlay.cpp:43,78);
+            // consensus private overlay signs by validator pubkey (private-overlay.cpp:51,126).
+            let src_key = if use_block_sync {
+                self.local_adnl_key.clone()
+            } else {
+                self.local_validator_key.clone()
+            };
             let transport = if self.is_quic_available { "QUIC" } else { "ADNL/UDP" };
+            let stats = if use_block_sync { self.block_sync_stats.clone() } else { None };
+            if let Some(stats) = &stats {
+                stats.bump_sent();
+            }
 
             self.runtime_handle.spawn(async move {
                 if stop_requested.load(Ordering::Relaxed) {
@@ -1704,13 +2042,7 @@ impl ConsensusOverlay for AdnlOverlay {
                 let result = if let Some(extra) = extra {
                     // Twostep broadcast with extra
                     overlay_node
-                        .broadcast_twostep(
-                            &overlay_id,
-                            &msg_tagged,
-                            Some(&local_validator_key),
-                            0,
-                            extra,
-                        )
+                        .broadcast_twostep(&overlay_id, &msg_tagged, Some(&src_key), 0, extra)
                         .await
                 } else {
                     // Canonic broadcast
@@ -1718,17 +2050,43 @@ impl ConsensusOverlay for AdnlOverlay {
                         .broadcast(
                             &overlay_id,
                             &msg_tagged,
-                            Some(&local_validator_key),
+                            Some(&src_key),
                             0,
                             AdnlSendMethod::Fast,
                         )
                         .await
                 };
 
-                log::debug!(
-                    target: LOG_TARGET,
-                    "AdnlOverlay::send_broadcast_fec_ex ({transport}) status: {result:?}"
-                );
+                match &result {
+                    Ok(info) if info.send_to == 0 => {
+                        if let Some(stats) = &stats {
+                            stats.bump_send_err();
+                        }
+                        log::warn!(
+                            target: LOG_TARGET,
+                            "AdnlOverlay::send_broadcast_fec_ex ({transport}) \
+                            overlay={overlay_id}: send_to=0 packets={} — \
+                            broadcast emitted to 0 neighbours (overlay known_peers empty?)",
+                            info.packets,
+                        );
+                    }
+                    Ok(info) => log::debug!(
+                        target: LOG_TARGET,
+                        "AdnlOverlay::send_broadcast_fec_ex ({transport}) \
+                        overlay={overlay_id} packets={} send_to={}",
+                        info.packets, info.send_to,
+                    ),
+                    Err(e) => {
+                        if let Some(stats) = &stats {
+                            stats.bump_send_err();
+                        }
+                        log::warn!(
+                            target: LOG_TARGET,
+                            "AdnlOverlay::send_broadcast_fec_ex ({transport}) \
+                            overlay={overlay_id} FAILED: {e:?}"
+                        );
+                    }
+                }
             });
         } else {
             // TCP path: manually build BroadcastTwostepSimple and multicast
@@ -1880,6 +2238,7 @@ impl ConsensusOverlayManager for AdnlOverlayManager {
         overlay_listener: ConsensusOverlayListenerPtr,
         _log_replay_listener: ConsensusOverlayLogReplayListenerPtr,
         transport_type: OverlayTransportType,
+        block_sync_params: Option<crate::BlockSyncOverlayParams>,
     ) -> Result<ConsensusOverlayPtr> {
         // Searching for existing overlay
         if let Some(existing) = self.overlays.lock().get(overlay_short_id) {
@@ -1909,6 +2268,7 @@ impl ConsensusOverlayManager for AdnlOverlayManager {
             self.track_private_peers,
             self.peers_storage.clone(),
             transport_type,
+            block_sync_params,
         )?;
 
         // Atomic overlay addition under lock
@@ -1931,8 +2291,11 @@ impl ConsensusOverlayManager for AdnlOverlayManager {
             overlay
         };
 
-        // Start broadcast listeners
+        // Start broadcast listeners (consensus and, if present, block-sync)
         overlay.clone().run_wait_broadcast();
+        if overlay.block_sync_overlay_id.is_some() {
+            overlay.clone().run_wait_block_sync_broadcast();
+        }
 
         Ok(overlay)
     }
@@ -1955,5 +2318,173 @@ impl ConsensusOverlayManager for AdnlOverlayManager {
                 "Cannot downcast overlay to AdnlOverlay: overlay_id={overlay_short_id}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/test_adnl_overlay.rs"]
+mod tests;
+
+#[cfg(test)]
+mod blocksync_check_tests {
+    //! Tests for the recv side (`on_recv`) of `BlockSyncCheck`.
+    //! Covers C++ `block-sync-overlay.cpp:135-155` `precheck_broadcast`:
+    //! sender in current set, broadcastExtra parses, sender == expected_leader_for(slot)
+
+    use super::*;
+    use ton_api::{ton::consensus::broadcastextra::BroadcastExtra, IntoBoxed};
+    use ton_block::KeyId;
+
+    fn key(seed: u8) -> Arc<KeyId> {
+        KeyId::from_data([seed; 32])
+    }
+
+    fn overlay_id() -> Arc<PrivateOverlayShortId> {
+        KeyId::from_data([0u8; 32])
+    }
+
+    /// Build a check that only does the sender check (current_set empty
+    /// disables the collator check via the defensive bypass)
+    fn sender_only_check(authorized_seeds: &[u8]) -> BlockSyncCheck {
+        BlockSyncCheck {
+            overlay_id: overlay_id(),
+            authorized: authorized_seeds.iter().map(|&s| key(s)).collect(),
+            max_payload_size: u32::MAX,
+            current_set: Vec::new(),
+            slots_per_leader_window: 0,
+            stats: None,
+        }
+    }
+
+    /// Build a fully-armed check with a leader schedule
+    fn schedule_check(ordered_seeds: &[u8], window: u32) -> BlockSyncCheck {
+        let current_set: Vec<_> = ordered_seeds.iter().map(|&s| key(s)).collect();
+        BlockSyncCheck {
+            overlay_id: overlay_id(),
+            authorized: current_set.iter().cloned().collect(),
+            max_payload_size: u32::MAX,
+            current_set,
+            slots_per_leader_window: window,
+            stats: None,
+        }
+    }
+
+    /// Serialize a `consensus.broadcastExtra{slot}` for use as `extra` bytes
+    fn extra_with_slot(slot: i32) -> Vec<u8> {
+        let extra = BroadcastExtra { slot };
+        ton_api::serialize_boxed(&extra.into_boxed()).unwrap()
+    }
+
+    // === Sender-only checks (when no schedule is configured) ===
+
+    #[test]
+    fn authorized_sender_passes() {
+        let cb = sender_only_check(&[1, 2, 3]);
+        assert!(cb.on_recv(&key(2), Some(&extra_with_slot(0))).is_ok());
+    }
+
+    #[test]
+    fn unauthorized_sender_rejected() {
+        let cb = sender_only_check(&[1, 2, 3]);
+        let err = cb
+            .on_recv(&key(99), Some(&extra_with_slot(0)))
+            .expect_err("expected unauthorized sender to be rejected");
+        assert!(err.to_string().contains("not in current-set authorized_keys"));
+    }
+
+    #[test]
+    fn empty_authorized_rejects_everyone() {
+        let cb = sender_only_check(&[]);
+        assert!(cb.on_recv(&key(1), Some(&extra_with_slot(0))).is_err());
+    }
+
+    // === Extra parse failure modes ===
+
+    #[test]
+    fn missing_extra_rejected() {
+        let cb = sender_only_check(&[1]);
+        let err = cb.on_recv(&key(1), None).expect_err("expected missing broadcastExtra");
+        assert!(err.to_string().contains("missing broadcastExtra"));
+    }
+
+    #[test]
+    fn malformed_extra_rejected() {
+        let cb = sender_only_check(&[1]);
+        let err = cb
+            .on_recv(&key(1), Some(&[0xde, 0xad, 0xbe, 0xef]))
+            .expect_err("expected malformed extra to be rejected");
+        assert!(err.to_string().contains("broadcastExtra"));
+    }
+
+    #[test]
+    fn negative_slot_rejected() {
+        let cb = sender_only_check(&[1]);
+        let err = cb
+            .on_recv(&key(1), Some(&extra_with_slot(-1)))
+            .expect_err("expected negative slot to be rejected");
+        assert!(err.to_string().contains("negative"));
+    }
+
+    // === Collator check (with leader schedule) ===
+
+    #[test]
+    fn correct_leader_for_slot_zero_passes() {
+        let cb = schedule_check(&[1, 2, 3, 4], 2);
+        assert!(cb.on_recv(&key(1), Some(&extra_with_slot(0))).is_ok());
+        assert!(cb.on_recv(&key(1), Some(&extra_with_slot(1))).is_ok());
+        assert!(cb.on_recv(&key(2), Some(&extra_with_slot(2))).is_ok());
+        assert!(cb.on_recv(&key(2), Some(&extra_with_slot(3))).is_ok());
+    }
+
+    #[test]
+    fn wrong_leader_rejected() {
+        let cb = schedule_check(&[1, 2, 3, 4], 2);
+        let err = cb
+            .on_recv(&key(2), Some(&extra_with_slot(0)))
+            .expect_err("expected wrong-leader broadcast to be rejected");
+        assert!(err.to_string().contains("leader-schedule mismatch"));
+    }
+
+    #[test]
+    fn leader_wraps_around_modulo_n() {
+        let cb = schedule_check(&[1, 2, 3], 1);
+        assert!(cb.on_recv(&key(1), Some(&extra_with_slot(0))).is_ok());
+        assert!(cb.on_recv(&key(1), Some(&extra_with_slot(3))).is_ok());
+        assert!(cb.on_recv(&key(1), Some(&extra_with_slot(6))).is_ok());
+        assert!(cb.on_recv(&key(2), Some(&extra_with_slot(3))).is_err());
+    }
+
+    #[test]
+    fn unauthorized_sender_rejected_before_extra_parse() {
+        let cb = schedule_check(&[1, 2, 3], 1);
+        let err = cb
+            .on_recv(&key(99), Some(&extra_with_slot(0)))
+            .expect_err("unauthorized sender must be rejected");
+        assert!(err.to_string().contains("not in current-set authorized_keys"));
+    }
+
+    // === on_send checks ===
+
+    #[test]
+    fn on_send_authorized_within_cap_passes() {
+        let mut cb = sender_only_check(&[1]);
+        cb.max_payload_size = 100;
+        assert!(cb.on_send(&key(1), 50).is_ok());
+        assert!(cb.on_send(&key(1), 100).is_ok());
+    }
+
+    #[test]
+    fn on_send_unauthorized_rejected() {
+        let cb = sender_only_check(&[1]);
+        let err = cb.on_send(&key(99), 10).expect_err("unauthorized must be rejected");
+        assert!(err.to_string().contains("not authorized"));
+    }
+
+    #[test]
+    fn on_send_oversized_rejected() {
+        let mut cb = sender_only_check(&[1]);
+        cb.max_payload_size = 100;
+        let err = cb.on_send(&key(1), 101).expect_err("oversize must be rejected");
+        assert!(err.to_string().contains("exceeds authorized cap"));
     }
 }

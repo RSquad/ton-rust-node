@@ -14,7 +14,7 @@ use std::{
     thread,
     time::SystemTime,
 };
-use ton_block::{Ed25519KeyOption, UInt256};
+use ton_block::{Ed25519KeyOption, UInt256, ZeroizingBytes};
 
 include!("../../../common/src/test.rs");
 
@@ -268,7 +268,8 @@ fn test_catchain_attempt(attempt_idx: usize) {
     nodes.reserve(NODE_COUNT);
 
     for _i in 0..NODE_COUNT {
-        let private_key = Ed25519KeyOption::generate().expect("Failed to generate private key");
+        let private_key =
+            Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate private key");
         let adnl_id = private_key.id();
 
         let catchain_node = CatchainNode { adnl_id: adnl_id.clone(), public_key: private_key };

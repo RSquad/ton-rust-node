@@ -50,13 +50,14 @@ use ton_api::{
 };
 use ton_block::{
     base64_decode, base64_encode, error, fail, sha256_digest, Ed25519KeyOption, KeyId, KeyOption,
-    Result, UInt256, UnixTime,
+    Result, UInt256, UnixTime, ZeroizingBytes,
 };
 
 #[path = "./test_utils.rs"]
 mod test_utils;
 use test_utils::{
-    find_overlay_peer, get_adnl_config, init_compatibility_test, init_test, TestContext,
+    find_overlay_peer, get_adnl_config, init_compatibility_test, init_test, init_test_log,
+    TestContext,
 };
 
 const KEY_TAG_DHT: usize = 1;
@@ -1245,6 +1246,7 @@ fn test_stop() {
             &ctx_test.adnl.key_by_tag(KEY_TAG_OVERLAY).unwrap(),
             &Vec::new(),
             false,
+            None,
         )
         .unwrap();
     assert!(added);
@@ -1301,7 +1303,7 @@ fn test_drop() {
 #[test]
 fn test_new_broadcast() {
     const HOPS: u8 = 5;
-    let src = Ed25519KeyOption::generate().unwrap();
+    let src = Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap();
     let bcast = BroadcastOrd {
         src: (&src).try_into().unwrap(),
         certificate: OverlayCertificate::Overlay_EmptyCertificate,
@@ -1339,7 +1341,7 @@ async fn test_overlay_semiprivate() -> Result<()> {
         let pi = PeerInfo {
             id,
             ip,
-            pub_key: Ed25519KeyOption::from_public_key(
+            pub_key: Ed25519KeyOption::<ZeroizingBytes>::from_public_key(
                 cfg.key_by_tag(KEY_TAG_OVERLAY)?.pub_key()?.try_into()?,
             ),
             key: cfg.key_by_tag(KEY_TAG_OVERLAY)?.clone(),
@@ -1372,7 +1374,17 @@ async fn test_overlay_semiprivate() -> Result<()> {
 
         adnl.start_over_udp(vec![pi.overlay.clone().unwrap()]).await.unwrap();
         let params = OverlayParams::with_id_only(overlay_id);
-        assert!(overlay.add_semiprivate_overlay(params, Some(&pi.key), roots, None, 1)?);
+        // In this test the overlay key serves both as ADNL id and as cert signer,
+        // so root_adnl_ids == root_public_keys.
+        assert!(overlay.add_semiprivate_overlay(
+            params,
+            Some(&pi.key),
+            roots,
+            roots,
+            None,
+            1,
+            false
+        )?);
         overlay
             .add_consumer(overlay_id, Arc::new(TestConsumer { received: pi.received.clone() }))?;
 
@@ -1427,7 +1439,17 @@ async fn test_overlay_semiprivate() -> Result<()> {
 
         pi.certificate = Some(cert.clone());
         let params = OverlayParams::with_id_only(overlay_id);
-        assert!(overlay.add_semiprivate_overlay(params, Some(&pi.key), roots, Some(cert), 1)?);
+        // In this test the overlay key serves both as ADNL id and as cert signer,
+        // so root_adnl_ids == root_public_keys.
+        assert!(overlay.add_semiprivate_overlay(
+            params,
+            Some(&pi.key),
+            roots,
+            roots,
+            Some(cert),
+            1,
+            false
+        )?);
         overlay
             .add_consumer(overlay_id, Arc::new(TestConsumer { received: pi.received.clone() }))?;
 
@@ -1442,7 +1464,7 @@ async fn test_overlay_semiprivate() -> Result<()> {
         Ok(())
     }
 
-    std::env::set_var("RUST_BACKTRACE", "full");
+    // std::env::set_var("RUST_BACKTRACE", "full");
 
     let zero_state_file_hash = base64_decode(ZERO_STATE)?;
     let zero_state_file_hash = zero_state_file_hash.as_slice().try_into()?;
@@ -1459,7 +1481,7 @@ async fn test_overlay_semiprivate() -> Result<()> {
     const SLAVE3: &str = "127.0.0.1:4206";
     const SLAVE4: &str = "127.0.0.1:4207";
 
-    crate::test_utils::init_test_log();
+    init_test_log();
 
     let mut peers = Vec::new();
 
@@ -1627,7 +1649,7 @@ async fn test_overlay_semiprivate() -> Result<()> {
 fn test_overlay_raptorq() {
     use rand::{seq::SliceRandom, SeedableRng};
 
-    fn run(symbol: Option<u16>) {
+    fn run(symbol: Option<u32>) {
         let seed: u64 = rand::random();
         println!("test_overlay_raptorq seed: {seed}");
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
@@ -1777,4 +1799,95 @@ fn test_overlay_raptorq() {
     run(None);
     println!("--- symbol=Some(771) (alignment=1) ---");
     run(Some(771));
+}
+
+/// Test that RaptorQ encode/decode works with symbol_size > 65535 (u16 limit).
+/// This matches the C++ behaviour where symbol_size is size_t.
+/// Simulates TwostepFec for 800KB data with 10 parties:
+///   k = (10*2-2)/3 = 6, part_size = ceil(819200/6) = 136534
+#[test]
+fn test_raptorq_large_symbol_size() {
+    use adnl::{RaptorqDecoder, RaptorqEncoder};
+    use rand::Rng;
+
+    const DATA_SIZE: usize = 800 * 1024;
+
+    for num_parties in [5u32, 10, 20] {
+        let k = ((num_parties as usize) * 2 - 2) / 3;
+        let part_size = (DATA_SIZE + k - 1) / k;
+
+        println!(
+            "--- parties={num_parties}, k={k}, part_size={part_size} (>65535: {}) ---",
+            part_size > 65535
+        );
+
+        // Generate random data
+        let mut rng = rand::thread_rng();
+        let data: Vec<u8> = (0..DATA_SIZE).map(|_| rng.gen()).collect();
+
+        // Encode with large symbol_size
+        let mut encoder = RaptorqEncoder::with_data(&data, Some(part_size as u32));
+        let params = encoder.params().clone();
+        println!(
+            "  params: data_size={}, symbol_size={}, symbols_count={}",
+            params.data_size, params.symbol_size, params.symbols_count
+        );
+        assert_eq!(params.data_size, DATA_SIZE as i32);
+        assert_eq!(params.symbol_size, part_size as i32);
+
+        // Collect source + repair symbols
+        let source_count = params.symbols_count as usize;
+        let mut packets: Vec<(u32, Vec<u8>)> = Vec::new();
+        let mut seqno = 0u32;
+        for _ in 0..(source_count * 3 / 2) {
+            let chunk = encoder.encode(&mut seqno).unwrap();
+            packets.push((seqno, chunk));
+            seqno += 1;
+        }
+        assert!(
+            packets.len() >= source_count,
+            "Not enough packets generated: {} < {source_count}",
+            packets.len()
+        );
+
+        // Decode using exactly source_count symbols (minimum required)
+        let mut decoder = RaptorqDecoder::with_params(params.clone())
+            .expect("decoder creation must succeed for large symbol_size");
+
+        let mut decoded = None;
+        for (seq, chunk) in packets.iter().take(source_count + 2) {
+            if let Some(result) = decoder.decode(*seq, chunk) {
+                decoded = Some(result);
+                break;
+            }
+        }
+
+        let result = decoded.expect("decode must succeed");
+        assert_eq!(result.len(), DATA_SIZE, "decoded size mismatch");
+        assert_eq!(result, data, "decoded data mismatch");
+        println!("  OK: encode/decode verified for symbol_size={part_size}");
+    }
+}
+
+/// Verify that the RaptorQ encoder produces valid FEC symbols for large
+/// part_size values (>65535) that match the C++ TwostepFec behaviour.
+#[test]
+fn test_twostep_fec_encoder_large_symbols() {
+    let data = vec![0x42u8; 800 * 1024];
+    for neighbours in [5u32, 10, 20] {
+        let k = ((neighbours as usize) * 2 - 2) / 3;
+        let part_size = (data.len() + k - 1) / k;
+
+        let mut encoder = RaptorqEncoder::with_data(&data, Some(part_size as u32));
+        let params = encoder.params().clone();
+        assert_eq!(params.data_size, data.len() as i32);
+        assert_eq!(params.symbol_size, part_size as i32);
+
+        // Generate one symbol per neighbour (like broadcast-twostep.cpp)
+        let mut seqno = 0u32;
+        for _ in 0..neighbours {
+            let chunk = encoder.encode(&mut seqno).unwrap();
+            assert_eq!(chunk.len(), part_size, "symbol size mismatch");
+        }
+    }
 }

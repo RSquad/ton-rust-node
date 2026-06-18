@@ -43,6 +43,55 @@ fn test_git_bits_simple() {
     check_git_bits(0x7342);
 }
 
+// Guard against the OOB reported as PR #789 review thread
+// (`discussion_r3141697878`): `get_bits(offset, bits)` must reject reads
+// where `offset + bits > remaining_bits()`, not just `bits > remaining_bits()`.
+// Without this check the two-byte fast path can dereference `data[q + 1]`
+// past the slice window.
+#[test]
+fn get_bits_rejects_offset_past_window() {
+    let mut slice = SliceData::new(vec![0xA5, 0x80]);
+    slice.shrink_data(0..8);
+    assert_eq!(slice.remaining_bits(), 8);
+    // `bits` alone fits but `offset + bits = 10` does not.
+    let err = slice.get_bits(4, 6).expect_err("offset + bits past window must error");
+    let msg = err.to_string();
+    assert!(msg.contains("not enough bits"), "expected CellUnderflow, got: {msg}");
+    // Boundary: exactly `offset + bits == remaining_bits` still works.
+    assert_eq!(slice.get_bits(4, 4).unwrap(), 0x5);
+}
+
+// Hardening for PR #789 review threads `discussion_r3156662087/144/164`:
+// `get_slice`, `get_bits` and `are_bits_same` must reject `usize`
+// wraparound on `offset + bits/len` rather than silently bypass
+// `check_remaining_bits` and produce a corrupt `start..end` range.
+#[test]
+fn slice_methods_reject_offset_overflow() {
+    let slice = SliceData::new(vec![0xA5, 0x5A, 0x80]);
+    assert!(slice.remaining_bits() >= 16);
+    let huge = usize::MAX - 4;
+
+    // `get_slice`: overflow on `offset + bits` must error, not wrap.
+    let err = slice.get_slice(huge, 8).expect_err("get_slice must reject offset + bits overflow");
+    assert!(
+        err.to_string().contains("overflow") || err.to_string().contains("not enough bits"),
+        "unexpected error: {err}"
+    );
+
+    // `get_bits`: same overflow guard, with `bits` already in 1..=8.
+    let err = slice.get_bits(huge, 4).expect_err("get_bits must reject offset + bits overflow");
+    assert!(
+        err.to_string().contains("overflow") || err.to_string().contains("not enough bits"),
+        "unexpected error: {err}"
+    );
+
+    // `are_bits_same`: returns `false` (it has no `Result` channel) for both
+    // the overflow case and the boundary `len == 0`.
+    assert!(!slice.are_bits_same(false, huge, 8));
+    assert!(!slice.are_bits_same(true, huge, 8));
+    assert!(!slice.are_bits_same(false, 0, 0));
+}
+
 #[test]
 fn compare_slices() {
     let mut slice1 = SliceData::new(vec![0xAA, 0x37, 0xA5, 0x55, 0x80]);
@@ -51,7 +100,7 @@ fn compare_slices() {
     slice1.append_reference(SliceData::new_empty()).unwrap();
     slice2.append_reference(SliceData::new_empty()).unwrap();
     slice1.shrink_data(9..23);
-    slice1.shrink_references(1..2);
+    slice1.shrink_references(1..2).unwrap();
     slice2.shrink_data(1..);
     assert_eq!(slice1, slice2);
 
@@ -60,7 +109,7 @@ fn compare_slices() {
     slice1.append_reference(SliceData::new(vec![0xFF])).unwrap();
     slice1.append_reference(SliceData::new_empty()).unwrap();
     slice2.append_reference(SliceData::new_empty()).unwrap();
-    slice1.shrink_references(1..=1);
+    slice1.shrink_references(1..=1).unwrap();
     assert_eq!(slice1, slice2);
 }
 

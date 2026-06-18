@@ -24,7 +24,7 @@ use ton_block::*;
 fn test_already_processed_enqueued_message() {
     let env = MsgEnvelope::construct_from_file("src/tests/static/message.boc").unwrap();
     let last_msg_lt = 93381000002;
-    let last_msg_hash = env.message_cell().repr_hash();
+    let last_msg_hash = env.message_cell().repr_hash().clone();
     let enq = EnqueuedMsg::with_param(last_msg_lt, &env).unwrap();
     let enq = MsgEnqueueStuff::from_enqueue(enq, 0).unwrap();
     let shards = ShardHashes::construct_from_file("src/tests/static/shards_73107.boc").unwrap();

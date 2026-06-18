@@ -16,7 +16,9 @@ use crate::{
     ConsensusOverlayManager, ConsensusOverlayManagerPtr, ConsensusOverlayPtr, OverlayTransportType,
     PrivateKey, PrivateOverlayShortId, PublicKeyHash, QueryResponseCallback,
 };
-use adnl::{node::AdnlNode, DhtNode, NetworkStack, OverlayNode, QuicNode, RldpNode};
+use adnl::{
+    node::AdnlNode, DhtNode, NetworkStack, OverlayNode, QuicNode, QuicRateLimitConfig, RldpNode,
+};
 use futures;
 use lazy_static::lazy_static;
 use std::{
@@ -246,8 +248,8 @@ impl<'a> NodeTestNetwork<'a> {
                     let quic = QuicNode::new(
                         vec![overlay.clone()],
                         cancellation_token.clone(),
-                        None,
                         tokio::runtime::Handle::current(),
+                        Some(QuicRateLimitConfig::disabled()),
                     );
                     overlay.set_quic(quic.clone()).unwrap();
                     Some(quic)
@@ -348,7 +350,12 @@ impl ConsensusOverlayListener for ToggleableOverlayListener {
         }
     }
 
-    fn on_broadcast(&self, source_key_hash: PublicKeyHash, data: &BlockPayloadPtr) {
+    fn on_broadcast(
+        &self,
+        source_key_hash: PublicKeyHash,
+        data: &BlockPayloadPtr,
+        source: crate::BroadcastSource,
+    ) {
         if !self.enabled.load(Ordering::Relaxed) {
             log::trace!(
                 "NodeTestNetwork: node {} dropping inbound broadcast from {} (network disabled)",
@@ -358,7 +365,7 @@ impl ConsensusOverlayListener for ToggleableOverlayListener {
             return;
         }
         if let Some(inner) = self.inner.upgrade() {
-            inner.on_broadcast(source_key_hash, data);
+            inner.on_broadcast(source_key_hash, data, source);
         }
     }
 
@@ -548,6 +555,7 @@ impl ConsensusOverlayManager for ToggleableOverlayManager {
         overlay_listener: ConsensusOverlayListenerPtr,
         log_replay_listener: ConsensusOverlayLogReplayListenerPtr,
         transport_type: OverlayTransportType,
+        block_sync_params: Option<crate::BlockSyncOverlayParams>,
     ) -> Result<ConsensusOverlayPtr> {
         // Wrap listener to gate inbound traffic.
         let listener = Arc::new(ToggleableOverlayListener {
@@ -564,6 +572,7 @@ impl ConsensusOverlayManager for ToggleableOverlayManager {
             listener_weak,
             log_replay_listener,
             transport_type,
+            block_sync_params,
         )?;
 
         // Keep the listener alive only after start_overlay succeeds.

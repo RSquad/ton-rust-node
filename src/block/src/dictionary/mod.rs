@@ -13,7 +13,7 @@ use crate::{
     error::{ExceptionCode, Result},
     fail, GasConsumer, Mask,
 };
-use std::{marker::PhantomData, mem};
+use std::marker::PhantomData;
 
 mod hashmap;
 pub use hashmap::HashmapE;
@@ -60,7 +60,7 @@ pub fn hm_label(key: &SliceData, max_len: usize) -> Result<BuilderData> {
     debug_assert!(len <= max_len && max_len <= 1023);
     if len > 0 {
         let bit = key.get_bit(0)?;
-        if same_bits(key, bit) {
+        if key.are_bits_same(bit, 0, key.remaining_bits()) {
             return hm_label_same(key, bit, max_len);
         }
     }
@@ -79,16 +79,6 @@ pub fn hm_label(key: &SliceData, max_len: usize) -> Result<BuilderData> {
     }
     b.append_bytestring(key)?;
     Ok(b)
-}
-
-fn same_bits(slice: &SliceData, bit: bool) -> bool {
-    for offset in 0..slice.remaining_bits() {
-        // unwrapping is safe because offsets are all within the slice range
-        if slice.get_bit_opt(offset).unwrap() != bit {
-            return false;
-        }
-    }
-    true
 }
 
 // reading hmLabel from SliceData
@@ -448,14 +438,14 @@ pub trait HashmapType {
         Ok(builder)
     }
     fn make_edge(
-        key: SliceData,
+        key: &SliceData,
         bit_len: usize,
         is_left: bool,
         mut next: SliceData,
     ) -> Result<BuilderData> {
         let mut next_bit_len =
             bit_len.checked_sub(key.remaining_bits() + 1).ok_or(ExceptionCode::CellUnderflow)?;
-        let mut key = key.into_builder()?;
+        let mut key = key.as_builder()?;
         key.append_bit_bool(!is_left)?;
         let label = LabelReader::read_label_raw(&mut next, &mut next_bit_len, key)?;
         let is_leaf = Self::is_leaf(&mut next);
@@ -488,6 +478,29 @@ pub trait HashmapType {
         builder.checked_append_references_and_data(value)?;
         Ok(builder)
     }
+    /// Assemble a subtree from a label and two optional children.
+    fn make_subtree_cell(
+        label: &SliceData,
+        n: usize,
+        left: Option<Cell>,
+        right: Option<Cell>,
+    ) -> Result<Option<Cell>> {
+        match (left, right) {
+            (None, None) => Ok(None),
+            (Some(left), Some(right)) => {
+                let (builder, _) = Self::make_fork(label, n, left, right, false)?;
+                Ok(Some(builder.into_cell()?))
+            }
+            (Some(child), None) => {
+                let next = SliceData::load_cell(child)?;
+                Ok(Some(Self::make_edge(label, n, true, next)?.into_cell()?))
+            }
+            (None, Some(child)) => {
+                let next = SliceData::load_cell(child)?;
+                Ok(Some(Self::make_edge(label, n, false, next)?.into_cell()?))
+            }
+        }
+    }
     fn is_fork(slice: &mut SliceData) -> Result<bool>;
     fn is_leaf(slice: &mut SliceData) -> bool;
     fn inner(self) -> Option<Cell>;
@@ -496,12 +509,6 @@ pub trait HashmapType {
     fn bit_len(&self) -> usize;
     fn iter(&self) -> HashmapIterator<Self> {
         HashmapIterator::from_hashmap(self)
-    }
-    fn count_cells(&self, max: usize) -> Result<usize> {
-        match self.data() {
-            Some(root) => root.count_cells(max),
-            None => Ok(0),
-        }
     }
     fn hashmap_get(&self, mut key: SliceData, gas_consumer: &mut dyn GasConsumer) -> Leaf {
         let mut bit_len = self.bit_len();
@@ -567,15 +574,23 @@ pub trait HashmapType {
         self.hashmap_set_with_mode(key, &builder, gas_consumer, mode)
     }
 
-    fn hashmap_multiset<I>(&mut self, iter: I) -> Result<()>
+    fn hashmap_multiset<'a, I>(&mut self, iter: I) -> Result<()>
     where
-        I: Iterator<Item = (SliceData, Option<SliceData>)>,
+        I: IntoIterator<Item = (FixedBitsKey<'a>, Option<SliceData>)>,
     {
-        let mut tr = HashmapTraverser::new(self);
-        for item in iter {
-            tr.insert(item.0, item.1)?;
+        let bit_len = self.bit_len();
+        let mut values: Vec<_> = iter.into_iter().collect();
+        if values.is_empty() {
+            return Ok(());
         }
-        *self.data_mut() = tr.traverse()?;
+        for (key, _) in &values {
+            if key.bit_len() != bit_len {
+                fail!("multiset key bit_len {} != expected {bit_len}: {key:?}", key.bit_len());
+            }
+        }
+        values.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        *self.data_mut() =
+            dict_multiset_impl::<Self>(self.data().cloned(), &values, bit_len, bit_len, 0)?;
         Ok(())
     }
 
@@ -1450,7 +1465,7 @@ fn remove_node<T: HashmapType + ?Sized>(
                             *cell_opt = Some(gas_consumer.finalize_cell(builder)?)
                         } else {
                             let builder = T::make_edge(
-                                label,
+                                &label,
                                 bit_len,
                                 next_index == 1,
                                 gas_consumer.load_cell(other)?,
@@ -1940,232 +1955,396 @@ impl<T: HashmapType + ?Sized> Iterator for HashmapIterator<T> {
     }
 }
 
-#[derive(Default, Debug)]
-enum Node {
-    #[default]
-    None,
-    Tree {
-        cell: Cell,
-        bit_len: usize,
-    },
-    Fork {
-        label: SliceData,
-        bit_len: usize,
-        left: Box<Node>,
-        right: Box<Node>,
-    },
-    Leaf {
-        label: SliceData,
-        bit_len: usize,
-        data: SliceData,
-    },
-    Job {
-        label: SliceData,
-        bit_len: usize,
-    },
-}
+// --- Batch multiset implementation ---
 
-impl Node {
-    fn label(&self) -> Option<&SliceData> {
-        match self {
-            Node::Fork { label, .. } => Some(label),
-            Node::Leaf { label, .. } => Some(label),
-            _ => None,
-        }
-    }
-
-    fn set_label(&mut self, new_label: SliceData, new_bit_len: usize) {
-        match self {
-            Node::Fork { label, bit_len, .. } | Node::Leaf { label, bit_len, .. } => {
-                *label = new_label;
-                *bit_len = new_bit_len;
-            }
-            _ => (),
-        }
-    }
-
-    fn set_data(&mut self, new_data: SliceData) {
-        if let Node::Leaf { data, .. } = self {
-            *data = new_data;
-        }
-    }
-
-    fn is_none(&self) -> bool {
-        matches!(self, Node::None)
-    }
-
-    fn merge(self, prefix: SliceData, bit_len: usize, bit_right: bool) -> Result<Node> {
-        let mut prefix = prefix.into_builder()?;
-        prefix.append_bit_bool(bit_right)?;
-        let node = match self {
-            Node::Tree { cell, bit_len: old_bit_len } => {
-                let mut data = SliceData::load_cell(cell)?;
-                let label = LabelReader::read_label(&mut data, old_bit_len)?;
-                prefix.checked_append_references_and_data(&label)?;
-                let label = SliceData::load_bitstring(prefix)?;
-                Node::Leaf { label, bit_len, data }
-            }
-            Node::Leaf { label, data, .. } => {
-                prefix.checked_append_references_and_data(&label)?;
-                let label = SliceData::load_bitstring(prefix)?;
-                Node::Leaf { label, bit_len, data }
-            }
-            Node::Fork { label, left, right, .. } => {
-                prefix.checked_append_references_and_data(&label)?;
-                let label = SliceData::load_bitstring(prefix)?;
-                Node::Fork { label, bit_len, left, right }
-            }
-            node => fail!("unexpected node in merge: {node:?}"),
-        };
-        Ok(node)
-    }
-
-    fn prune(&mut self) -> Result<()> {
-        if let Node::Fork { label, bit_len, left, right } = self {
-            left.prune()?;
-            right.prune()?;
-
-            *self = match (left.is_none(), right.is_none()) {
-                (true, true) => Node::None,
-                (true, false) => mem::take(right).merge(mem::take(label), *bit_len, true)?,
-                (false, true) => mem::take(left).merge(mem::take(label), *bit_len, false)?,
-                _ => {
-                    return Ok(());
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-struct HashmapTraverser<T: HashmapType + ?Sized> {
+/// Zero-copy bit-level view over a byte buffer
+#[derive(Clone, Copy, Eq, Debug)]
+pub struct FixedBitsKey<'a> {
+    bytes: &'a [u8],
+    bit_offset: usize,
     bit_len: usize,
-    root: Node,
-    phantom: PhantomData<T>,
 }
 
-impl<T: HashmapType + ?Sized> HashmapTraverser<T> {
-    fn new(hashmap: &T) -> Self {
-        let bit_len = hashmap.bit_len();
-        let root = match hashmap.data().cloned() {
-            Some(cell) => Node::Tree { cell, bit_len: hashmap.bit_len() },
-            None => Node::None,
-        };
-        Self { bit_len, root, phantom: PhantomData::<T> }
+impl<'a> FixedBitsKey<'a> {
+    pub fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, bit_offset: 0, bit_len: bytes.len() * 8 }
     }
-    fn insert(&mut self, mut key: SliceData, mut data: Option<SliceData>) -> Result<()> {
-        let mut bit_len = key.remaining_bits();
-        if bit_len != self.bit_len {
-            fail!(ExceptionCode::DictionaryError, "key length {bit_len} mismatch")
+
+    pub fn with_offset(bytes: &'a [u8], bit_offset: usize, bit_len: usize) -> Result<Self> {
+        if bytes.len() * 8 < bit_offset + bit_len {
+            fail!(
+                "FixedBitsKey: buffer too small ({} bytes for offset {} + {} bits)",
+                bytes.len(),
+                bit_offset,
+                bit_len,
+            );
         }
-        let mut node = &mut self.root;
-        loop {
-            *node = match mem::take(node) {
-                Node::None => {
-                    if let Some(data) = data.take() {
-                        *node = Node::Leaf { label: key, bit_len, data };
-                    }
-                    break;
-                }
-                Node::Tree { cell, bit_len } => {
-                    let mut data = SliceData::load_cell(cell)?;
-                    let label = LabelReader::read_label(&mut data, bit_len)?;
-                    if let Some(new_bit_len) = bit_len.checked_sub(label.remaining_bits() + 1) {
-                        let cell = data.checked_drain_reference()?;
-                        let left = Box::new(Node::Tree { cell, bit_len: new_bit_len });
-                        let cell = data.checked_drain_reference()?;
-                        let right = Box::new(Node::Tree { cell, bit_len: new_bit_len });
-                        Node::Fork { label, bit_len, left, right }
-                    } else {
-                        Node::Leaf { label, bit_len, data }
-                    }
-                }
-                node @ Node::Fork { .. } => node,
-                node @ Node::Leaf { .. } => node,
-                Node::Job { .. } => fail!("job unreachable in insert"),
-            };
-            let Some(label) = node.label() else { fail!(ExceptionCode::FatalError) };
-            match SliceData::common_prefix(&key, label) {
-                (_, None, Some(_)) => fail!(ExceptionCode::DictionaryError),
-                // full edge - continue down
-                (_, Some(mut remainder), None) => {
-                    let Node::Fork { left, right, .. } = node else {
-                        fail!("node is not a fork after common prefix")
-                    };
-                    node = if remainder.get_next_bit()? { right.as_mut() } else { left.as_mut() };
-                    key = remainder;
-                    bit_len = key.remaining_bits();
-                }
-                // Leaf found - replace
-                (_, None, None) => {
-                    if let Some(data) = data.take() {
-                        node.set_data(data);
-                    } else {
-                        *node = Node::None;
-                    }
-                    break;
-                }
-                // slice edge - make fork with node and new leaf
-                (prefix, Some(mut remainder), Some(mut label)) => {
-                    let Some(data) = data.take() else {
-                        break;
-                    };
-                    // remainder and label are non-empty here
-                    let next_bit = remainder.get_next_bit()?;
-                    let new_bit_len = remainder.remaining_bits();
-                    label.move_by(1)?;
-                    node.set_label(label, new_bit_len);
-                    let mut left = Node::Leaf { label: remainder, bit_len: new_bit_len, data };
-                    let mut right = mem::take(node);
-                    if next_bit {
-                        mem::swap(&mut left, &mut right);
-                    }
-                    *node = Node::Fork {
-                        label: prefix.unwrap_or_default(),
-                        bit_len,
-                        left: Box::new(left),
-                        right: Box::new(right),
-                    };
-                    break;
-                }
-            }
+        Ok(Self { bytes, bit_offset, bit_len })
+    }
+
+    pub fn from_slice_data(slice: &'a SliceData) -> Self {
+        Self { bytes: slice.storage(), bit_offset: slice.pos(), bit_len: slice.remaining_bits() }
+    }
+
+    pub fn bit_len(&self) -> usize {
+        self.bit_len
+    }
+
+    fn check_range(&self, offset: usize, len: usize) -> Result<()> {
+        if offset + len > self.bit_len {
+            fail!(
+                "FixedBitsKey: range {}..{} exceeds bit_len {}",
+                offset,
+                offset + len,
+                self.bit_len
+            );
         }
         Ok(())
     }
-    fn traverse(self) -> Result<Option<Cell>> {
-        let mut root = self.root;
-        root.prune()?;
-        let mut stack = vec![root];
-        let mut results = vec![];
-        while let Some(node) = stack.pop() {
-            match node {
-                Node::None => return Ok(None),
-                Node::Tree { cell, .. } => results.push(cell),
-                Node::Leaf { label, bit_len, data } => {
-                    let builder = T::make_cell_with_label_and_data(&label, bit_len, true, &data)?;
-                    results.push(builder.into_cell()?);
-                }
-                Node::Fork { label, bit_len, left, right } => {
-                    stack.push(Node::Job { label, bit_len });
-                    stack.push(*right);
-                    stack.push(*left);
-                }
-                Node::Job { label, bit_len } => {
-                    let Some(right) = results.pop() else {
-                        fail!("no right branch for tree label: {label:x}, bit_len: {bit_len}")
-                    };
-                    let Some(left) = results.pop() else {
-                        fail!("no left branch for tree label: {label:x}, bit_len: {bit_len}")
-                    };
-                    let (builder, _data) = T::make_fork(&label, bit_len, left, right, false)?;
-                    results.push(builder.into_cell()?);
-                }
+
+    /// Read a single bit at `offset`.
+    pub fn get_bit(&self, offset: usize) -> Result<bool> {
+        self.check_range(offset, 1)?;
+        let abs = self.bit_offset + offset;
+        Ok((self.bytes[abs / 8] >> (7 - abs % 8)) & 1 != 0)
+    }
+
+    /// Extract a range of key bits as a `SliceData` (for label construction).
+    pub fn slice(&self, offset: usize, len: usize) -> Result<SliceData> {
+        if len == 0 {
+            return Ok(SliceData::default());
+        }
+        self.check_range(offset, len)?;
+        let abs = self.bit_offset + offset;
+        let mut result = SliceData::with_bitstring(self.bytes, abs + len);
+        result.move_by(abs)?;
+        Ok(result)
+    }
+
+    /// Common prefix length (in bits) between this key from `self_offset` and
+    /// `other` from `other_offset`, up to `max_len` bits.
+    pub fn common_prefix_bits(
+        &self,
+        self_offset: usize,
+        other: &Self,
+        other_offset: usize,
+        max_len: usize,
+    ) -> Result<usize> {
+        self.check_range(self_offset, max_len)?;
+        other.check_range(other_offset, max_len)?;
+
+        let abs_a = self.bit_offset + self_offset;
+        let abs_b = other.bit_offset + other_offset;
+        let ra = abs_a % 8;
+        let rb = abs_b % 8;
+        let mut qa = abs_a / 8;
+        let mut qb = abs_b / 8;
+
+        #[inline(always)]
+        fn get_bits(bytes: &[u8], q: usize, r: usize, bits: usize) -> u8 {
+            let mask = 0xFFu8.wrapping_shl((8 - bits) as u32);
+            if r + bits <= 8 {
+                (bytes[q] << r) & mask
+            } else {
+                // bytes[q + 1] is required for the data, so it's guaranteed valid when
+                // the caller has already checked the bit range via `check_range`.
+                let hi = (bytes[q] as u16) << 8;
+                let lo = bytes[q + 1] as u16;
+                ((hi | lo) >> (8 - r)) as u8 & mask
             }
         }
-        if let Some(cell) = results.pop() {
-            Ok(Some(cell))
+
+        let mut i = 0;
+        while i + 8 <= max_len {
+            let a = get_bits(self.bytes, qa, ra, 8);
+            let b = get_bits(other.bytes, qb, rb, 8);
+            if a != b {
+                return Ok(i + (a ^ b).leading_zeros() as usize);
+            }
+            i += 8;
+            qa += 1;
+            qb += 1;
+        }
+        let tail = max_len - i;
+        if tail > 0 {
+            let a = get_bits(self.bytes, qa, ra, tail);
+            let b = get_bits(other.bytes, qb, rb, tail);
+            if a != b {
+                return Ok(i + (a ^ b).leading_zeros() as usize);
+            }
+        }
+        Ok(max_len)
+    }
+}
+
+impl<'a> PartialEq for FixedBitsKey<'a> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl<'a> Ord for FixedBitsKey<'a> {
+    #[inline(always)]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        if self.bit_len != other.bit_len {
+            return self.bit_len.cmp(&other.bit_len);
+        }
+        // Fast path: both keys start on a byte boundary.
+        if self.bit_offset.is_multiple_of(8) && other.bit_offset.is_multiple_of(8) {
+            let sa = self.bit_offset / 8;
+            let ob = other.bit_offset / 8;
+            let full_bytes = self.bit_len / 8;
+            let tail = self.bit_len % 8;
+            let cmp = self.bytes[sa..sa + full_bytes].cmp(&other.bytes[ob..ob + full_bytes]);
+            if cmp != std::cmp::Ordering::Equal || tail == 0 {
+                return cmp;
+            }
+            let mask = 0xFFu8 << (8 - tail);
+            return (self.bytes[sa + full_bytes] & mask)
+                .cmp(&(other.bytes[ob + full_bytes] & mask));
+        }
+        self.cmp_unaligned(other)
+    }
+}
+
+impl<'a> FixedBitsKey<'a> {
+    /// Slow path for `Ord::cmp` when keys are not byte-aligned.
+    fn cmp_unaligned(&self, other: &Self) -> std::cmp::Ordering {
+        let common_len = self.common_prefix_bits(0, other, 0, self.bit_len).unwrap_or(0);
+        if common_len == self.bit_len {
+            std::cmp::Ordering::Equal
         } else {
-            fail!("no result cell")
+            let a = self.get_bit(common_len).unwrap_or(false);
+            let b = other.get_bit(common_len).unwrap_or(false);
+            a.cmp(&b)
+        }
+    }
+}
+
+impl<'a> PartialOrd for FixedBitsKey<'a> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Binary search for the first index in `values` whose key has bit 1 at `bit_pos`.
+/// Equivalent to `partition_point` but propagates errors.
+fn partition_by_bit(
+    values: &[(FixedBitsKey<'_>, Option<SliceData>)],
+    bit_pos: usize,
+) -> Result<usize> {
+    let mut lo = 0;
+    let mut hi = values.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if values[mid].0.get_bit(bit_pos)? {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    Ok(lo)
+}
+
+/// Build a new hashmap subtree from a sorted slice of key-value pairs.
+/// Values with `None` data are treated as deletions of non-existent keys (no-ops).
+fn dict_build_impl<T: HashmapType + ?Sized>(
+    values: &[(FixedBitsKey<'_>, Option<SliceData>)],
+    total_key_len: usize,
+    prefix_len: usize,
+) -> Result<Option<Cell>> {
+    if values.is_empty() {
+        return Ok(None);
+    }
+    if values.len() == 1 {
+        return match &values[0].1 {
+            Some(data) => {
+                let remaining = total_key_len - prefix_len;
+                let label = values[0].0.slice(prefix_len, remaining)?;
+                let builder = T::make_cell_with_label_and_data(&label, remaining, true, data)?;
+                Ok(Some(builder.into_cell()?))
+            }
+            None => Ok(None),
+        };
+    }
+    let remaining = total_key_len - prefix_len;
+    let first = &values[0].0;
+    let last = &values.last().unwrap().0;
+    let common = first.common_prefix_bits(prefix_len, last, prefix_len, remaining)?;
+    debug_assert!(common < remaining);
+
+    let split_pos = prefix_len + common;
+    let idx = partition_by_bit(values, split_pos)?;
+
+    let left = dict_build_impl::<T>(&values[..idx], total_key_len, split_pos + 1)?;
+    let right = dict_build_impl::<T>(&values[idx..], total_key_len, split_pos + 1)?;
+
+    let label = values[0].0.slice(prefix_len, common)?;
+    make_subtree_cell::<T>(&label, remaining, left, right)
+}
+
+/// Merge an existing hashmap cell with a sorted slice of new values.
+/// `n` is the remaining key bits at this level, `skip` is bits to skip in the dict's label.
+fn dict_multiset_impl<T: HashmapType + ?Sized>(
+    dict: Option<Cell>,
+    values: &[(FixedBitsKey<'_>, Option<SliceData>)],
+    n: usize,
+    total_key_len: usize,
+    skip: usize,
+) -> Result<Option<Cell>> {
+    let prefix_len = total_key_len - n;
+
+    if dict.is_none() {
+        return dict_build_impl::<T>(values, total_key_len, prefix_len);
+    }
+    if values.is_empty() {
+        debug_assert_eq!(skip, 0);
+        return Ok(dict);
+    }
+
+    // Compute common prefix length among values
+    let l2 = if values.len() <= 1 {
+        n
+    } else {
+        values[0].0.common_prefix_bits(prefix_len, &values.last().unwrap().0, prefix_len, n)?
+    };
+
+    // Split values into left/right at the divergence point
+    let split_pos = prefix_len + l2;
+    let (values_left, values_right) = if split_pos < total_key_len && values.len() > 1 {
+        let idx = partition_by_bit(values, split_pos)?;
+        (&values[..idx], &values[idx..])
+    } else {
+        (&values[..0], values)
+    };
+
+    // Parse dict's label
+    let dict_cell = dict.unwrap();
+    let mut dict_rem = SliceData::load_cell(dict_cell.clone())?;
+    let dict_label = LabelReader::read_label(&mut dict_rem, n + skip)?;
+    let l1 = dict_label.remaining_bits() - skip;
+
+    // Find how many bits of dict's label match the values' common prefix.
+    let dict_label_key = FixedBitsKey::from_slice_data(&dict_label);
+    let c = values[0].0.common_prefix_bits(prefix_len, &dict_label_key, skip, l1.min(l2))?;
+
+    if c < l1 && c < l2 {
+        // Case 1: Disjoint — dict and values diverge before either label ends.
+        // Prune dict's label and create a fork at the divergence point.
+        let pruned_label = dict_label.get_slice(skip + c + 1, l1 - c - 1)?;
+        let pruned = T::make_cell_with_label_and_data(&pruned_label, n - c - 1, false, &dict_rem)?;
+        let dict_side = pruned.into_cell()?;
+
+        let values_side = dict_build_impl::<T>(values, total_key_len, prefix_len + c + 1)?;
+
+        let dict_goes_right = dict_label.get_bit(skip + c)?;
+        let (left, right) = if !dict_goes_right {
+            (Some(dict_side), values_side)
+        } else {
+            (values_side, Some(dict_side))
+        };
+
+        let label = dict_label.get_slice(skip, c)?;
+        return make_subtree_cell::<T>(&label, n, left, right);
+    }
+
+    if c == l1 && c == l2 {
+        // Case 2: Labels match exactly.
+        if c == n {
+            // Leaf match: update or delete
+            return match &values[0].1 {
+                Some(data) => {
+                    let label = dict_label.get_slice(skip, c)?;
+                    let builder = T::make_cell_with_label_and_data(&label, n, true, data)?;
+                    Ok(Some(builder.into_cell()?))
+                }
+                None => Ok(None),
+            };
+        }
+        // Fork: recurse into both children
+        let left_child = dict_rem.checked_drain_reference()?;
+        let right_child = dict_rem.checked_drain_reference()?;
+
+        let c1 =
+            dict_multiset_impl::<T>(Some(left_child), values_left, n - c - 1, total_key_len, 0)?;
+        let c2 =
+            dict_multiset_impl::<T>(Some(right_child), values_right, n - c - 1, total_key_len, 0)?;
+
+        let label = dict_label.get_slice(skip, c)?;
+        return make_subtree_cell::<T>(&label, n, c1, c2);
+    }
+
+    if c == l1 {
+        // Case 3: c == l1 < l2 — dict's label is shorter (dict is a fork).
+        // All values share the same bit at the fork point, go to one side.
+        let left_child = dict_rem.checked_drain_reference()?;
+        let right_child = dict_rem.checked_drain_reference()?;
+
+        let values_go_right = values[0].0.get_bit(prefix_len + c)?;
+        let (c1, c2) = if !values_go_right {
+            let c1 =
+                dict_multiset_impl::<T>(Some(left_child), values, n - c - 1, total_key_len, 0)?;
+            (c1, Some(right_child))
+        } else {
+            let c2 =
+                dict_multiset_impl::<T>(Some(right_child), values, n - c - 1, total_key_len, 0)?;
+            (Some(left_child), c2)
+        };
+
+        let label = dict_label.get_slice(skip, c)?;
+        return make_subtree_cell::<T>(&label, n, c1, c2);
+    }
+
+    // Case 4: c == l2 < l1 — values' prefix is shorter (values fork within dict's edge).
+    // Dict goes to one side (with skip), other side is built from values.
+    debug_assert!(c == l2 && c < l1);
+    let dict_goes_right = dict_label.get_bit(skip + c)?;
+    let (c1, c2) = if !dict_goes_right {
+        let c1 = dict_multiset_impl::<T>(
+            Some(dict_cell),
+            values_left,
+            n - c - 1,
+            total_key_len,
+            skip + c + 1,
+        )?;
+        let c2 = dict_build_impl::<T>(values_right, total_key_len, prefix_len + c + 1)?;
+        (c1, c2)
+    } else {
+        let c2 = dict_multiset_impl::<T>(
+            Some(dict_cell),
+            values_right,
+            n - c - 1,
+            total_key_len,
+            skip + c + 1,
+        )?;
+        let c1 = dict_build_impl::<T>(values_left, total_key_len, prefix_len + c + 1)?;
+        (c1, c2)
+    };
+
+    let label = values[0].0.slice(prefix_len, c)?;
+    make_subtree_cell::<T>(&label, n, c1, c2)
+}
+
+/// Assemble a subtree from a label and two optional children.
+fn make_subtree_cell<T: HashmapType + ?Sized>(
+    label: &SliceData,
+    n: usize,
+    left: Option<Cell>,
+    right: Option<Cell>,
+) -> Result<Option<Cell>> {
+    match (left, right) {
+        (None, None) => Ok(None),
+        (Some(left), Some(right)) => {
+            let (builder, _) = T::make_fork(label, n, left, right, false)?;
+            Ok(Some(builder.into_cell()?))
+        }
+        (Some(child), None) => {
+            let next = SliceData::load_cell(child)?;
+            Ok(Some(T::make_edge(label, n, true, next)?.into_cell()?))
+        }
+        (None, Some(child)) => {
+            let next = SliceData::load_cell(child)?;
+            Ok(Some(T::make_edge(label, n, false, next)?.into_cell()?))
         }
     }
 }

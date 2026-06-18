@@ -20,7 +20,10 @@ use std::{
     },
     time::Duration,
 };
-use ton_block::{error, BlockIdExt, BlockSignaturesVariant, Ed25519KeyOption, ShardIdent, UInt256};
+use ton_block::{
+    error, BlockIdExt, BlockSignaturesVariant, Ed25519KeyOption, ShardIdent, UInt256,
+    ZeroizingBytes,
+};
 use validator_session::*;
 
 include!("../../../common/src/info.rs");
@@ -434,15 +437,6 @@ impl SessionListener for SessionInstance {
             self.source_index
         );
     }
-
-    fn get_committed_candidate(
-        &self,
-        block_id: BlockIdExt,
-        callback: consensus_common::CommittedBlockProofCallback,
-    ) {
-        log::info!("get_committed_candidate: STUB for block_id={block_id}");
-        callback(Err(error!("get_committed_candidate not implemented in test")));
-    }
 }
 
 impl SessionListener for SessionInstanceListener {
@@ -522,15 +516,6 @@ impl SessionListener for SessionInstanceListener {
                 callback,
             );
         }
-    }
-
-    fn get_committed_candidate(
-        &self,
-        block_id: BlockIdExt,
-        callback: consensus_common::CommittedBlockProofCallback,
-    ) {
-        log::info!("get_committed_candidate: STUB for block_id={block_id}");
-        callback(Err(error!("get_committed_candidate not implemented in test")));
     }
 }
 
@@ -630,7 +615,8 @@ where
     nodes.reserve(config.node_count);
 
     for _i in 0..config.node_count {
-        let private_key = Ed25519KeyOption::generate().expect("Failed to generate private key");
+        let private_key =
+            Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate private key");
         let adnl_id = private_key.id();
 
         let catchain_node =

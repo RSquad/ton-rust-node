@@ -8,6 +8,7 @@
  */
 pub mod auth;
 pub mod contracts;
+pub mod elections;
 pub mod http;
 pub mod runtime_config;
 pub mod service_main_task;

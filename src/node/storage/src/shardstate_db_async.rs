@@ -22,7 +22,6 @@ use crate::{
     StorageAlloc, TARGET,
 };
 use std::{
-    path::Path,
     sync::{
         atomic::{AtomicU32, AtomicU8, Ordering},
         Arc,
@@ -77,14 +76,15 @@ pub enum Job {
 
 #[async_trait::async_trait]
 pub trait Callback: Sync + Send {
-    async fn invoke(&self, job: Job, ok: bool);
+    /// Invoked only on successful apply; failures are retried, stop skips it.
+    async fn invoke(&self, job: Job);
 }
 
 pub struct SsNotificationCallback(tokio::sync::Notify);
 
 #[async_trait::async_trait]
 impl Callback for SsNotificationCallback {
-    async fn invoke(&self, _job: Job, _ok: bool) {
+    async fn invoke(&self, _job: Job) {
         self.0.notify_one();
     }
 }
@@ -109,17 +109,39 @@ impl Job {
 
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
 pub struct CellsDbConfig {
+    #[serde(deserialize_with = "CellsDbConfig::deserialize_states_db_queue_len")]
     pub states_db_queue_len: u32,
-    pub prefill_cells_counters: bool,
+    #[serde(default, skip_serializing, rename = "prefill_cells_counters")]
+    _prefill_cells_counters: Option<bool>,
     pub cells_cache_size_bytes: u64,
     pub counters_cache_size_bytes: u64,
     #[serde(default = "CellsDbConfig::default_cells_lru_cache_capacity")]
     pub cells_lru_cache_capacity: usize,
+    #[serde(default = "CellsDbConfig::default_counters_lru_cache_capacity")]
+    pub counters_lru_cache_capacity: usize,
 }
 
 impl CellsDbConfig {
     fn default_cells_lru_cache_capacity() -> usize {
         5_000_000
+    }
+    fn default_counters_lru_cache_capacity() -> usize {
+        5_000_000
+    }
+    fn deserialize_states_db_queue_len<'de, D: serde::Deserializer<'de>>(
+        d: D,
+    ) -> std::result::Result<u32, D::Error> {
+        let v = <u32 as serde::Deserialize>::deserialize(d)?;
+        if v < Self::min_states_db_queue_len() {
+            return Err(serde::de::Error::custom(format!(
+                "states_db_queue_len must be >= {}, got {v}",
+                Self::min_states_db_queue_len()
+            )));
+        }
+        Ok(v)
+    }
+    fn min_states_db_queue_len() -> u32 {
+        100
     }
 }
 
@@ -127,10 +149,11 @@ impl Default for CellsDbConfig {
     fn default() -> Self {
         Self {
             states_db_queue_len: 1000,
-            prefill_cells_counters: false,
-            cells_cache_size_bytes: 500_000_000,
-            counters_cache_size_bytes: 500_000_000,
+            _prefill_cells_counters: None,
+            cells_cache_size_bytes: 2_000_000_000,
+            counters_cache_size_bytes: 1_000_000_000,
             cells_lru_cache_capacity: Self::default_cells_lru_cache_capacity(),
+            counters_lru_cache_capacity: Self::default_counters_lru_cache_capacity(),
         }
     }
 }
@@ -151,6 +174,8 @@ impl ShardStateDb {
     const MASK_GC: u8 = 0x01;
     const MASK_WORKER: u8 = 0x02;
     pub(crate) const MASK_STOPPED: u8 = 0x80;
+    const GC_QUEUE_POLL_INTERVAL_MS: u64 = 10_000;
+    const PUT_QUEUE_POLL_INTERVAL_MS: u64 = 100;
 
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -158,7 +183,6 @@ impl ShardStateDb {
         shardstate_db_cf: &str,
         cell_db_cf: &str,
         counters_cf_name: &str,
-        db_root_path: impl AsRef<Path>,
         config: CellsDbConfig,
         #[cfg(feature = "telemetry")] telemetry: Arc<StorageTelemetry>,
         allocated: Arc<StorageAlloc>,
@@ -169,7 +193,6 @@ impl ShardStateDb {
             db.clone(),
             cell_db_cf,
             counters_cf_name,
-            db_root_path.as_ref(),
             &config,
             #[cfg(feature = "telemetry")]
             telemetry.clone(),
@@ -238,13 +261,13 @@ impl ShardStateDb {
                 loop {
                     let in_queue = in_queue.load(Ordering::Relaxed);
                     metrics::gauge!("ton_node_db_shardstate_queue_size").set(in_queue as f64);
-                    if in_queue >= max_queue_len {
+                    if in_queue >= max_queue_len / 2 {
                         log::warn!(
                             target: TARGET,
-                            "ShardStateDb GC: waiting for queue (current queue length: {})",
+                            "ShardStateDb GC: queue is half full (length: {}), waiting...",
                             in_queue
                         );
-                        if !sleep_nicely(stop, 1000).await {
+                        if !sleep_nicely(stop, ShardStateDb::GC_QUEUE_POLL_INTERVAL_MS).await {
                             return false;
                         }
                     } else {
@@ -415,21 +438,29 @@ impl ShardStateDb {
         state_root: Cell,
         callback: Option<Arc<dyn Callback>>,
     ) -> Result<()> {
-        let root_id = state_root.repr_hash();
+        let root_id = state_root.repr_hash().clone();
         log::debug!(
             target: TARGET,
             "ShardStateDb::put  id {}  root_cell_id {:x}",
             id, root_id
         );
+        let mut attempt = 0usize;
         loop {
             let in_queue = self.in_queue.load(Ordering::Relaxed);
             if in_queue >= self.config.states_db_queue_len {
-                log::warn!(
-                    target: TARGET,
-                    "ShardStateDb::put  id {}  root_cell_id {:x}  waiting for queue (current queue length: {})",
-                    id, root_id, in_queue
-                );
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                if attempt % 10 == 0 {
+                    log::warn!(
+                        target: TARGET,
+                        "ShardStateDb::put id {id}  root_cell_id {root_id:x} \
+                        waiting for queue (current queue length: {in_queue})"
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(Self::PUT_QUEUE_POLL_INTERVAL_MS)).await;
+                attempt += 1;
+
+                if self.stop.load(Ordering::Relaxed) & Self::MASK_STOPPED != 0 {
+                    fail!("Stopped");
+                }
             } else {
                 break;
             }
@@ -476,13 +507,13 @@ impl ShardStateDb {
             }
         }
 
-        let root_cell = self.dynamic_boc_db.load_cell(&db_entry.cell_id, false)?;
+        let root_cell = self.dynamic_boc_db.load_cell(&db_entry.cell_id)?;
         Ok(root_cell)
     }
 
     pub fn get_cell(&self, id: &UInt256) -> Result<Cell> {
-        log::debug!(target: TARGET, "ShardStateDb::get_cell  id {:x}", id);
-        self.dynamic_boc_db.load_cell(id, false)
+        log::trace!(target: TARGET, "ShardStateDb::get_cell  id {:x}", id);
+        self.dynamic_boc_db.load_cell(id)
     }
 
     pub fn create_hashed_cell_storage(
@@ -534,21 +565,6 @@ impl ShardStateDb {
             }
         };
 
-        let ss_db = Arc::clone(&self);
-
-        if ss_db.config.prefill_cells_counters {
-            log::info!(target: TARGET, "ShardStateDb worker: prefilling cells counters started");
-            if let Err(e) = tokio::task::block_in_place(|| -> Result<()> {
-                ss_db.dynamic_boc_db.fill_counters(&check_stop)
-            }) {
-                log::error!(
-                    target: TARGET,
-                    "CRITICAL! ShardStateDb::put_internal: Can't fill cells counters: {e}"
-                );
-                return;
-            }
-        }
-
         loop {
             if check_stop() {
                 return;
@@ -562,44 +578,49 @@ impl ShardStateDb {
                 self.telemetry.shardstates_queue.update(std::cmp::max(0, in_queue) as u64);
                 log::debug!("ShardStateDb worker: in_queue {}", in_queue);
 
-                let mut ok = false;
-                match &mut job {
-                    Job::PutState(cell, id) => match self.clone().put_internal(id, cell.clone()) {
-                        Err(e) => {
-                            if check_stop() {
-                                return;
+                loop {
+                    match &mut job {
+                        Job::PutState(cell, id) => {
+                            match self.clone().put_internal(id, cell.clone()) {
+                                Err(e) => {
+                                    if check_stop() {
+                                        return;
+                                    }
+                                    log::error!(
+                                        target: TARGET, "CRITICAL! ShardStateDb::put_internal  {}", e
+                                    );
+                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                    continue;
+                                }
+                                Ok(saved_root) => {
+                                    *cell = saved_root;
+                                }
                             }
-                            log::error!(
-                                target: TARGET, "CRITICAL! ShardStateDb::put_internal  {}", e
-                            );
                         }
-                        Ok(saved_root) => {
-                            *cell = saved_root;
-                            ok = true;
-                        }
-                    },
-                    Job::DeleteState(id) => {
-                        if let Err(e) = self.clone().delete_internal(id) {
-                            if check_stop() {
-                                return;
+                        Job::DeleteState(id) => {
+                            if let Err(e) = self.clone().delete_internal(id) {
+                                if check_stop() {
+                                    return;
+                                }
+                                log::error!(
+                                    target: TARGET, "CRITICAL! ShardStateDb::delete_internal  {}", e
+                                );
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                continue;
                             }
-                            log::error!(
-                                target: TARGET, "CRITICAL! ShardStateDb::delete_internal  {}", e
-                            );
-                        } else {
-                            ok = true
                         }
                     }
+                    break;
                 }
                 if let Some(callback) = callback {
-                    let _ = callback.invoke(job, ok).await;
+                    let _ = callback.invoke(job).await;
                 }
             }
         }
     }
 
     fn put_internal(self: Arc<Self>, id: &BlockIdExt, state_root: Cell) -> Result<Cell> {
-        let cell_id = state_root.repr_hash();
+        let cell_id = state_root.repr_hash().clone();
 
         log::trace!(
             target: TARGET,
@@ -613,7 +634,7 @@ impl ShardStateDb {
                 "ShardStateDb::put_internal  ALREADY EXISTS  id {}  root_cell_id {:x}",
                 id, cell_id
             );
-            return self.dynamic_boc_db.load_cell(&cell_id, false);
+            return self.dynamic_boc_db.load_cell(&cell_id);
         }
 
         let ss_db = self.clone();
@@ -647,6 +668,8 @@ impl ShardStateDb {
         let db_entry = DbEntry::deserialize(&self.shardstate_db.get(id)?)?;
 
         let ss_db = self.clone();
+        let shardstate_db = self.shardstate_db.clone();
+        let id_for_batch = id.clone();
         tokio::task::block_in_place(|| {
             let check_stop = || {
                 if ss_db.stop.load(Ordering::Relaxed) & Self::MASK_STOPPED != 0 {
@@ -655,10 +678,10 @@ impl ShardStateDb {
                     Ok(())
                 }
             };
-            ss_db.dynamic_boc_db.delete_boc(&db_entry.cell_id, &check_stop)
+            ss_db.dynamic_boc_db.delete_boc(&db_entry.cell_id, &check_stop, |batch| {
+                shardstate_db.add_delete_to_batch(batch, &id_for_batch)
+            })
         })?;
-
-        self.shardstate_db.delete(id)?;
 
         log::trace!(target: TARGET, "ShardStateDb::delete_internal  DONE  id {}", id);
         Ok(())

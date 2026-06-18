@@ -44,12 +44,79 @@ If nodectl runs in a different cluster than the validators, the Control Server p
 
 ### Create a vault secret
 
-See [Secrets Vault](../../ton-rust-node/docs/vault.md) for vault setup, URL formats, and security details.
+nodectl supports two vault backends. Pick one based on where you want the
+secrets to live.
+
+| Backend | URL scheme | Where secrets live | Typical use |
+|---------|------------|--------------------|-------------|
+| **File** | `file://` | Encrypted JSON file on the nodectl PVC, AES-256-GCM under a master key | Single-cluster deployments, simplest setup |
+| **HashiCorp Vault** | `hashicorp://` | Remote Vault — Ed25519 keys in Transit engine, blobs in KV v2 | Multi-tenant infra, shared key management, centralised audit |
+
+#### File backend
 
 ```bash
 kubectl create secret generic nodectl-vault \
   --from-literal=VAULT_URL="file:///nodectl/data/vault.json?master_key=$(openssl rand -hex 32)"
 ```
+
+The master key is a 32-byte AES-256 encryption key (64 hex characters). Store
+it securely — anyone with the key can decrypt the vault file.
+
+#### HashiCorp Vault backend
+
+Prepare the Vault server (enable the Transit and KV v2 engines, create the policy and — for Kubernetes auth — the role) per [vault.md → HashiCorp Vault backend](../../ton-rust-node/docs/vault.md#hashicorp-vault-backend). The procedure is identical for nodectl and the node chart; only the placeholders differ.
+
+Use these values when applying the policy and role templates:
+
+| Placeholder        | nodectl value     |
+|--------------------|-------------------|
+| `<TRANSIT_MOUNT>`  | `ton-transit`     |
+| `<TRANSIT_PREFIX>` | `nodectl`         |
+| `<KV_MOUNT>`       | `ton`             |
+| `<KV_PREFIX>`      | `nodectl`         |
+| `<AUTH_MOUNT>`     | `kubernetes`      |
+| `<ROLE>`           | `nodectl`         |
+| `<SA>`             | `nodectl-sa`      |
+
+For the full `VAULT_URL` grammar (every accepted query parameter, defaults) see [secrets-vault README](../../../src/secrets-vault/README.md#vault-url-schemes).
+
+##### Create the K8s Secret
+
+Pick one of the two URLs and put it into a `Secret` referenced by `vault.secretName`.
+
+**Static token** — for development or out-of-cluster Vault:
+
+```bash
+kubectl create secret generic nodectl-vault \
+  --from-literal=VAULT_URL='hashicorp://https://vault.example.com:8200?api_key=hvs.xxx&transit_mount=ton-transit&transit_prefix=nodectl&kv_mount=ton&kv_prefix=nodectl'
+```
+
+**Kubernetes auth** — recommended for in-cluster Vault:
+
+```bash
+kubectl create secret generic nodectl-vault \
+  --from-literal=VAULT_URL='hashicorp://http://vault.vault.svc:8200?auth=k8s&auth_mount=kubernetes&role=nodectl&transit_mount=ton-transit&transit_prefix=nodectl&kv_mount=ton&kv_prefix=nodectl'
+```
+
+##### Helm values
+
+For Kubernetes auth, the chart must attach the SA bound to the Vault role:
+
+```yaml
+vault:
+  secretName: nodectl-vault
+
+serviceAccount:
+  enabled: true        # chart creates the SA
+  name: nodectl-sa     # must match bound_service_account_names in the Vault role
+  # OR, to attach an existing SA you manage yourself:
+  # enabled: false
+  # name: my-existing-sa
+```
+
+##### Migrating from the file backend
+
+If you already run nodectl on the file backend and want to move secrets into HashiCorp Vault without re-generating keys, use the dedicated migration command — see [copy-file-to-hashicorp.md](copy-file-to-hashicorp.md). The target Vault must already be prepared per the steps above.
 
 ### Install the chart
 
@@ -138,16 +205,27 @@ nodectl config wallet add -n wallet2 -s wallet-key-2
 | `-i` | Subwallet ID | `42` |
 | `-w` | Workchain | `-1` |
 
-> **Why one wallet per node?** The SNP contract address is computed from `owner_address + validator_wallet_address`. If two nodes share a wallet, they produce the same pool address and cannot participate in elections independently. See [Key concepts](../README.md#single-nominator-pool-snp).
+> **Why one wallet per node?** The SNP contract address is computed from `owner_address + validator_wallet_address`. If two nodes share a wallet, they produce the same pool address and cannot participate in elections independently. See [Key concepts](../README.md#single-nominator-pool-snp). TONCore pools use a different model — see [TONCore nominator pools](#toncore-nominator-pools).
 
 ### Add pools
+
+nodectl supports two nominator pool types. Choose based on your operational model:
+
+| | **SNP** (Single Nominator Pool) | **TONCore** (Nominator Pool) |
+|---|---|---|
+| **Pool contracts** | 1 per node | 2 per node (even + odd slots) |
+| **Round participation** | Every round from one pool | Each pool participates in **1 of 2** consecutive rounds |
+| **Validator stake deposit** | Not required — pool balance is the stake | Required — validator must deposit into each pool via `deposit-validator` |
+| **Stake policies** | All supported (Minimum, Fixed, Split50, AdaptiveSplit50) | Split50 / AdaptiveSplit50 behave differently — stake the **full liquid balance** instead of half (see [below](#stake-policy-limitations)) |
+
+#### Single Nominator Pool (SNP)
 
 Add Single Nominator Pools with the owner address. The pool contract address is computed automatically on startup:
 
 ```bash
-nodectl config pool add -n pool0 --owner="<OWNER_ADDRESS>"
-nodectl config pool add -n pool1 --owner="<OWNER_ADDRESS>"
-nodectl config pool add -n pool2 --owner="<OWNER_ADDRESS>"
+nodectl config pool add -n pool0 --owner=”<OWNER_ADDRESS>”
+nodectl config pool add -n pool1 --owner=”<OWNER_ADDRESS>”
+nodectl config pool add -n pool2 --owner=”<OWNER_ADDRESS>”
 ```
 
 > **Note:** Use `--owner=` (with `=`) when the address starts with `-1:` — otherwise the CLI parser treats `-1:...` as a flag.
@@ -155,8 +233,80 @@ nodectl config pool add -n pool2 --owner="<OWNER_ADDRESS>"
 If the pool contract is already deployed, pass its address instead:
 
 ```bash
-nodectl config pool add -n pool0 -a "-1:<POOL_CONTRACT_ADDRESS>"
+nodectl config pool add -n pool0 -a “-1:<POOL_CONTRACT_ADDRESS>”
 ```
+
+#### Nominator pool (TONCore)
+
+##### How it works
+
+A Nominator Pool participates in **only one of every two consecutive election rounds**. The TON Elector alternates between even and odd rounds, and each on-chain pool contract is bound to one of them. This means:
+
+- With a **single slot** (even **or** odd) you validate in **every other round** — skipping the alternate one.
+- To validate in **every round**, configure **both slots** (`--even` and `--odd`) under the same pool name. nodectl automatically picks the correct slot for each round.
+
+Unlike SNP — where the pool balance is the stake — a TONCore pool requires a **validator stake deposit**. The validator must explicitly send funds into each pool contract via `deposit-validator` before elections can proceed. See [Validator stake deposit](#validator-stake-deposit) below.
+
+##### Adding pools
+
+Both slots are registered under a single pool name (e.g. `core0`) with two separate commands. You bind the node once to that pool name; nodectl manages both slot addresses.
+
+**If the pool contracts are already deployed**, pass their addresses:
+
+```bash
+nodectl config pool add core -n core0 --even --address=”-1:<EVEN_POOL_ADDRESS>”
+nodectl config pool add core -n core0 --odd  --address=”-1:<ODD_POOL_ADDRESS>”
+```
+
+**Otherwise**, register slots with deploy parameters (adjust shares and minima to your network and economics):
+
+```bash
+nodectl config pool add core -n core0 --even \
+  --validator-share 1000 \
+  --min-validator-stake 10000 \
+  --min-nominator-stake 10000
+
+nodectl config pool add core -n core0 --odd \
+  --validator-share 1000 \
+  --min-validator-stake 10001 \
+  --min-nominator-stake 10000
+```
+
+> **Distinct slot addresses:** the **even** and **odd** contracts must have **different** on-chain addresses. The derived address is a function of the validator wallet plus the slot’s **init parameters**; identical params on both slots yield the **same** address. A common pattern is to change **`min-validator-stake` by one unit** (TON) between slots (this example uses **`10000` vs `10001`**). You can vary any numeric deploy field as long as the resulting init data differs.
+
+| Flag | Meaning |
+|------|---------|
+| `--even` / `--odd` | Which validation-round slot this contract covers (required; pick exactly one per command). |
+| `--validator-share` | Validator reward share in **basis points** (e.g. `1000` = 10%). |
+| `--min-validator-stake` | Minimum validator stake locked in the pool, **TON**. If omitted, the service default is **`100_000` TON**. |
+| `--min-nominator-stake` | Minimum stake per nominator, **TON**. If omitted, the service default is **`10_000` TON**. |
+
+##### Validator stake deposit
+
+TONCore pools require a validator stake — funds the validator locks into the pool before it can participate in elections. This is separate from nominator deposits. Each `deposit-validator` call sends TON from the **validator wallet** (resolved via the binding) into the specified pool slot.
+
+The deposit amount must be **>=** the slot’s `min-validator-stake`. Fund the validator wallet on-chain first; it must cover the deposit amount plus gas.
+
+After the binding exists and the validator wallet is funded, run:
+
+```bash
+nodectl config pool deposit-validator -b node0 -a 10000 --pool-even
+nodectl config pool deposit-validator -b node0 -a 10001 --pool-odd
+```
+
+| Flag | Description |
+|------|-------------|
+| `-b` | Binding name (same as the node name in `config bind add -n …`). Resolves the **validator wallet** and pool. |
+| `-a` | **Validator stake** in **TON**, sent from the binding’s wallet into the pool slot. |
+| `--pool-even` / `--pool-odd` | Which TONCore slot receives the deposit (default if omitted: even). |
+
+> **`deposit-validator` is executed by the CLI with local vault + RPC** (not via the REST API yet). Run it from the pod shell where `CONFIG_PATH` and `VAULT_URL` are set.
+
+##### Stake policy limitations
+
+**Split50** and **AdaptiveSplit50** are designed for SNP, where a single pool re-splits its balance across alternating rounds. TONCore uses **two separate pools** that each stake in only one round, so splitting inside a round has no effect. When the binding points at a TONCore pool, nodectl ignores these two policies and stakes the **full liquid balance** of the active slot’s pool (still floored at `min_stake`).
+
+To control per-round exposure with TONCore, use **Fixed** or **Minimum** instead. See [staking strategies](elections.md) for details.
 
 ### Add bindings
 
@@ -331,7 +481,7 @@ The `contracts_task` automatically:
 
 1. Deploys the master wallet contract
 2. Deploys each validator wallet (sends 1 TON from master)
-3. Deploys each SNP pool contract (sends 1 TON from master)
+3. Deploys each configured pool contract — SNP pools and TONCore even/odd slots (sends 1 TON from master per pool deployment)
 
 Look for: `all contracts are ready` — all wallets and pools are deployed.
 

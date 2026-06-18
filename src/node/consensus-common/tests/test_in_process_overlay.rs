@@ -24,7 +24,7 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime},
 };
-use ton_block::{KeyId, Result};
+use ton_block::{Ed25519KeyOption, KeyId, Result, ZeroizingBytes};
 
 include!("../../../common/src/test.rs");
 
@@ -136,7 +136,12 @@ impl ConsensusOverlayListener for TestListener {
         );
         self.query_count.fetch_add(1, Ordering::SeqCst);
     }
-    fn on_broadcast(&self, from: PublicKeyHash, payload: &BlockPayloadPtr) {
+    fn on_broadcast(
+        &self,
+        from: PublicKeyHash,
+        payload: &BlockPayloadPtr,
+        _source: consensus_common::BroadcastSource,
+    ) {
         log::trace!(
             target: "in_process_overlay_test",
             "on_broadcast called (local_id: {}, from: {from}, msg_size: {})",
@@ -190,13 +195,13 @@ fn run_overlay_test(manager: ConsensusOverlayManagerPtr) -> Result<()> {
     let mut nodes = Vec::new();
     for _ in 0..NUM_NODES {
         let private_key =
-            ton_block::Ed25519KeyOption::generate().expect("Failed to generate private key");
+            Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate private key");
         let public_key_bytes = private_key
             .pub_key()
             .expect("Failed to get public key")
             .try_into()
             .expect("Invalid public key length");
-        let public_key = ton_block::Ed25519KeyOption::from_public_key(public_key_bytes);
+        let public_key = Ed25519KeyOption::<ZeroizingBytes>::from_public_key(public_key_bytes);
         let adnl_id = public_key.id();
         node_ids.push(adnl_id.clone());
         nodes.push(ConsensusNode { adnl_id: adnl_id.clone(), public_key });
@@ -222,6 +227,7 @@ fn run_overlay_test(manager: ConsensusOverlayManagerPtr) -> Result<()> {
             weak_listener,
             make_log_replay_listener(),
             TRANSPORT_TYPE,
+            None,
         )?;
         overlays.push(overlay);
         listeners.push(listener);
@@ -338,7 +344,12 @@ impl ConsensusOverlayListener for PerformanceTestListener {
         std::thread::sleep(CALLBACK_SLEEP_TIME);
     }
 
-    fn on_broadcast(&self, _from: PublicKeyHash, payload: &BlockPayloadPtr) {
+    fn on_broadcast(
+        &self,
+        _from: PublicKeyHash,
+        payload: &BlockPayloadPtr,
+        _source: consensus_common::BroadcastSource,
+    ) {
         let latency =
             SystemTime::now().duration_since(payload.get_creation_time()).unwrap_or_default();
         self.broadcast_latencies.lock().unwrap().push(latency);
@@ -399,13 +410,13 @@ fn run_overlay_performance_test(manager: ConsensusOverlayManagerPtr) -> Result<(
     let mut nodes = Vec::new();
     for _ in 0..NUM_NODES {
         let private_key =
-            ton_block::Ed25519KeyOption::generate().expect("Failed to generate private key");
+            Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate private key");
         let public_key_bytes = private_key
             .pub_key()
             .expect("Failed to get public key")
             .try_into()
             .expect("Invalid public key length");
-        let public_key = ton_block::Ed25519KeyOption::from_public_key(public_key_bytes);
+        let public_key = Ed25519KeyOption::<ZeroizingBytes>::from_public_key(public_key_bytes);
         let adnl_id = public_key.id();
         node_ids.push(adnl_id.clone());
         nodes.push(ConsensusNode { adnl_id: adnl_id.clone(), public_key });
@@ -427,6 +438,7 @@ fn run_overlay_performance_test(manager: ConsensusOverlayManagerPtr) -> Result<(
             weak_listener,
             make_log_replay_listener(),
             TRANSPORT_TYPE,
+            None,
         )?;
         overlays.push(overlay);
         all_listeners.push(listener);

@@ -17,8 +17,8 @@ use std::{
     sync::{Arc, LazyLock},
 };
 use ton_block::{
-    error, fail, unpack_out_action_slices, AccStatusChange, Account, AccountId, AccountStatus,
-    AddSub, BlockError, BouncedByPhase, Cell, ChildCell, Coins, ComputeSkipReason,
+    error, fail, time_checker, unpack_out_action_slices, AccStatusChange, Account, AccountId,
+    AccountStatus, AddSub, BlockError, BouncedByPhase, Cell, ChildCell, Coins, ComputeSkipReason,
     CurrencyCollection, Deserializable, ExceptionCode, GasLimitsPrices, GetRepresentationHash,
     GlobalCapabilities, HashmapE, HashmapFilterResult, IBitstring, Mask, Message, MsgAddressInt,
     NewBounceBody, NewBounceComputePhaseInfo, NewBounceOriginalInfo, OutAction, Result,
@@ -34,7 +34,7 @@ use ton_block::{
 };
 use ton_vm::{
     error::tvm_exception_full,
-    executor::{gas::gas_state::Gas, BehaviorModifiers, Engine},
+    executor::{gas::gas_state::Gas, BehaviorModifiers, Engine, TraceCallback},
     smart_contract_info::{PrevBlocksInfo, SmartContractInfo},
     stack::{savelist::SaveList, Stack, StackItem},
 };
@@ -68,7 +68,7 @@ const RESULT_CODE_LIB_BAD_CELL: i32 = 41;
 const RESULT_CODE_LIB_BAD_ACCOUNT_STATE: i32 = 42;
 const RESULT_CODE_LIB_EXCEEDED_LIMITS: i32 = 43;
 
-const MAX_ACTIONS: usize = 255;
+pub(crate) const MAX_ACTIONS: usize = 255;
 
 static SPECIAL_LIMIT_ACCOUNTS: LazyLock<HashMap<MsgAddressInt, (u32, u64)>> = LazyLock::new(|| {
     let limits = [
@@ -109,7 +109,7 @@ pub struct ExecuteParams {
     pub last_tr_lt: u64,
     pub seed_block: UInt256,
     pub debug: bool,
-    pub trace_callback: Option<Arc<ton_vm::executor::TraceCallback>>,
+    pub trace_callback: Option<Arc<TraceCallback>>,
     pub behavior_modifiers: Option<BehaviorModifiers>,
     pub prev_blocks_info: PrevBlocksInfo,
 }
@@ -251,7 +251,6 @@ pub trait TransactionExecutor {
         );
         acc_balance.add(msg_balance)?;
         Ok(TrCreditPhase::new(msg_balance.clone()))
-        //TODO: Is it need to credit with ihr_fee value in internal messages?
     }
 
     /// Implementation of transaction's computing phase.
@@ -435,6 +434,7 @@ pub trait TransactionExecutor {
 
         let result = vm.execute();
         log::trace!(target: "executor", "execute result: {:?}", result);
+        vm_phase.success = vm.is_committed_state();
         let mut raw_exit_arg = None;
         match result {
             Ok(exit_code) => vm_phase.exit_code = exit_code,
@@ -450,14 +450,15 @@ pub trait TransactionExecutor {
                         None => ExceptionCode::UnknownError as i32,
                     }
                 };
-                vm_phase.exit_arg = match value.as_integer_value(i32::MIN..=i32::MAX) {
-                    Err(_) | Ok(0) => None,
-                    Ok(exit_arg) => Some(exit_arg),
-                };
+                // set exit_arg only if phase is !success
+                if let Ok(v) = value.as_integer_value(i32::MIN..=i32::MAX) {
+                    if v != 0 && !vm_phase.success {
+                        vm_phase.exit_arg = Some(v);
+                    }
+                }
                 raw_exit_arg = Some(value);
             }
         };
-        vm_phase.success = vm.is_committed_state();
         log::debug!(target: "executor", "VM terminated with exit code {}", vm_phase.exit_code);
 
         // calc gas fees
@@ -535,24 +536,23 @@ pub trait TransactionExecutor {
         let mut phase = TrActionPhase::default();
         let mut total_reserved_value = Coins::default();
         let mut bounce = false;
-        phase.action_list_hash = actions_cell.repr_hash();
-        let action_slices =
-            match SliceData::load_cell(actions_cell).and_then(unpack_out_action_slices) {
-                Err(err) => {
-                    log::debug!(
-                        target: "executor",
-                        "cannot parse action list: format is invalid, err: {}",
-                        err
-                    );
-                    phase.result_code = RESULT_CODE_ACTIONLIST_INVALID;
-                    return Ok(ActionPhaseResult::from_phase(phase, bounce));
-                }
-                Ok(actions) => actions,
-            };
-
+        phase.action_list_hash = actions_cell.repr_hash().clone();
+        let action_slices = match unpack_out_action_slices(actions_cell) {
+            Ok(actions) => actions,
+            Err((position, err)) => {
+                log::debug!(
+                    target: "executor",
+                    "action list invalid at position {position}: {err}"
+                );
+                phase.result_code = RESULT_CODE_ACTIONLIST_INVALID;
+                phase.result_arg = Some(position as i32);
+                return Ok(ActionPhaseResult::from_phase(phase, bounce));
+            }
+        };
         if action_slices.len() > MAX_ACTIONS {
             log::debug!(target: "executor", "too many actions: {}", action_slices.len());
             phase.result_code = RESULT_CODE_TOO_MANY_ACTIONS;
+            phase.result_arg = Some(MAX_ACTIONS as i32 + 1);
             return Ok(ActionPhaseResult::from_phase(phase, bounce));
         }
         phase.tot_actions = action_slices.len() as i16;
@@ -565,50 +565,52 @@ pub trait TransactionExecutor {
         let limits = self.config().size_limits_config();
 
         let mut parsed_actions = Vec::with_capacity(action_slices.len());
-        for (i, mut slice) in action_slices.into_iter().enumerate() {
-            match OutAction::construct_from(&mut slice) {
-                Ok(action) => parsed_actions.push(Some(action)),
-                Err(err) => {
-                    if let Some(BlockError::OutActionError(_, mode)) = err.downcast_ref() {
-                        if mode.bit(SENDMSG_IGNORE_ERROR) {
-                            phase.skipped_actions += 1;
-                            parsed_actions.push(None);
-                            continue;
-                        } else if mode.bit(SENDMSG_BOUNCE_IF_FAIL) {
-                            bounce = true;
-                        }
-                    };
-                    log::debug!(
-                        target: "executor",
-                        "invalid action {i} found while preprocessing action list: {err}"
-                    );
-                    phase.result_code = RESULT_CODE_UNKNOWN_OR_INVALID_ACTION;
-                    if i != 0 {
-                        phase.result_arg = Some(i as i32);
+        for (i, slice) in action_slices.into_iter().enumerate() {
+            if let Err(err) = OutAction::skip(&mut slice.clone()) {
+                log::debug!(
+                    target: "executor",
+                    "invalid action {i} found while preprocessing action list: {err:?}"
+                );
+                if let Some(BlockError::OutActionError(_, mode)) = err.downcast_ref() {
+                    if mode.bit(SENDMSG_IGNORE_ERROR) {
+                        phase.skipped_actions += 1;
+                        parsed_actions.push(None);
+                        continue;
+                    } else if mode.bit(SENDMSG_BOUNCE_IF_FAIL) {
+                        bounce = true;
                     }
-                    return finish_action_phase_with_fine(
-                        tr,
-                        phase,
-                        Some(msg_remaining_balance),
-                        acc_balance,
-                        bounce,
-                    );
+                };
+                phase.result_code = RESULT_CODE_UNKNOWN_OR_INVALID_ACTION;
+                if i != 0 {
+                    phase.result_arg = Some(i as i32);
                 }
+                return finish_action_phase_with_fine(
+                    tr,
+                    phase,
+                    Some(msg_remaining_balance),
+                    acc_balance,
+                    bounce,
+                );
             }
+            parsed_actions.push(Some(slice));
         }
 
-        for (i, action) in parsed_actions.into_iter().enumerate() {
-            let Some(action) = action else {
+        phase.valid = true;
+        for (i, slice) in parsed_actions.into_iter().enumerate() {
+            let Some(mut slice) = slice else {
                 continue;
             };
-            log::debug!(target: "executor", "\nAction #{}\nType: {}\nInitial balance: {}",
-                i,
-                action_type(&action),
-                balance_to_string(Some(&acc_remaining_balance))
-            );
+            // set result_arg to index of failed action in case of error
+            phase.result_arg = Some(i as i32);
             let mut init_balance = acc_remaining_balance.clone();
-            let mut err_code = match action {
-                OutAction::SendMsg { mode, mut out_msg } => {
+            let mut err_code = match OutAction::construct_from(&mut slice) {
+                Ok(OutAction::SendMsg { mode, mut out_msg }) => {
+                    log::debug!(
+                        target: "executor",
+                        "\nAction #{i}\nType: SendMsg flag: {mode}, value: {}\nInitial balance: {}",
+                        balance_to_string(out_msg.value()),
+                        balance_to_string(Some(&acc_remaining_balance))
+                    );
                     let result = outmsg_action_handler(
                         &mut phase,
                         mode,
@@ -629,6 +631,10 @@ pub trait TransactionExecutor {
                             0
                         }
                         Err(code) => {
+                            log::debug!(
+                                target: "executor",
+                                "outmsg_action_handler failed with code {code}"
+                            );
                             if code != RESULT_CODE_SKIPPED && (SENDMSG_BOUNCE_IF_FAIL & mode) != 0 {
                                 bounce = true;
                             }
@@ -636,7 +642,14 @@ pub trait TransactionExecutor {
                         }
                     }
                 }
-                OutAction::ReserveCurrency { mode, value } => {
+                Ok(OutAction::ReserveCurrency { mode, value }) => {
+                    log::debug!(
+                        target: "executor",
+                        "\nAction #{i}\nType: ReserveCurrency flag: \
+                        {mode} value: {}\nInitial balance: {}",
+                        balance_to_string(Some(&value)),
+                        balance_to_string(Some(&acc_remaining_balance))
+                    );
                     match reserve_action_handler(
                         mode,
                         &value,
@@ -658,8 +671,14 @@ pub trait TransactionExecutor {
                         }
                     }
                 }
-                OutAction::SetCode { new_code: code } => {
-                    match setcode_action_handler(&mut acc_copy, code) {
+                Ok(OutAction::SetCode { new_code }) => {
+                    log::debug!(
+                        target: "executor",
+                        "\nAction #{i}\nType: SetCode {:x}\nInitial balance: {}",
+                        new_code.repr_hash(),
+                        balance_to_string(Some(&acc_remaining_balance))
+                    );
+                    match setcode_action_handler(&mut acc_copy, new_code) {
                         None => {
                             phase.spec_actions += 1;
                             0
@@ -667,12 +686,22 @@ pub trait TransactionExecutor {
                         Some(code) => code,
                     }
                 }
-                OutAction::ChangeLibrary { mode, code, hash } => {
+                Ok(OutAction::ChangeLibrary { mode, code, hash }) => {
+                    log::debug!(
+                        target: "executor",
+                        "\nAction #{i}\nType: ChangeLibrary flag: {mode}\nInitial balance: {}",
+                        balance_to_string(Some(&acc_remaining_balance))
+                    );
                     let mode = mode >> 1;
-                    let code = change_library_action_handler(limits, &mut acc_copy, mode, code, hash).unwrap_or_else(|err| {
-                        log::debug!(target: "executor", "change_library_action_handler failed: {}", err);
-                        RESULT_CODE_LIB_BAD_ACCOUNT_STATE
-                    });
+                    let code =
+                        change_library_action_handler(limits, &mut acc_copy, mode, code, hash)
+                            .unwrap_or_else(|err| {
+                                log::debug!(
+                                    target: "executor",
+                                    "change_library_action_handler failed: {err}"
+                                );
+                                RESULT_CODE_LIB_BAD_ACCOUNT_STATE
+                            });
                     if code == 0 {
                         phase.spec_actions += 1;
                     } else if mode.bit(CHANGE_SET_LIB_BOUNCE_IF_FAIL) {
@@ -680,7 +709,18 @@ pub trait TransactionExecutor {
                     }
                     code
                 }
-                OutAction::None => RESULT_CODE_UNKNOWN_OR_INVALID_ACTION,
+                Ok(OutAction::None) => RESULT_CODE_UNKNOWN_OR_INVALID_ACTION,
+                Err(err) => {
+                    let msg = match err.downcast_ref() {
+                        Some(BlockError::OutActionError(err, _)) => err.to_string(),
+                        _ => err.to_string(),
+                    };
+                    log::debug!(
+                        target: "executor",
+                        "cannot parse outbound message in action {i}: format is invalid, err: {msg}"
+                    );
+                    RESULT_CODE_UNSUPPORTED
+                }
             };
             init_balance.sub(&acc_remaining_balance)?;
             log::debug!(target: "executor", "Final balance:   {}\nDelta:           {}",
@@ -691,7 +731,7 @@ pub trait TransactionExecutor {
             if err_code != 0 && !is_special && !check_account_size_limits(limits, &mut acc_copy)? {
                 fail!("Account size limits exceeded");
             }
-            if err_code == -1 {
+            if err_code == RESULT_CODE_UNSUPPORTED {
                 err_code = RESULT_CODE_UNKNOWN_OR_INVALID_ACTION;
             }
             if err_code == RESULT_CODE_SKIPPED {
@@ -700,9 +740,6 @@ pub trait TransactionExecutor {
                 log::debug!(target: "executor", "action failed: error_code={}", err_code);
                 phase.valid = true;
                 phase.result_code = err_code;
-                if i != 0 {
-                    phase.result_arg = Some(i as i32);
-                }
                 if err_code == RESULT_CODE_NOT_ENOUGH_COINS
                     || err_code == RESULT_CODE_NOT_ENOUGH_EXTRA
                 {
@@ -720,17 +757,25 @@ pub trait TransactionExecutor {
 
         //calc new account balance
         if !total_reserved_value.is_zero() {
-            log::debug!(target: "executor", "\nReturn reserved balance:\nInitial:  {}\nReserved: {}",
+            log::debug!(
+                target: "executor",
+                "\nReturn reserved balance:\nInitial:  {}\nReserved: {}",
                 balance_to_string(Some(&acc_remaining_balance)),
                 total_reserved_value
             );
             if let Err(err) = acc_remaining_balance.coins.add(&total_reserved_value) {
-                log::debug!(target: "executor", "failed to add account balance with reserved value {}", err);
+                log::debug!(
+                    target: "executor",
+                    "failed to add account balance with reserved value {err}"
+                );
                 fail!("failed to add account balance with reserved value {}", err)
             }
         }
 
-        log::debug!(target: "executor", "Final:    {}", balance_to_string(Some(&acc_remaining_balance)));
+        log::debug!(
+            target: "executor",
+            "Final:    {}", balance_to_string(Some(&acc_remaining_balance))
+        );
 
         msg_remaining_balance.coins.sub_checked(&phase.action_fine);
 
@@ -744,8 +789,14 @@ pub trait TransactionExecutor {
         if let Some(new_data) = new_data {
             acc_copy.set_data(new_data);
         }
+        // Roots the stat ran over : the candidate state — tentative on
+        // a limit rollback, final on success.
+        tr.set_account_updates(acc_copy.storage_roots());
         if !is_special && !check_account_size_limits(limits, &mut acc_copy)? {
-            log::debug!(target: "executor", "Account size limits exceeded. Taking fine and rolling back state");
+            log::debug!(
+                target: "executor",
+                "Account size limits exceeded. Taking fine and rolling back state"
+            );
             phase.result_code = RESULT_CODE_EXCEEDED_LIMITS;
             return finish_action_phase_with_fine(tr, phase, None, acc_balance, true);
         }
@@ -755,6 +806,8 @@ pub trait TransactionExecutor {
         log::debug!(target: "executor", "Total action fees: {}", fee);
         tr.add_fee_coins(&fee)?;
 
+        // Reset result_arg on success
+        phase.result_arg = None;
         phase.success = true;
         *acc_balance = acc_remaining_balance;
         *acc = acc_copy;
@@ -805,7 +858,7 @@ pub trait TransactionExecutor {
                 if extra_flags.bit(EXTRA_FLAG_FULL_BODY_BOUNCE) {
                     body.clone().into_cell()?
                 } else {
-                    body.get_slice(body.remaining_bits())?.into_cell()?
+                    body.get_slice(0, body.remaining_bits())?.into_cell()?
                 }
             } else {
                 Cell::default()
@@ -869,13 +922,19 @@ pub trait TransactionExecutor {
         let compute_phase_fees = compute_phase.gas_fees();
         if remaining_msg_balance.coins < fwd_full_fees + compute_phase_fees {
             log::debug!(
-                target: "executor", "bounce phase - not enough value {} to get compute fee {} and fwd fee {}",
-                remaining_msg_balance.coins, compute_phase_fees, fwd_full_fees);
+                target: "executor",
+                "bounce phase - not enough value {} to get compute fee \
+                {compute_phase_fees} and fwd fee {fwd_full_fees}",
+                remaining_msg_balance.coins
+            );
             return Ok((TrBouncePhase::no_funds(msg_size, fwd_full_fees), None));
         }
 
-        log::debug!(target: "executor", "get compute fee {} and forward fee {} from bounce msg {}",
-            compute_phase_fees, fwd_full_fees, remaining_msg_balance);
+        log::debug!(
+            target: "executor",
+            "get compute fee {compute_phase_fees} and forward fee {fwd_full_fees} \
+            from bounce msg {remaining_msg_balance}"
+        );
 
         acc_balance.sub(&remaining_msg_balance)?;
         remaining_msg_balance.coins.sub(&fwd_full_fees)?;
@@ -1211,7 +1270,7 @@ fn outmsg_action_handler(
             }
             Err(IncorrectCheckRewrite::Other) => {
                 log::warn!(target: "executor", "Incorrect destination address {}", int_header.dst);
-                return Err(RESULT_CODE_UNKNOWN_OR_INVALID_ACTION);
+                return check_skip_invalid(RESULT_CODE_UNKNOWN_OR_INVALID_ACTION);
             }
         }
 
@@ -1227,6 +1286,21 @@ fn outmsg_action_handler(
             int_header.ihr_disabled = true;
         }
         int_header.bounced = false;
+
+        let max_extras = config.size_limits_config().max_msg_extra_currencies as usize;
+        let extras_count = int_header.value.other.count(max_extras + 1).map_err(|err| {
+            log::warn!(target: "executor", "cannot count extra currencies: {err}");
+            RESULT_CODE_TOO_MANY_EXTRA // replicate CPP behavior
+        })?;
+        if extras_count > max_extras {
+            log::debug!(target: "executor",
+                "too many extra currencies in outbound message");
+            return check_skip_invalid(RESULT_CODE_TOO_MANY_EXTRA);
+        }
+        int_header.value.remove_zero_currencies().map_err(|err| {
+            log::warn!(target: "executor", "cannot remove zero extra currencies: {err}");
+            RESULT_CODE_TOO_MANY_EXTRA // replicate CPP behavior
+        })?;
     }
 
     let fwd_prices = config.get_fwd_prices(msg.is_masterchain());
@@ -1331,7 +1405,7 @@ fn outmsg_action_handler(
 
         log::debug!(target: "executor", "msg_storage cells: {}, bits: {}", sstat.cells(), sstat.bits());
         if !is_special {
-            fine = Coins::from(fine_per_cell * sstat.cells());
+            fine = Coins::from(fine_per_cell * max_cells.min(sstat.cells()));
         }
         let mut acc_balance_copy = acc_balance.clone();
         let mut collect_fine = || {
@@ -1348,12 +1422,12 @@ fn outmsg_action_handler(
             }
         };
         let compute_fwd_fee = if !is_special {
-            if sstat.cells() > max_cells {
+            if sstat.cells() > max_cells && max_cells < limits.max_msg_cells as u64 {
                 log::debug!(target: "executor", "not enough funds to process a message (max_cells={})", max_cells);
                 collect_fine();
                 return check_skip_invalid(RESULT_CODE_INVALID_BALANCE);
             }
-            if sstat.bits() > limits.max_msg_bits as u64 {
+            if sstat.bits() > limits.max_msg_bits as u64 || sstat.cells() > max_cells {
                 log::debug!(target: "executor", "message too large, invalid");
                 collect_fine();
                 return check_skip_invalid(RESULT_CODE_INVALID_BALANCE);
@@ -1513,7 +1587,7 @@ fn outmsg_action_handler(
         phase.tot_msg_size.add_bits_and_cells(sstat.bits() + add_bits, sstat.cells() + 1);
 
         if mode.any(SENDMSG_ALL_BALANCE | SENDMSG_REMAINING_MSG_BALANCE) {
-            *msg_balance = CurrencyCollection::default();
+            msg_balance.coins.clear();
         }
 
         log::debug!(
@@ -1621,8 +1695,8 @@ fn change_library_action_handler(
             return Ok(RESULT_CODE_LIB_BAD_CELL);
         }
         let hash = code.repr_hash();
-        let is_public = mode.bit(SET_LIB_CODE_ADD_PUBLIC >> 1);
-        if let Some(exist) = library.get(&hash)? {
+        let is_public = mode.bit(SET_LIB_CODE_ADD_PUBLIC);
+        if let Some(exist) = library.get(hash)? {
             if exist.root.repr_hash() == hash && exist.is_public_library() == is_public {
                 return Ok(0);
             }
@@ -1634,8 +1708,9 @@ fn change_library_action_handler(
                 sstat.cells(), sstat.bits(), max_merkle_depth);
             return Ok(RESULT_CODE_LIB_EXCEEDED_LIMITS);
         }
+        let key = hash.write_to_bitstring()?;
         let lib = SimpleLib::new(code, is_public);
-        library.set_raw(hash.write_to_bitstring()?, &lib.write_to_new_cell()?)?;
+        library.set_raw(key, &lib.write_to_new_cell()?)?;
     } else if let Some(hash) = hash {
         log::debug!(target: "executor", "OutAction::ChangeLibrary mode: {}, hash: {:x}", mode, hash);
         library.remove(&hash)?;
@@ -1819,20 +1894,6 @@ fn balance_to_string(balance: Option<&CurrencyCollection>) -> String {
     )
 }
 
-fn action_type(action: &OutAction) -> String {
-    match action {
-        OutAction::SendMsg { mode, out_msg } => {
-            format!("SendMsg flag: {mode}, value: {}", balance_to_string(out_msg.value()))
-        }
-        OutAction::SetCode { new_code } => format!("SetCode {:x}", new_code.repr_hash()),
-        OutAction::ReserveCurrency { mode, value } => {
-            format!("ReserveCurrency flag: {mode} value: {}", value.coins)
-        }
-        OutAction::ChangeLibrary { mode: _, code: _, hash: _ } => "ChangeLibrary".to_string(),
-        _ => "Unknown".to_string(),
-    }
-}
-
 fn finish_action_phase_with_fine(
     tr: &mut Transaction,
     mut phase: TrActionPhase,
@@ -1873,23 +1934,26 @@ fn check_vm_init_params(ctrls: &SaveList, stack: &Stack) {
 }
 
 pub(super) fn check_account_size_limits(cfg: &SizeLimitsConfig, acc: &mut Account) -> Result<bool> {
-    acc.update_storage_stat(cfg.acc_state_cells_for_storage_dict)?;
-    let Some(stat) = acc.storage_stat() else {
-        return Ok(true);
-    };
     let max_acc_state_cells = if acc.get_addr().is_some_and(|addr| addr.is_masterchain()) {
         cfg.max_mc_acc_state_cells as u64
     } else {
         cfg.max_acc_state_cells as u64
     };
+    let acc_id = acc.get_id().cloned().unwrap_or_default();
+    let _tc = time_checker!(|| format!("account {:x} precalc_storage_stat", acc_id), 100);
+    let Some(stat) = acc.precalc_storage_stat()? else {
+        return Ok(true);
+    };
     if stat.total_cells() > max_acc_state_cells {
         log::debug!(target: "executor", "account has too many cells {} (max cells = {})", stat.total_cells(), max_acc_state_cells);
         return Ok(false);
     }
-    let max_merkle_depth = stat.max_merkle_depth()?;
-    if max_merkle_depth > MAX_MERKLE_DEPTH {
-        log::debug!(target: "executor", "account has too big merkle depth {max_merkle_depth}");
-        return Ok(false);
+    if stat.is_changed() {
+        let max_merkle_depth = stat.max_merkle_depth()?;
+        if max_merkle_depth > MAX_MERKLE_DEPTH {
+            log::debug!(target: "executor", "account has too big merkle depth {max_merkle_depth}");
+            return Ok(false);
+        }
     }
     Ok(true)
 }

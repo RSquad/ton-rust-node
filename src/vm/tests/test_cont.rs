@@ -9,12 +9,23 @@
 use ton_assembler::{compile_code, compile_code_to_cell, CompileError};
 use ton_block::{ExceptionCode, SliceData};
 use ton_vm::{
+    executor::{FixGasPrefix, FIX_GAS},
     int,
     stack::{continuation::ContinuationData, integer::IntegerData, Stack, StackItem},
 };
 
 mod common;
 use common::*;
+
+fn test_continuation(code: &str) -> ContinuationData {
+    ContinuationData::with_code(compile_code(code).unwrap())
+}
+
+fn stack_with_cont(cont: ContinuationData) -> Stack {
+    let mut stack = Stack::new();
+    stack.push_cont(cont);
+    stack
+}
 
 #[ignore] // we should have c0, c1, c2 and other instantiated
 #[test]
@@ -152,6 +163,8 @@ fn test_pushctr_different_type() {
          PUSHCTR c3",
     )
     .expect_failure(ExceptionCode::TypeCheckError);
+
+    expect_exception("NULL POPCTR c2", ExceptionCode::TypeCheckError);
 }
 
 #[test]
@@ -416,7 +429,7 @@ fn test_bug_pop_c2_null() {
         NULL
     ",
     )
-    .with_gas_limit(1000)
+    .with_gas_limit(60)
     .expect_failure(ExceptionCode::OutOfGas);
 }
 
@@ -720,6 +733,50 @@ fn setaltctr() {
 }
 
 #[test]
+fn setaltctr_setretctr_duplicate_savelist_slot_v14() {
+    let mut alt = test_continuation("NOP");
+    alt.put_to_savelist(0, StackItem::continuation(test_continuation("NOP"))).unwrap();
+
+    let setaltctr_case = "
+        PUSHCONT {
+            NOP
+        }
+        PUSHCONT {
+            NOP
+        }
+        SWAP
+        SETCONTCTR c0
+        POPCTR c1
+        PUSHINT 1
+        SETALTCTR c0
+    ";
+
+    test_case(setaltctr_case)
+        .expect_empty_stack()
+        .expect_ctrl(1, &StackItem::continuation(alt.clone()));
+
+    test_case(setaltctr_case).with_block_version(13).expect_failure(ExceptionCode::TypeCheckError);
+
+    let setretctr_case = "
+        PUSHCONT {
+            PUSHINT 7
+        }
+        PUSHCONT {
+            NOP
+        }
+        SWAP
+        SETCONTCTR c0
+        POPCTR c0
+        PUSHINT 1
+        SETRETCTR c0
+    ";
+
+    test_case(setretctr_case).expect_int_stack(&[7]);
+
+    test_case(setretctr_case).with_block_version(13).expect_failure(ExceptionCode::TypeCheckError);
+}
+
+#[test]
 fn setcontargs() {
     let mut cont = ContinuationData::with_code(compile_code("PUSH s0").unwrap());
     cont.nargs = 2;
@@ -791,6 +848,78 @@ fn setcontctrx() {
 }
 
 #[test]
+fn setcontctr_duplicate_savelist_slot_v14() {
+    let mut expected = test_continuation("PUSH s0");
+    expected.put_to_savelist(0, StackItem::continuation(test_continuation("NOP"))).unwrap();
+
+    test_case(
+        "PUSHCONT {
+             PUSH s0
+         }
+         PUSHCONT {
+             NOP
+         }
+         SWAP
+         SETCONTCTR c0
+         PUSHINT 1
+         SWAP
+         SETCONTCTR c0",
+    )
+    .expect_stack(Stack::new().push_cont(expected.clone()));
+
+    test_case(
+        "PUSHCONT {
+             PUSH s0
+         }
+         PUSHCONT {
+             NOP
+         }
+         SWAP
+         SETCONTCTR c0
+         PUSHINT 1
+         SWAP
+         SETCONTCTR c0",
+    )
+    .with_block_version(13)
+    .expect_failure(ExceptionCode::TypeCheckError);
+
+    test_case(
+        "PUSHCONT {
+             PUSH s0
+         }
+         PUSHCONT {
+             NOP
+         }
+         SWAP
+         PUSHINT 0
+         SETCONTCTRX
+         PUSHINT 1
+         SWAP
+         PUSHINT 0
+         SETCONTCTRX",
+    )
+    .expect_stack(Stack::new().push_cont(expected.clone()));
+
+    test_case(
+        "PUSHCONT {
+             PUSH s0
+         }
+         PUSHCONT {
+             NOP
+         }
+         SWAP
+         PUSHINT 0
+         SETCONTCTRX
+         PUSHINT 1
+         SWAP
+         PUSHINT 0
+         SETCONTCTRX",
+    )
+    .with_block_version(13)
+    .expect_failure(ExceptionCode::TypeCheckError);
+}
+
+#[test]
 fn setcontctrmany_normal() {
     let mut cont0 = ContinuationData::with_code(compile_code("PUSH s0").unwrap());
     test_case("PUSHCONT { DUP } SETCONTCTRMANY 0")
@@ -832,6 +961,50 @@ fn setcontctrmany_normal() {
         SETCONTCTRMANYX",
     )
     .expect_stack(Stack::new().push_cont(cont0.clone()).push_int(1));
+}
+
+#[test]
+fn setcontctrmany_duplicate_savelist_slot_v14() {
+    let old_c0 = test_continuation("ZERO");
+    let new_c0 = test_continuation("ONE");
+    let new_c1 = test_continuation("TWO");
+
+    let mut input = test_continuation("PUSH s0");
+    input.put_to_savelist(0, StackItem::continuation(old_c0.clone())).unwrap();
+
+    let mut expected_v14 = test_continuation("PUSH s0");
+    expected_v14.put_to_savelist(0, StackItem::continuation(old_c0.clone())).unwrap();
+    expected_v14.put_to_savelist(1, StackItem::continuation(new_c1.clone())).unwrap();
+
+    let mut expected_v13 = test_continuation("PUSH s0");
+    expected_v13.put_to_savelist(0, StackItem::continuation(new_c0.clone())).unwrap();
+    expected_v13.put_to_savelist(1, StackItem::continuation(new_c1.clone())).unwrap();
+
+    test_case("SETCONTCTRMANY 3")
+        .with_stack(stack_with_cont(input.clone()))
+        .with_ctrl(0, StackItem::continuation(new_c0.clone()))
+        .with_ctrl(1, StackItem::continuation(new_c1.clone()))
+        .expect_stack(Stack::new().push_cont(expected_v14.clone()).push_int(1));
+
+    test_case("SETCONTCTRMANY 3")
+        .with_stack(stack_with_cont(input.clone()))
+        .with_ctrl(0, StackItem::continuation(new_c0.clone()))
+        .with_ctrl(1, StackItem::continuation(new_c1.clone()))
+        .with_block_version(13)
+        .expect_stack(Stack::new().push_cont(expected_v13.clone()).push_int(1));
+
+    test_case("PUSHINT 3 SETCONTCTRMANYX")
+        .with_stack(stack_with_cont(input.clone()))
+        .with_ctrl(0, StackItem::continuation(new_c0.clone()))
+        .with_ctrl(1, StackItem::continuation(new_c1.clone()))
+        .expect_stack(Stack::new().push_cont(expected_v14).push_int(1));
+
+    test_case("PUSHINT 3 SETCONTCTRMANYX")
+        .with_stack(stack_with_cont(input))
+        .with_ctrl(0, StackItem::continuation(new_c0))
+        .with_ctrl(1, StackItem::continuation(new_c1))
+        .with_block_version(13)
+        .expect_stack(Stack::new().push_cont(expected_v13).push_int(1));
 }
 
 #[test]
@@ -2365,6 +2538,7 @@ fn test_popctrx_range() {
 
 mod runvm {
     use super::*;
+    use ton_block::{BuilderData, ZeroizingBytes};
 
     #[test]
     fn test_runvm_error() {
@@ -2384,6 +2558,73 @@ mod runvm {
     }
 
     #[test]
+    fn test_checksignatures() {
+        let key = ton_block::Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap();
+        let pub_key = BuilderData::with_raw(key.pub_key().unwrap(), 256).unwrap();
+        let pub_key = pub_key.into_cell().unwrap();
+        let data = SliceData::new(vec![0x01, 0x02, 0x03, 0x80]);
+        let signature = key.sign(&data.get_bytestring(0)).unwrap();
+        let signature = BuilderData::with_raw(signature, 512).unwrap();
+        let signature = signature.into_cell().unwrap();
+        let data = data.into_cell().unwrap();
+        let ethalon = [(3, 6013), (4, 18286), (5, 30559), (9, 79651), (10, 91924), (14, 141040)];
+        for (count, mut gas) in ethalon {
+            for flag in [0, 128] {
+                if flag == 128 {
+                    match count {
+                        3 => gas += 16000,
+                        4 => gas += 8000,
+                        _ => (),
+                    }
+                }
+                let runvm_code = compile_code_to_cell(&format!(
+                    "
+                    PUSHINT {count}
+                    PUSHCONT {{
+                        BLKPUSH 3, 2
+                        CHKSIGNS
+                        THROWIFNOT 100
+                    }}
+                    REPEAT
+                ",
+                ))
+                .unwrap();
+                let code = format!(
+                    "
+                    PUSHREFSLICE ; code
+                    PUSHREFSLICE ; data
+                    PUSHREFSLICE ; signature
+                    PUSHREFSLICE ; pub_key
+                    PLDU 256
+                    BLKPUSH 3, 2
+                    CHKSIGNS
+                    THROWIFNOT 100
+                    PUSHINT 3
+                    PUSH s4
+                    RUNVM {flag}
+                    DROP
+                    BLKPUSH 3, 2
+                    CHKSIGNS
+                    THROWIFNOT 100
+                    PUSHINT 3
+                    PUSH s4
+                    RUNVM {flag}
+                    DROP
+                    BLKSWAP 1, 3
+                    BLESS
+                    POP C0
+                "
+                );
+                test_case_with_refs(
+                    code,
+                    vec![runvm_code.clone(), data.clone(), signature.clone(), pub_key.clone()],
+                )
+                .expect_gas_used(gas);
+            }
+        }
+    }
+
+    #[test]
     fn test_runvm_success() {
         // simplest case without any additional arguments on stack
         test_case(
@@ -2395,7 +2636,7 @@ mod runvm {
         .expect_int_stack(&[3, 0])
         .expect_gas_used(142);
 
-        // pass and one argument on stack
+        // pass one argument on stack
         test_case(
             "TEN
             ONE ; pass one stack value
@@ -2403,6 +2644,16 @@ mod runvm {
             RUNVM 0",
         )
         .expect_int_stack(&[10, 3, 0])
+        .expect_gas_used(160);
+
+        // pass 0 and one argument on stack
+        test_case(
+            "TEN
+            ONE ; pass one stack value
+            PUSHSLICE x73 ; PUSHINT 3
+            RUNVM 3",
+        )
+        .expect_int_stack(&[10, 0, 3, 0])
         .expect_gas_used(160);
 
         // pass gas max one argument on stack
@@ -2470,5 +2721,28 @@ mod runvm {
             code,
         )
         .expect_int_stack(&[0, 777]);
+    }
+}
+
+#[test]
+fn test_cont_invalid_opcode() {
+    for (bits, fix_gas) in FIX_GAS.into_iter().enumerate() {
+        let bits = bits + 1;
+        for (prefix, gas) in fix_gas {
+            let prefix = match prefix {
+                FixGasPrefix::Number(prefix) => prefix,
+                FixGasPrefix::Range(start, ..) => start,
+            };
+
+            log::info!(target: "tvm", "Testing prefix 0x{prefix:X} with bits {bits} and gas {gas}\n");
+            let data = (*prefix as u32) << (32 - bits) | (1 << (32 - bits - 1));
+            let data = data.to_be_bytes();
+            assert_eq!(data[3], 0);
+            let code = SliceData::new(data.to_vec()).into_cell().unwrap();
+            test_case_with_bytecode(code)
+                .expect_steps(2)
+                .expect_failure(ExceptionCode::InvalidOpcode)
+                .expect_gas_used(*gas as i64 + 50);
+        }
     }
 }

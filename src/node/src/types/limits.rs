@@ -232,7 +232,7 @@ impl CellStorageStats {
         if cells_stat {
             self.cells_stats.internal_refs += 1;
             /* if (parent_ && parent_->seen_.count(cell->get_hash()) != 0) || */
-            if !self.cells_seen.insert(cell.repr_hash()) {
+            if !self.cells_seen.insert(cell.repr_hash().clone()) {
                 // This cell and its children had been already seen
                 cells_stat = false
             } else {
@@ -251,7 +251,7 @@ impl CellStorageStats {
         */
 
         if proof_stat {
-            if Some(true) == usage_tree.map(|usage_tree| usage_tree.contains(&cell.repr_hash())) {
+            if Some(true) == usage_tree.map(|usage_tree| usage_tree.contains(cell.repr_hash())) {
                 self.proof_stats.external_refs += 1;
                 proof_stat = false;
             }
@@ -263,7 +263,7 @@ impl CellStorageStats {
             else {
                 self.proof_stats.internal_refs += 1;
                 // if (parent_ && parent_->proof_seen_.count(cell->get_hash()) != 0) ||
-                if !self.proof_seen.insert(cell.repr_hash()) {
+                if !self.proof_seen.insert(cell.repr_hash().clone()) {
                     // This cell and its children had been already seen
                     proof_stat = false
                 } else {

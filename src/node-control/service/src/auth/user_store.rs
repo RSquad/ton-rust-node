@@ -11,12 +11,16 @@ use crate::runtime_config::RuntimeConfig;
 use anyhow::Context;
 use common::{app_config::UserEntry, verify_password};
 use secrets_vault::{
-    crypto::factory::{AutoCryptoFactory, CryptoFactory},
+    crypto::factory::CryptoFactory,
     types::{
-        algorithm::Algorithm, metadata::Metadata, secret::Secret, secret_id::SecretId,
+        algorithm::Algorithm,
+        metadata::Metadata,
+        secret::{Secret, SecretInMemoryFactory},
+        secret_id::SecretId,
         store_mode::StoreMode,
     },
     vault::SecretVault,
+    vault_block::BlockCryptoFactory,
 };
 use std::sync::Arc;
 
@@ -127,7 +131,7 @@ impl UserStore {
 
         let user_name = username.to_owned();
         let secret_name = secret_id.to_string();
-        self.runtime_cfg.update_config(Box::new(move |cfg| {
+        self.runtime_cfg.update_and_save(Box::new(move |cfg| {
             let auth = cfg.http.auth.get_or_insert_with(Default::default);
             auth.users.push(UserEntry {
                 username: user_name,
@@ -137,7 +141,6 @@ impl UserStore {
                 revoked_after: None,
             });
         }))?;
-        self.runtime_cfg.save_to_file();
 
         Ok(())
     }
@@ -163,12 +166,11 @@ impl UserStore {
         }
 
         let user_name = username.to_owned();
-        self.runtime_cfg.update_config(Box::new(move |cfg| {
+        self.runtime_cfg.update_and_save(Box::new(move |cfg| {
             if let Some(auth) = &mut cfg.http.auth {
                 auth.users.retain(|u| u.username != user_name);
             }
         }))?;
-        self.runtime_cfg.save_to_file();
 
         Ok(())
     }
@@ -197,8 +199,8 @@ impl UserStore {
                         entry.username
                     );
                 }
-                let secret = vault.get(&sid).await?;
-                let hash_bytes = extract_blob_bytes(&secret).await?;
+                let secret = vault.load(&sid).await?;
+                let hash_bytes = extract_blob_bytes(&secret)?;
                 let hash = String::from_utf8(hash_bytes).map_err(|_| {
                     anyhow::anyhow!(
                         "corrupted password hash in vault for user '{}'",
@@ -249,19 +251,18 @@ pub async fn store_password_blob(
     let mut metadata = Metadata::new(Some(secret_id), Algorithm::None, true);
     metadata.tags.insert("role".to_owned(), "auth-hash".to_owned());
 
-    let secret = Secret::from_raw_data(
+    let secret = SecretInMemoryFactory::new_raw(
         password_hash.as_bytes(),
         metadata,
-        AutoCryptoFactory {}.new_crypto()?,
-    )
-    .await?;
-    vault.put(&secret, StoreMode::NewOnly).await
+        BlockCryptoFactory {}.new_crypto()?,
+    )?;
+    vault.store(&secret, StoreMode::NewOnly).await
 }
 
 /// Extracts raw bytes from a [`Secret::Blob`] variant.
-async fn extract_blob_bytes(secret: &Secret) -> anyhow::Result<Vec<u8>> {
+fn extract_blob_bytes(secret: &Secret) -> anyhow::Result<Vec<u8>> {
     match secret {
-        Secret::Blob { blob } => Ok(blob.data().await?.lock().await?.to_vec()),
+        Secret::Blob { blob } => Ok(blob.data().lock()?.to_vec()),
         _ => anyhow::bail!("expected blob secret for user record"),
     }
 }
@@ -299,11 +300,10 @@ mod tests {
         let key_material = KeyMaterial::generate_new(
             Algorithm::None,
             Some(32),
-            AutoCryptoFactory {}.new_crypto().unwrap().as_ref(),
+            BlockCryptoFactory {}.new_crypto().unwrap().as_ref(),
         )
-        .await
         .unwrap();
-        MasterKey::from_key_material(key_material).await.unwrap()
+        MasterKey::from_key_material(key_material).unwrap()
     }
 
     async fn create_test_vault() -> SecretVault {
@@ -313,9 +313,14 @@ mod tests {
         let file_path = temp_dir.path().join("secrets.json");
         std::mem::forget(temp_dir); // Leak the temp_dir to keep it alive
         let storage = Arc::new(
-            FileJsonStorage::new(master_key, &file_path, Box::new(AutoCryptoFactory {}), false)
-                .await
-                .unwrap(),
+            FileJsonStorage::new(
+                master_key,
+                &file_path,
+                false,
+                BlockCryptoFactory {}.new_crypto().unwrap(),
+            )
+            .await
+            .unwrap(),
         );
         SecretVaultBuilder::default().with_storage(storage).build().await.unwrap()
     }
@@ -323,8 +328,8 @@ mod tests {
     struct NoopWallet;
     #[async_trait::async_trait]
     impl contracts::SmartContract for NoopWallet {
-        fn address(&self) -> MsgAddressInt {
-            MsgAddressInt::with_standart(None, 0, [0u8; 32].into()).unwrap()
+        async fn address(&self) -> anyhow::Result<MsgAddressInt> {
+            Ok(MsgAddressInt::with_standart(None, 0, [0u8; 32].into()).unwrap())
         }
         async fn balance(&self) -> anyhow::Result<u64> {
             Ok(0)
@@ -383,6 +388,8 @@ mod tests {
                 ClientJsonRpc::connect_many(
                     vec![("http://127.0.0.1:3301/".to_owned(), None)],
                     None,
+                    common::app_config::EndpointTimeouts::default(),
+                    common::app_config::FreshnessConfig::disabled(),
                 )
                 .unwrap(),
             )
@@ -392,16 +399,12 @@ mod tests {
             Some(self.vault.clone())
         }
 
-        fn update_config(&self, f: Box<dyn FnOnce(&mut AppConfig) + Send>) -> anyhow::Result<()> {
+        fn update_and_save(&self, f: Box<dyn FnOnce(&mut AppConfig) + Send>) -> anyhow::Result<()> {
             let mut guard = self.config.write().expect("lock");
             let mut cfg = (**guard).clone();
             f(&mut cfg);
             *guard = Arc::new(cfg);
             Ok(())
-        }
-
-        fn save_to_file(&self) {
-            // no-op in tests
         }
     }
 
@@ -434,6 +437,7 @@ mod tests {
             voting: None,
             master_wallet: None,
             tick_interval: 30,
+            automation: Default::default(),
             log: Some(Default::default()),
         }
     }

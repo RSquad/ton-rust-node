@@ -89,8 +89,8 @@ impl WalletContract {
                 let mut b = BuilderData::new();
                 b.append_u32(0)?.append_raw(public_key, 256)?;
                 let state = StateInit::with_code_and_data(v1r3_code, b.into_cell()?);
-                let state_hash = state.write_to_new_cell()?.into_cell()?.hash(0);
-                Ok(MsgAddressInt::with_params(wc, state_hash.as_slice())?)
+                let state_cell = state.write_to_new_cell()?.into_cell()?;
+                Ok(MsgAddressInt::with_params(wc, state_cell.hash(0).as_slice())?)
             }
             TonWalletVersion::V3R2 => {
                 let v3r2_code = read_single_root_boc(
@@ -99,8 +99,8 @@ impl WalletContract {
                 let mut b = BuilderData::new();
                 b.append_u32(0)?.append_u32(wallet_id)?.append_raw(public_key, 256)?;
                 let state = StateInit::with_code_and_data(v3r2_code, b.into_cell()?);
-                let state_hash = state.write_to_new_cell()?.into_cell()?.hash(0);
-                Ok(MsgAddressInt::with_params(wc, state_hash.as_slice())?)
+                let state_cell = state.write_to_new_cell()?.into_cell()?;
+                Ok(MsgAddressInt::with_params(wc, state_cell.hash(0).as_slice())?)
             }
             TonWalletVersion::V4R2 => {
                 let v4r2_code = read_single_root_boc(base64_decode(V4R2_CODE_B64)?)?;
@@ -108,8 +108,8 @@ impl WalletContract {
                 b.append_u32(0)?.append_u32(wallet_id)?.append_raw(public_key, 256)?;
                 b.append_bit_zero()?;
                 let state = StateInit::with_code_and_data(v4r2_code, b.into_cell()?);
-                let state_hash = state.write_to_new_cell()?.into_cell()?.hash(0);
-                Ok(MsgAddressInt::with_params(wc, state_hash.as_slice())?)
+                let state_cell = state.write_to_new_cell()?.into_cell()?;
+                Ok(MsgAddressInt::with_params(wc, state_cell.hash(0).as_slice())?)
             }
             TonWalletVersion::V5R1 => {
                 let v5r1_code = read_single_root_boc(base64_decode(V5R1_CODE_B64)?)?;
@@ -118,8 +118,8 @@ impl WalletContract {
                 b.append_u32(0)?.append_u32(wallet_id)?.append_raw(public_key, 256)?;
                 b.append_bit_zero()?;
                 let state = StateInit::with_code_and_data(v5r1_code, b.into_cell()?);
-                let state_hash = state.write_to_new_cell()?.into_cell()?.hash(0);
-                Ok(MsgAddressInt::with_params(wc, state_hash.as_slice())?)
+                let state_cell = state.write_to_new_cell()?.into_cell()?;
+                Ok(MsgAddressInt::with_params(wc, state_cell.hash(0).as_slice())?)
             }
         }
     }
@@ -303,8 +303,16 @@ impl TonWallet for WalletContract {
 
     async fn deploy_message(&self, value: u64, payload: Cell) -> anyhow::Result<Cell> {
         let state_init = self.build_state_init().await?;
-        self.build_message(self.address(), value, payload, false, Some(0), Some(state_init), None)
-            .await
+        self.build_message(
+            self.address().await?,
+            value,
+            payload,
+            false,
+            Some(0),
+            Some(state_init),
+            None,
+        )
+        .await
     }
 
     async fn state_init(&self) -> anyhow::Result<StateInit> {
@@ -359,7 +367,7 @@ impl TonWallet for WalletContract {
         };
 
         let mut message = Message::with_ext_in_header_and_body(
-            ExternalInboundMessageHeader::new(MsgAddressExt::AddrNone, self.address()),
+            ExternalInboundMessageHeader::new(MsgAddressExt::AddrNone, self.address().await?),
             body_slice,
         );
 
@@ -377,8 +385,8 @@ impl TonWallet for WalletContract {
 
 #[async_trait::async_trait]
 impl SmartContract for WalletContract {
-    fn address(&self) -> MsgAddressInt {
-        self.address.clone()
+    async fn address(&self) -> anyhow::Result<MsgAddressInt> {
+        Ok(self.address.clone())
     }
     async fn balance(&self) -> anyhow::Result<u64> {
         self.provider.balance(&self.address).await

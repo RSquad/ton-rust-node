@@ -12,6 +12,7 @@ use super::consensus::{
     BlockHash, BlockPayloadPtr, ConsensusNode, PublicKey, PublicKeyHash, SessionNode,
 };
 use crate::{engine_traits::EngineOperations, shard_state::ShardStateStuff};
+use secrets_vault::vault_block::get_key_option_factory;
 use std::{
     fmt::{Debug, Display, Formatter, Write},
     hash::Hash,
@@ -20,13 +21,13 @@ use std::{
 use ton_api::ton::engine::validator::validator::groupmember::GroupMember;
 use ton_block::{
     error, fail, BlockIdExt, BlockSignatures, BlockSignaturesPure, BuilderData, ConfigParams,
-    CryptoSignature, CryptoSignaturePair, Ed25519KeyOption, KeyId, Result, Serializable, Sha256,
-    ShardIdent, SigPubKey, UInt256, ValidatorBaseInfo, ValidatorDescr, ValidatorSet,
-    WorkchainDescr, Workchains,
+    CryptoSignature, CryptoSignaturePair, KeyId, Result, Serializable, Sha256, ShardIdent,
+    SigPubKey, UInt256, ValidatorBaseInfo, ValidatorDescr, ValidatorSet, WorkchainDescr,
+    Workchains,
 };
 
 pub fn sigpubkey_to_publickey(k: &SigPubKey) -> PublicKey {
-    Ed25519KeyOption::from_public_key(k.key_bytes())
+    get_key_option_factory().from_public_key(k.key_bytes())
 }
 
 pub fn make_cryptosig(s: BlockPayloadPtr) -> Result<CryptoSignature> {
@@ -290,7 +291,10 @@ pub fn calc_subset_for_workchain_standard(
     cc_seqno: u32,
 ) -> Result<ValidatorSubsetInfo> {
     if shard_id.is_masterchain() {
-        fail!("calc_subset_for_workchain_standard must be called for shardchain only, but called for {}", shard_id);
+        fail!(
+            "calc_subset_for_workchain_standard must be called for shardchain only, but called for {}",
+            shard_id
+        );
     }
 
     match try_calc_subset_for_workchain_standard(vset, config, shard_id, cc_seqno)? {

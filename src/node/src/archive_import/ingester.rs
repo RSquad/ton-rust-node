@@ -21,6 +21,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::Path,
     sync::Arc,
+    time::Instant,
 };
 use storage::{
     archives::{
@@ -34,7 +35,8 @@ use storage::{
     types::BlockMeta,
 };
 use ton_block::{
-    error, fail, Block, BlockIdExt, Cell, Deserializable, Result, ShardIdent, UInt256,
+    error, fail, read_single_root_boc, Block, BlockIdExt, Cell, Deserializable, Error, Result,
+    ShardIdent, UInt256,
 };
 
 const TARGET: &str = "archive_import";
@@ -161,8 +163,8 @@ pub struct LastGroupState {
 
 fn parse_and_verify_block(data: &[u8], declared_id: &BlockIdExt) -> Result<Block> {
     let file_hash = UInt256::calc_file_hash(data);
-    let root_cell = ton_block::read_single_root_boc(data)?;
-    let root_hash = root_cell.repr_hash();
+    let root_cell = read_single_root_boc(data)?;
+    let root_hash = root_cell.repr_hash().clone();
     let block = Block::construct_from_cell(root_cell)?;
     let info = block.read_info()?;
     let actual_id =
@@ -379,7 +381,7 @@ fn parse_shard_entries(
     prev_shard_tops: Vec<BlockIdExt>,
     skip: bool,
 ) -> Result<Vec<ProcessedEntry>> {
-    let now = std::time::Instant::now();
+    let now = Instant::now();
     let results: HashMap<BlockIdExt, ProcessedEntry> = raw
         .into_par_iter()
         .map(|(id, r)| deserialize_shard_entry(id.clone(), r, skip).map(|res| (id, res)))
@@ -515,7 +517,7 @@ impl Ingester {
                 Result<(HashMap<BlockIdExt, RawEntry>, Vec<HashMap<BlockIdExt, RawEntry>>)>,
             >,
         > = None;
-        let start = std::time::Instant::now();
+        let start = Instant::now();
 
         for (local_idx, group) in groups.iter().enumerate() {
             let global_idx = start_idx + local_idx;
@@ -540,7 +542,7 @@ impl Ingester {
                         read_raw_package(&mc_path),
                         try_join_all(shard_paths.iter().map(|p| read_raw_package(p))),
                     )?;
-                    Ok::<_, ton_block::Error>((mc_raw, shard_raws))
+                    Ok::<_, Error>((mc_raw, shard_raws))
                 })
             });
 
@@ -590,9 +592,9 @@ impl Ingester {
         let expected_first_mc_prev = prev_group_state.mc_block_id;
         let prev_shard_tops = prev_group_state.shard_tops;
         let mc_block_count = mc_raw.len();
-        let group_start = std::time::Instant::now();
+        let group_start = Instant::now();
 
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         let (mc_entries, key_block, mc_shard_tops, last_group_state, validator) =
             tokio::task::spawn_blocking(move || -> Result<_> {
                 let mut v = validator;
@@ -604,7 +606,7 @@ impl Ingester {
             .map_err(|e| error!("MC parse task panicked: {}", e))??;
         let parse_mc_ms = t.elapsed().as_millis();
 
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         for entry in &mc_entries {
             self.update_block_handles(entry)?;
         }
@@ -637,7 +639,7 @@ impl Ingester {
         let mc_shard = ShardIdent::masterchain();
 
         // Run mc_import, mc_states, and the full shard pipeline concurrently.
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         let mut shard_block_count = 0usize;
         let (_, _, shard_pipeline_ms) = tokio::try_join!(
             // Task 1: import MC package into archive
@@ -655,7 +657,7 @@ impl Ingester {
             },
             // Task 3: shard pipeline — parse → handles+states → import
             async {
-                let t_pipeline = std::time::Instant::now();
+                let t_pipeline = Instant::now();
 
                 // 3a: await shard parse (already spawned above)
                 let shard_parse_results: Vec<Vec<ProcessedEntry>> =
@@ -704,7 +706,7 @@ impl Ingester {
         )?;
         let parallel_ms = t.elapsed().as_millis();
 
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         if let Some(kb) = key_block {
             self.archive_key_block(&kb.block_id, kb.proof_data, kb.block_data).await?;
         }

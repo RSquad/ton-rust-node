@@ -11,9 +11,14 @@
 use super::*;
 use crate::{
     define_HashmapE, generate_test_account, read_single_root_boc, write_boc, AccountTestOptions,
-    Block, BocWriter, CurrencyCollection, MerkleProof, ShardState, UsageTree,
+    Block, BocWriter, CellLoader, CurrencyCollection, MerkleProof, ShardState, UsageTree,
 };
-use std::{fs::read, path::Path, time::Instant};
+use std::{
+    fs::read,
+    path::Path,
+    sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    time::Instant,
+};
 
 #[test]
 fn test_merkle_update() {
@@ -51,7 +56,7 @@ fn test_merkle_update() {
     let new_cell = acc.serialize().unwrap();
     assert_ne!(old_cell, new_cell);
     let mupd = MerkleUpdate::create(&old_cell, &new_cell).unwrap();
-    let updated_cell = mupd.apply_for(&old_cell).unwrap();
+    let (updated_cell, _) = mupd.apply_for(&old_cell).unwrap();
     assert_eq!(new_cell, updated_cell);
 }
 
@@ -72,7 +77,7 @@ fn test_merkle_update_serialization() {
     let mupd = MerkleUpdate::create(&old_cell, &new_cell).unwrap();
     let mupd_bytes = write_boc(&mupd.serialize().unwrap()).unwrap();
     let mupd2 = MerkleUpdate::construct_from_bytes(&mupd_bytes).unwrap();
-    let updated_cell = mupd2.apply_for(&old_cell).unwrap();
+    let (updated_cell, _) = mupd2.apply_for(&old_cell).unwrap();
     assert_eq!(new_cell, updated_cell);
 }
 
@@ -81,7 +86,7 @@ fn test_empty_merkle_update() {
     let ss = ShardState::default();
     let cell = ss.serialize().unwrap();
     let mupd = MerkleUpdate::create(&cell, &cell).unwrap();
-    let cell2 = mupd.apply_for(&cell).unwrap();
+    let (cell2, _) = mupd.apply_for(&cell).unwrap();
     assert_eq!(cell, cell2);
 }
 
@@ -91,7 +96,7 @@ fn test_empty_merkle_update2() {
     let cell1 = ss.serialize().unwrap();
     let cell2 = Cell::default();
     let mupd = MerkleUpdate::create(&cell1, &cell2).unwrap();
-    let cell3 = mupd.apply_for(&cell1).unwrap();
+    let (cell3, _) = mupd.apply_for(&cell1).unwrap();
     assert_eq!(cell2, cell3);
 }
 
@@ -100,7 +105,7 @@ fn test_merkle_update_for_other_bags() {
     let cell1 = BuilderData::with_raw(vec![1, 2, 3, 0x80], 4).unwrap().into_cell().unwrap();
     let cell2 = BuilderData::with_raw(vec![5, 6, 7, 0x80], 4).unwrap().into_cell().unwrap();
     let mupd = MerkleUpdate::create(&cell1, &cell2).unwrap();
-    let cell3 = mupd.apply_for(&cell1).unwrap();
+    let (cell3, _) = mupd.apply_for(&cell1).unwrap();
     assert_eq!(cell2, cell3);
 }
 
@@ -166,7 +171,7 @@ fn test_merkle_update3() {
     let root2 = root2.into_cell().unwrap();
 
     let mupd = MerkleUpdate::create(&root1, &root2).unwrap();
-    let root3 = mupd.apply_for(&root1).unwrap();
+    let (root3, _) = mupd.apply_for(&root1).unwrap();
 
     assert_eq!(root2, root3);
 }
@@ -180,13 +185,14 @@ fn check_one_mu(index: u64) {
     let (new_shard_state, _new_ss_len) = ss_from_file(&format!("{}{}", PATH_TO_SS, index));
 
     // apply update from block and compare result with new state
-    let updated_shard_state = block.read_state_update().unwrap().apply_for(&shard_state).unwrap();
+    let (updated_shard_state, _) =
+        block.read_state_update().unwrap().apply_for(&shard_state).unwrap();
     assert_eq!(new_shard_state.repr_hash(), updated_shard_state.repr_hash());
 
     // calculate own mu, apply it and compare result with new state
     let mu = MerkleUpdate::create(&shard_state, &new_shard_state).unwrap();
 
-    let updated_shard_state_2 = mu.apply_for(&shard_state).unwrap();
+    let (updated_shard_state_2, _) = mu.apply_for(&shard_state).unwrap();
     assert_eq!(new_shard_state.repr_hash(), updated_shard_state_2.repr_hash());
 }
 
@@ -236,7 +242,7 @@ fn test_merkle_update_create_fast() {
             MerkleUpdate::create_fast(&shard_state, &new_shard_state, |h| usage_tree.contains(h))
                 .unwrap();
 
-        let updated_shard_state_2 = mu.apply_for(&shard_state).unwrap();
+        let (updated_shard_state_2, _) = mu.apply_for(&shard_state).unwrap();
         assert_eq!(new_shard_state.repr_hash(), updated_shard_state_2.repr_hash());
     }
 }
@@ -284,7 +290,7 @@ fn merkle_update_apply_benchmark() {
                 let now = Instant::now();
 
                 for update in updates {
-                    ss = update.apply_for(&ss).unwrap();
+                    ss = update.apply_for(&ss).unwrap().0;
                 }
 
                 print!("{} ", now.elapsed().as_millis());
@@ -332,14 +338,14 @@ fn test_merkle_update4() {
     }
 
     let mupd = MerkleUpdate::create_fast(&root1, &root2, |h| usage_tree.contains(h)).unwrap();
-    let root3 = mupd.apply_for(&root1).unwrap();
+    let (root3, _) = mupd.apply_for(&root1).unwrap();
 
     assert_eq!(root2, root3);
 }
 
 #[test]
 fn test_merkle_update5() {
-    std::env::set_var("RUST_BACKTRACE", "full");
+    // std::env::set_var("RUST_BACKTRACE", "full");
 
     fn create_cell(bytes: &[u8], refs: &[&Cell]) -> Cell {
         let mut c = BuilderData::new();
@@ -377,19 +383,24 @@ fn test_merkle_update5() {
 
     // merkle proof of c6 subtree in old tree
     let cells = [
-        old_tree.repr_hash(),
-        c6.repr_hash(),
-        c3.repr_hash(),
-        c4.repr_hash(),
-        c1.repr_hash(),
-        c2.repr_hash(),
+        old_tree.repr_hash().clone(),
+        c6.repr_hash().clone(),
+        c3.repr_hash().clone(),
+        c4.repr_hash().clone(),
+        c1.repr_hash().clone(),
+        c2.repr_hash().clone(),
     ];
     let old_proof =
         MerkleProof::create(&old_tree, |h| cells.contains(h)).unwrap().serialize().unwrap();
 
     // merkle proof of c6' subtree in new tree
-    let cells =
-        [new_tree.repr_hash(), c6_.repr_hash(), c3_.repr_hash(), c4_.repr_hash(), c1.repr_hash()];
+    let cells = [
+        new_tree.repr_hash().clone(),
+        c6_.repr_hash().clone(),
+        c3_.repr_hash().clone(),
+        c4_.repr_hash().clone(),
+        c1.repr_hash().clone(),
+    ];
     let new_proof =
         MerkleProof::create(&new_tree, |h| cells.contains(h)).unwrap().serialize().unwrap();
 
@@ -406,8 +417,8 @@ fn test_merkle_update5() {
         } else {
             // "fast"
             let cells = [
-                old_tree.repr_hash(),
-                c6.repr_hash(), /*c3.repr_hash(), c4.repr_hash(), c1.repr_hash()*/
+                old_tree.repr_hash().clone(),
+                c6.repr_hash().clone(), /*c3.repr_hash(), c4.repr_hash(), c1.repr_hash()*/
             ];
 
             let update =
@@ -424,10 +435,11 @@ fn test_merkle_update5() {
         let b5 = create_cell(&[3], &[&b4]);
 
         // merkle proof of merkle update in the big tree
-        let mut cells = vec![b1.repr_hash(), b4.repr_hash(), b5.repr_hash()];
+        let mut cells =
+            vec![b1.repr_hash().clone(), b4.repr_hash().clone(), b5.repr_hash().clone()];
         fn visit(c: &Cell, cells: &mut Vec<UInt256>) {
-            cells.push(c.repr_hash());
-            for child in c.clone_references() {
+            cells.push(c.repr_hash().clone());
+            for child in c.clone_references().unwrap() {
                 visit(&child, cells);
             }
         }
@@ -446,7 +458,139 @@ fn test_merkle_update5() {
         )
         .unwrap();
 
-        let new_proof_2 = update.apply_for(&old_proof).unwrap();
+        let (new_proof_2, _) = update.apply_for(&old_proof).unwrap();
         assert_eq!(new_proof, new_proof_2);
     }
+}
+
+// ---------------------------------------------------------------------------
+// apply_lazy_unchecked tests
+// ---------------------------------------------------------------------------
+
+/// Test factory: stores cells indexed by repr_hash, builds lazy cells whose
+/// loader pulls from that map. Counts loader invocations so tests can assert
+/// laziness.
+struct TestLazyFactory {
+    cells_by_hash: ahash::AHashMap<UInt256, Cell>,
+    loader_calls: Arc<AtomicUsize>,
+}
+
+impl TestLazyFactory {
+    fn new(root: &Cell) -> Arc<Self> {
+        let mut cells_by_hash = ahash::AHashMap::new();
+        Self::collect(root, &mut cells_by_hash);
+        Arc::new(Self { cells_by_hash, loader_calls: Arc::new(AtomicUsize::new(0)) })
+    }
+
+    fn collect(cell: &Cell, out: &mut ahash::AHashMap<UInt256, Cell>) {
+        if out.insert(cell.repr_hash().clone(), cell.clone()).is_some() {
+            return;
+        }
+        for i in 0..cell.references_count() {
+            let r = cell.reference(i).unwrap();
+            Self::collect(&r, out);
+        }
+    }
+}
+
+impl CellsFactory for TestLazyFactory {
+    fn create_cell(self: Arc<Self>, builder: BuilderData) -> Result<Cell> {
+        builder.into_cell()
+    }
+
+    fn create_lazy_load_cell(self: Arc<Self>, pruned: &Cell, merkle_depth: u8) -> Result<Cell> {
+        let cells = self.cells_by_hash.clone();
+        let counter = Arc::clone(&self.loader_calls);
+        let loader: CellLoader = Arc::new(move |hash: &UInt256| {
+            counter.fetch_add(1, AtomicOrdering::SeqCst);
+            cells
+                .get(hash)
+                .cloned()
+                .ok_or_else(|| error!("Cell not found in test factory: {:x}", hash))
+        });
+        Cell::lazy_from_pruned(pruned, loader, merkle_depth)
+    }
+}
+
+/// Build a small account-based old/new pair, like the existing
+/// test_merkle_update setup but kept local.
+fn build_account_update_pair() -> (Cell, Cell) {
+    let mut acc = generate_test_account(true, AccountTestOptions::with_default_setup(true));
+    let old_cell = acc.serialize().unwrap();
+    acc.add_funds(&CurrencyCollection::with_coins(42)).unwrap();
+    let data = SliceData::new(vec![
+        0b00011111, 0b11111111, 0b11111111, 0b11111111, 0b11111111, 0b11111111, 0b11111111,
+        0b11110100,
+    ]);
+    acc.set_data(data.into_cell().unwrap());
+    let new_cell = acc.serialize().unwrap();
+    assert_ne!(old_cell.repr_hash(), new_cell.repr_hash());
+    (old_cell, new_cell)
+}
+
+#[test]
+fn test_apply_lazy_unchecked_matches_classic() {
+    let (old_cell, new_cell) = build_account_update_pair();
+    let mupd = MerkleUpdate::create(&old_cell, &new_cell).unwrap();
+
+    let default_factory: Arc<dyn CellsFactory> = Arc::new(DefaultCellsFactory);
+    let (classic_root, _) = mupd.apply_with_factory(&old_cell, &default_factory).unwrap();
+
+    let lazy_factory: Arc<dyn CellsFactory> = TestLazyFactory::new(&old_cell);
+    let (lazy_root, _) = mupd.apply_lazy_unchecked(&lazy_factory).unwrap();
+
+    assert_eq!(lazy_root.repr_hash(), classic_root.repr_hash());
+    assert_eq!(lazy_root.repr_hash(), new_cell.repr_hash());
+    assert_eq!(lazy_root.repr_depth(), classic_root.repr_depth());
+    assert_eq!(lazy_root.level_mask(), classic_root.level_mask());
+}
+
+#[test]
+fn test_apply_lazy_unchecked_empty_update() {
+    // new == old → MerkleUpdate.new is a single pruned branch over `old`.
+    // apply_lazy_unchecked must hit the `self.new_hash == self.old_hash`
+    // path on line ~432 and produce a lazy cell that mirrors `old`.
+    let (old_cell, _) = build_account_update_pair();
+    let mupd = MerkleUpdate::create(&old_cell, &old_cell).unwrap();
+    assert_eq!(mupd.old_hash, mupd.new_hash);
+
+    let factory = TestLazyFactory::new(&old_cell);
+    let factory_dyn: Arc<dyn CellsFactory> = factory.clone();
+    let (lazy_root, _) = mupd.apply_lazy_unchecked(&factory_dyn).unwrap();
+
+    // Hash/depth/mask come from the pruned branch inline data — no loader
+    // calls should be needed.
+    assert_eq!(lazy_root.repr_hash(), old_cell.repr_hash());
+    assert_eq!(lazy_root.repr_depth(), old_cell.repr_depth());
+    assert_eq!(lazy_root.level_mask(), old_cell.level_mask());
+    assert_eq!(
+        factory.loader_calls.load(AtomicOrdering::SeqCst),
+        0,
+        "loader must not run while only hash/depth/mask are queried",
+    );
+
+    // Touching data triggers exactly one load.
+    let _ = lazy_root.data();
+    assert_eq!(factory.loader_calls.load(AtomicOrdering::SeqCst), 1);
+    let _ = lazy_root.data();
+    assert_eq!(factory.loader_calls.load(AtomicOrdering::SeqCst), 1, "load is memoised");
+}
+
+#[test]
+fn test_apply_lazy_unchecked_lazy_loading() {
+    // For a non-trivial update we expect hash queries on the resulting tree
+    // to be answerable without loading every pruned subtree.
+    let (old_cell, new_cell) = build_account_update_pair();
+    let mupd = MerkleUpdate::create(&old_cell, &new_cell).unwrap();
+
+    let factory = TestLazyFactory::new(&old_cell);
+    let factory_dyn: Arc<dyn CellsFactory> = factory.clone();
+    let (lazy_root, _) = mupd.apply_lazy_unchecked(&factory_dyn).unwrap();
+
+    let before = factory.loader_calls.load(AtomicOrdering::SeqCst);
+    let _ = lazy_root.repr_hash();
+    let _ = lazy_root.repr_depth();
+    let _ = lazy_root.level_mask();
+    let after = factory.loader_calls.load(AtomicOrdering::SeqCst);
+    assert_eq!(before, after, "repr_hash/repr_depth/level_mask must not trigger loader",);
 }

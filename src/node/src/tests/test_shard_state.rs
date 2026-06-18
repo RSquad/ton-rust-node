@@ -38,7 +38,7 @@ fn test_shard_state_deserilaize() {
     if check.is_ok() {
         panic!("zero state must be checked")
     }
-    zero_state_id.root_hash = cell.repr_hash();
+    zero_state_id.root_hash = cell.repr_hash().clone();
     zero_state_id.file_hash = UInt256::calc_file_hash(&bytes);
     let new_ss = ShardStateStuff::deserialize_zerostate(
         zero_state_id.clone(),

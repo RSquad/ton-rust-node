@@ -36,6 +36,10 @@ ton_block = { path = '../block', features = [ 'export_key' ] }
 lockfree = { path = '../lockfree' }
 raptorq = { path = 'raptorq', version = '1.2.1' }
 ton_api = { path = '../tl/ton_api' }
+secrets-vault = { path = '../secrets-vault', default-features = false, features = [
+    "file-storage-json",
+    "hashicorp-storage",
+] }
 
 [dev-dependencies]
 log4rs = '1.2'

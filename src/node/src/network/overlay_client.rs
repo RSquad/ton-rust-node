@@ -21,7 +21,10 @@ use adnl::{
     BroadcastSendInfo, DhtNode, DhtSearchPolicy, OverlayId, OverlayNode, OverlayNodeInfo,
     OverlayNodesResolveContext, OverlayNodesSearchContext, OverlayParams, OverlayShortId,
 };
-use rand::seq::{IteratorRandom, SliceRandom};
+use rand::{
+    seq::{IteratorRandom, SliceRandom},
+    Rng,
+};
 use std::{
     collections::VecDeque,
     io::Cursor,
@@ -50,6 +53,14 @@ const TIMEOUT_STORE_OVERLAY_NODE_SEC: Duration = Duration::from_secs(600);
 const ADNL_ATTEMPTS: u32 = 50;
 const TIMEOUT_DELTA: u64 = 50; // Milliseconds
 const TIMEOUT_NO_NEIGHBOURS: u64 = 1000; // Milliseconds
+const ACTIVE_PEERS_PRIME_PROBABILITY: f64 = 0.1;
+
+// Decide whether to bypass the active_peers cache and pick a fresh neighbour
+// instead. Without this, a single sticky peer can monopolize all queries until
+// it fails.
+pub(super) fn should_prime_active_peers() -> bool {
+    rand::thread_rng().gen_bool(ACTIVE_PEERS_PRIME_PROBABILITY)
+}
 
 struct OverlayClientContext {
     id: Arc<OverlayShortId>,
@@ -130,7 +141,8 @@ impl OverlayClient {
     pub async fn new_semiprivate(
         id: Arc<OverlayShortId>,
         id_full: OverlayId,
-        root_members: Vec<Arc<KeyId>>,
+        root_adnl_ids: Vec<Arc<KeyId>>,
+        root_public_keys: Vec<Arc<KeyId>>,
         key: Option<&Arc<dyn KeyOption>>,
         certificate: Option<MemberCertificate>,
         network_context: Arc<NetworkContext>,
@@ -138,15 +150,18 @@ impl OverlayClient {
         policy: DhtSearchPolicy,
         default_rldp_roundtrip: Option<u32>,
         max_clients: usize,
+        use_quic: bool,
     ) -> Result<Arc<Self>> {
         // Add a new overlay to the protocol
         let params = OverlayParams::with_id_only(&id);
         network_context.stack.overlay.add_semiprivate_overlay(
             params,
             key,
-            &root_members,
+            &root_adnl_ids,
+            &root_public_keys,
             certificate,
             max_clients,
+            use_quic,
         )?;
 
         OverlayClient::init(
@@ -157,7 +172,7 @@ impl OverlayClient {
             policy,
             default_rldp_roundtrip,
             true,
-            root_members,
+            root_adnl_ids,
             None,
         )
         .await
@@ -298,23 +313,38 @@ impl OverlayClient {
         self.ctx.overlay_node().broadcast(&self.ctx.id, data, source, flags, method).await
     }
 
+    pub async fn broadcast_twostep(
+        &self,
+        data: &TaggedByteSlice<'_>,
+        source: Option<&Arc<dyn KeyOption>>,
+        flags: u32,
+    ) -> Result<BroadcastSendInfo> {
+        self.ctx
+            .overlay_node()
+            .broadcast_twostep(&self.ctx.id, data, source, flags, Vec::new())
+            .await
+    }
+
     pub async fn send_adnl_query_to_peer<D: ton_api::AnyBoxedSerialize>(
         &self,
         peer: &Arc<Neighbour>,
         request: &TaggedTlObject,
         timeout: Option<u64>,
     ) -> Result<Option<D>> {
-        let request_str = if log::log_enabled!(log::Level::Trace) || cfg!(feature = "telemetry") {
+        let request_str = if log::log_enabled!(log::Level::Debug) || cfg!(feature = "telemetry") {
             format!("ADNL {:?}", request.object)
         } else {
             String::default()
         };
-        log::trace!("USE PEER {peer}, {request_str}");
-
+        log::debug!("send_adnl_query_to_peer sending {request_str} to {peer}");
         let now = Instant::now();
         let timeout = timeout.or(Some(AdnlNode::calc_timeout(peer.roundtrip_adnl())));
-        let answer =
-            self.ctx.overlay_node().query(peer.id(), request, &self.ctx.id, timeout).await?;
+        let result = self.ctx.overlay_node().query(peer.id(), request, &self.ctx.id, timeout).await;
+        log::debug!(
+            "send_adnl_query_to_peer: got {}, peer: {peer}, request: {request_str}",
+            if result.is_ok() { "OK" } else { "ERR" }
+        );
+        let answer = result?;
         let elapsed = now.elapsed();
         let roundtrip = elapsed.as_millis() as u64;
         let labels = [("peer", peer.id().to_string())];
@@ -443,6 +473,32 @@ impl OverlayClient {
         fail!("Cannot send query {:?} to all peers", request.object)
     }
 
+    // Pick a peer for an outgoing query: prefer a random one from active_peers
+    // (the cache of recently good peers), occasionally bypass it via
+    // should_prime_active_peers to rotate in fresh neighbours, and fall back to
+    // choose_neighbour. The returned bool is `true` if the peer came from
+    // active_peers — useful to avoid a redundant insert on success.
+    pub async fn choose_peer(
+        &self,
+        active_peers: Option<&lockfree::set::Set<Arc<KeyId>>>,
+    ) -> Result<(Arc<Neighbour>, bool)> {
+        if let Some(ap) = active_peers {
+            if !should_prime_active_peers() {
+                if let Some(p) = ap.iter().choose(&mut rand::thread_rng()) {
+                    if let Some(n) = self.ctx.neighbours_manager.peer(&p) {
+                        return Ok((n, true));
+                    }
+                }
+            }
+        }
+        if let Some(n) = self.ctx.neighbours_manager.choose_neighbour()? {
+            Ok((n, false))
+        } else {
+            tokio::time::sleep(Duration::from_millis(TIMEOUT_NO_NEIGHBOURS)).await;
+            fail!("Neighbour is not found ({} in list)", self.ctx.neighbours_manager.count())
+        }
+    }
+
     // use this function if request size and answer size < 768 bytes (send query via ADNL)
     pub async fn send_adnl_query<D: ton_api::AnyBoxedSerialize>(
         &self,
@@ -453,25 +509,7 @@ impl OverlayClient {
     ) -> Result<(D, Arc<Neighbour>)> {
         let attempts = attempts.unwrap_or(ADNL_ATTEMPTS);
         for _ in 0..attempts {
-            let (peer, active) = loop {
-                if let Some(ap) = active_peers {
-                    if let Some(p) = ap.iter().choose(&mut rand::thread_rng()) {
-                        if let Some(n) = self.ctx.neighbours_manager.peer(&p) {
-                            break (n, true);
-                        }
-                    }
-                }
-                if let Some(n) = self.ctx.neighbours_manager.choose_neighbour()? {
-                    break (n, false);
-                } else {
-                    tokio::time::sleep(Duration::from_millis(TIMEOUT_NO_NEIGHBOURS)).await;
-                    fail!(
-                        "Neighbour is not found ({} in list) for query {:?}",
-                        self.ctx.neighbours_manager.count(),
-                        request.object
-                    )
-                }
-            };
+            let (peer, active) = self.choose_peer(active_peers).await?;
             match self.send_adnl_query_to_peer::<D>(&peer, request, timeout).await {
                 Err(e) => {
                     if let Some(active_peers) = active_peers {
@@ -495,6 +533,91 @@ impl OverlayClient {
             }
         }
         fail!("No reply to query {:?} in {} attempts", request.object, attempts)
+    }
+
+    // Send the same prepare-style ADNL query to up to `n_peers` random
+    // neighbours concurrently and return the first response that `is_good`
+    // accepts.
+    pub async fn send_adnl_query_fan_out<D, F>(
+        &self,
+        request: &TaggedTlObject,
+        n_peers: usize,
+        timeout: Option<u64>,
+        is_good: F,
+        active_peers: &lockfree::set::Set<Arc<KeyId>>,
+    ) -> Result<(D, Arc<Neighbour>)>
+    where
+        D: ton_api::AnyBoxedSerialize,
+        F: Fn(&D) -> bool,
+    {
+        // Build the peer set for fan-out:
+        // - first slot via choose_peer to keep affinity with a recently good
+        //   peer from active_peers (if any);
+        // - remaining slots via choose_neighbour directly, bypassing the
+        //   active_peers preference — otherwise, when active_peers is small,
+        //   the sticky pick would dominate and fan-out would collapse to a
+        //   single-peer query.
+        // Retry budget guards against re-picking the same weighted-random
+        // neighbour over and over when the pool is small.
+        let mut peers: Vec<Arc<Neighbour>> = Vec::with_capacity(n_peers);
+        if let Ok((p, _)) = self.choose_peer(Some(active_peers)).await {
+            peers.push(p);
+        }
+        let extra_attempts = n_peers.saturating_mul(3);
+        for _ in 0..extra_attempts {
+            if peers.len() >= n_peers {
+                break;
+            }
+            match self.ctx.neighbours_manager.choose_neighbour()? {
+                Some(p) => {
+                    if !peers.iter().any(|x| x.id() == p.id()) {
+                        peers.push(p);
+                    }
+                }
+                None => break,
+            }
+        }
+        if peers.is_empty() {
+            fail!("No neighbours for fan-out query {:?}", request.object)
+        }
+
+        use futures::stream::StreamExt;
+        let mut tasks = futures::stream::FuturesUnordered::new();
+        for peer in &peers {
+            let peer = peer.clone();
+            tasks.push(async move {
+                let result = self.send_adnl_query_to_peer::<D>(&peer, request, timeout).await;
+                (peer, result)
+            });
+        }
+
+        // NOTE: we intentionally do not insert the winning peer into
+        // active_peers here. Promotion is the caller's job after the full
+        // operation succeeds (e.g. RLDP download + deserialization), so a peer
+        // that ACKed prepare but fails the heavy part is not falsely promoted.
+        let mut last_err = None;
+        while let Some((peer, result)) = tasks.next().await {
+            match result {
+                Ok(Some(answer)) => {
+                    if is_good(&answer) {
+                        return Ok((answer, peer));
+                    }
+                    active_peers.remove(peer.id());
+                }
+                Ok(None) => {
+                    active_peers.remove(peer.id());
+                }
+                Err(e) => {
+                    active_peers.remove(peer.id());
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        if let Some(e) = last_err {
+            return Err(e);
+        }
+        fail!("fan-out query {:?}: no good response from {} peers", request.object, peers.len())
     }
 
     pub async fn send_rldp_query_raw<T>(
@@ -581,15 +704,15 @@ impl OverlayClient {
     {
         let mut query = self.ctx.overlay_node().get_query_prefix(&self.ctx.id)?;
         serialize_boxed_append(&mut query, &request.object)?;
-        let request_str = if log::log_enabled!(log::Level::Trace) || cfg!(feature = "telemetry") {
+        let request_str = if log::log_enabled!(log::Level::Debug) || cfg!(feature = "telemetry") {
             std::any::type_name::<T>().to_string()
         } else {
             String::default()
         };
-        log::trace!("USE PEER {}, {}", peer, request_str);
+        log::debug!("send_rldp_query: sending {request_str} to {peer}");
         #[cfg(feature = "telemetry")]
         let now = Instant::now();
-        let (answer, roundtrip) = self
+        let result = self
             .ctx
             .overlay_node()
             .query_via_rldp(
@@ -604,7 +727,12 @@ impl OverlayClient {
                 v2,
                 peer.roundtrip_rldp().map(|t| t + attempt as u64 * TIMEOUT_DELTA),
             )
-            .await?;
+            .await;
+        log::debug!(
+            "send_rldp_query: got {}, peer: {peer}, request: {request_str}",
+            if result.is_ok() { "OK" } else { "ERR" }
+        );
+        let (answer, roundtrip) = result?;
         if let Some(answer) = answer {
             #[cfg(feature = "telemetry")]
             self.ctx.telemetry().consumed_query(request_str, true, now.elapsed(), answer.len());

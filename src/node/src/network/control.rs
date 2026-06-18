@@ -63,8 +63,8 @@ use ton_api::{
     IntoBoxed, TLObject,
 };
 use ton_block::{
-    error, fail, AccountId, BlockIdExt, Ed25519KeyOption, KeyId, MerkleProof, MsgAddressInt,
-    Result, Serializable, ShardAccount, ShardIdent, UInt256, UnixTime,
+    error, fail, AccountId, BlockIdExt, KeyId, MerkleProof, MsgAddressInt, Result, Serializable,
+    ShardAccount, ShardIdent, UInt256, UnixTime, ED25519_KEY_TYPE,
 };
 use ton_block_json::serialize_config_param;
 
@@ -270,9 +270,9 @@ impl ControlQuerySubscriber {
         Ok(match shard_account {
             Some((shard_account, _state_guard)) => {
                 let account = shard_account.read_account()?;
-                let code = account.get_code().map(|cell| cell.repr_hash());
-                let data = account.get_data().map(|cell| cell.repr_hash());
-                let libs = account.libraries().root().map(|cell| cell.repr_hash());
+                let code = account.get_code().map(|cell| cell.repr_hash().clone());
+                let data = account.get_data().map(|cell| cell.repr_hash().clone());
+                let libs = account.libraries().root().map(|cell| cell.repr_hash().clone());
 
                 let cell = shard_account.account_cell();
                 let proof = MerkleProof::create(&cell, |hash| {
@@ -674,8 +674,13 @@ impl ControlQuerySubscriber {
 
     async fn prepare_future_bundle(&self, prev_block_ids: Vec<BlockIdExt>) -> Result<Success> {
         if let DataSource::Engine(ref engine) = self.data_source {
-            let bundle =
-                CollatorTestBundle::build_for_collating_block(engine, prev_block_ids, None).await?;
+            let bundle = CollatorTestBundle::build_for_collating_block(
+                engine,
+                prev_block_ids,
+                None,
+                Vec::new(),
+            )
+            .await?;
             tokio::task::spawn_blocking(move || {
                 bundle.save("target/bundles").ok();
             });
@@ -761,7 +766,7 @@ impl ControlQuerySubscriber {
         let query = match query.downcast::<GenerateKeyPair>() {
             Ok(_params) => {
                 return QueryResult::consume(
-                    self.process_generate_keypair(Ed25519KeyOption::KEY_TYPE).await?,
+                    self.process_generate_keypair(ED25519_KEY_TYPE).await?,
                     #[cfg(feature = "telemetry")]
                     None,
                 )

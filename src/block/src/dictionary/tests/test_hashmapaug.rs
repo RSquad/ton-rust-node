@@ -13,8 +13,8 @@
 #![allow(clippy::vec_init_then_push)]
 use super::*;
 use crate::{
-    define_HashmapAugE, dictionary::HashmapTraverser, error, AddSub, Coins, HashmapFilterResult,
-    HashmapSubtree, IBitstring, UInt256,
+    define_HashmapAugE, error, AddSub, Coins, HashmapFilterResult, HashmapSubtree, IBitstring,
+    UInt256,
 };
 use std::fmt;
 
@@ -909,41 +909,25 @@ fn test_multiset_aug() {
         ([2u8; 32], 0x22u8, 73u64),
         ([8u8; 32], 0x33u8, 74u64),
     ];
-    let mut hashmap = TestDescr::new();
-    let mut tr = HashmapTraverser::new(&hashmap);
+    let mut hashmap_set = TestDescr::new();
 
     for (key, value, aug) in data {
-        {
-            let key = key.write_to_bitstring().unwrap();
-            let mut builder = aug.write_to_new_cell().unwrap();
-            value.write_to(&mut builder).unwrap();
-            let data = SliceData::load_bitstring(builder).unwrap();
-            tr.insert(key, Some(data)).unwrap();
-        }
         let key = UInt256::with_array(key);
-        hashmap.set(&key, &value, &MinLt(aug)).unwrap();
+        hashmap_set.set(&key, &value, &MinLt(aug)).unwrap();
     }
 
-    println!("{:?}", tr.root);
-
-    let new_root = tr.traverse().unwrap().unwrap();
-    let new_cell = format!("{new_root:#.10}");
-    let cell = format!("{:#.10}", hashmap.data().unwrap());
-    pretty_assertions::assert_eq!(new_cell, cell);
-    assert_eq!(&new_root, hashmap.data().unwrap());
-
-    let mut hashmap = TestDescr::new();
-    hashmap
-        .multiset(data.into_iter().map(|(key, value, aug)| {
-            let key = key.write_to_bitstring().unwrap();
+    let mut hashmap_multiset = TestDescr::new();
+    hashmap_multiset
+        .multiset(data.iter().map(|(key, value, aug)| {
+            let fk = crate::dictionary::FixedBitsKey::new(&key[..]);
             let mut builder = aug.write_to_new_cell().unwrap();
             value.write_to(&mut builder).unwrap();
             let data = SliceData::load_bitstring(builder).unwrap();
-            (key, Some(data))
+            (fk, Some(data))
         }))
         .unwrap();
 
-    assert_eq!(&new_root, hashmap.data().unwrap());
+    assert_eq!(hashmap_set, hashmap_multiset);
 }
 
 #[test]

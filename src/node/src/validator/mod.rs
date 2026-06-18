@@ -9,6 +9,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 pub mod accept_block;
+pub mod block_sync_observer;
 pub mod candidate_db;
 pub mod collator;
 pub mod consensus;
@@ -19,6 +20,7 @@ mod mutex_wrapper;
 pub mod out_msg_queue;
 mod out_msg_queue_cleaner;
 pub mod out_msg_queue_manager;
+pub mod state_resolver_cache;
 #[cfg(feature = "telemetry")]
 pub mod telemetry;
 pub mod validate_query;
@@ -62,6 +64,8 @@ pub struct CollatorSettings {
     pub lt_compatible: bool,
     // true when running under simplex consensus (passed from ValidatorGroup)
     pub is_simplex: bool,
+    // when set, collator must not choose gen_utime_ms earlier than this value
+    pub min_gen_utime_ms: Option<u64>,
 }
 
 impl CollatorSettings {

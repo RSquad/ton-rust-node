@@ -36,18 +36,24 @@ action_set_code#ad4de08e new_code:^Cell = OutAction;
 ///
 pub type OutActions = LinkedList<OutAction>;
 
-pub fn unpack_out_action_slices(mut cell: SliceData) -> Result<Vec<SliceData>> {
+pub fn unpack_out_action_slices(
+    actions_cell: Cell,
+) -> std::result::Result<Vec<SliceData>, (u32, crate::Error)> {
+    let mut cell = actions_cell;
     let mut slices_rev = Vec::new();
+    let mut n: u32 = 0;
     loop {
-        if cell.remaining_references() == 0 {
-            if cell.is_empty_cell() {
-                break;
-            }
-            fail!("cell is not empty")
+        if cell.cell_type() != crate::CellType::Ordinary {
+            return Err((n, crate::error!("special cell in action list: {:?}", cell.cell_type())));
         }
-        let prev_cell = cell.checked_drain_reference()?;
-        slices_rev.push(cell);
-        cell = SliceData::load_cell(prev_cell)?;
+        let mut slice = SliceData::load_cell(cell).map_err(|err| (n, err))?;
+        if slice.is_empty_cell() {
+            break;
+        }
+        let prev_cell = slice.checked_drain_reference().map_err(|err| (n, err))?;
+        slices_rev.push(slice);
+        cell = prev_cell;
+        n += 1;
     }
     slices_rev.reverse();
     Ok(slices_rev)
@@ -79,7 +85,9 @@ impl Serializable for OutActions {
 ///
 impl Deserializable for OutActions {
     fn read_from(&mut self, cell: &mut SliceData) -> Result<()> {
-        let action_slices = unpack_out_action_slices(cell.clone())?;
+        let root = cell.clone().into_cell()?;
+        let action_slices = unpack_out_action_slices(root)
+            .map_err(|(pos, err)| crate::error!("action list invalid at position {pos}: {err}"))?;
         for mut action_slice in action_slices {
             self.push_back(OutAction::construct_from(&mut action_slice)?);
         }
@@ -232,15 +240,12 @@ impl Serializable for OutAction {
 
 impl Deserializable for OutAction {
     fn construct_from(slice: &mut SliceData) -> Result<Self> {
-        if slice.remaining_bits() < std::mem::size_of::<u32>() * 8 {
-            fail!(BlockError::InvalidArg("cell can't be shorter than 32 bits".to_string()))
-        }
         let tag = slice.get_next_u32()?;
         let action = match tag {
             ACTION_SEND_MSG => {
                 let mode = slice.get_next_byte()?;
                 match Message::construct_from_reference(slice) {
-                    Ok(msg) => OutAction::new_send(mode, msg),
+                    Ok(out_msg) => OutAction::new_send(mode, out_msg),
                     Err(err) => fail!(BlockError::OutActionError(err, mode)),
                 }
             }
@@ -256,15 +261,17 @@ impl Deserializable for OutAction {
                 let mode = slice.get_next_byte()?;
                 let flags = (mode >> 1) & SET_LIB_CODE_ADD_PRIVATE_OR_PUBLIC_MASK;
                 match (mode & CHANGE_SET_LIB_MASK, flags) {
-                    (CHANGE_LIB_MODE, 0) => {
-                        let hash = UInt256::construct_from(slice)?;
-                        OutAction::new_change_library(mode, None, Some(hash))
-                    }
+                    (CHANGE_LIB_MODE, 0) => match UInt256::construct_from(slice) {
+                        Ok(hash) => OutAction::new_change_library(mode, None, Some(hash)),
+                        Err(err) => fail!(BlockError::OutActionError(err, mode)),
+                    },
                     (SET_LIB_CODE_MODE, SET_LIB_CODE_REMOVE)
                     | (SET_LIB_CODE_MODE, SET_LIB_CODE_ADD_PRIVATE)
                     | (SET_LIB_CODE_MODE, SET_LIB_CODE_ADD_PUBLIC) => {
-                        let code = slice.checked_drain_reference()?;
-                        OutAction::new_change_library(mode, Some(code), None)
+                        match slice.checked_drain_reference() {
+                            Ok(code) => OutAction::new_change_library(mode, Some(code), None),
+                            Err(err) => fail!(BlockError::OutActionError(err, mode)),
+                        }
                     }
                     _ => fail!("wrong mode for ChangeLibrary action: {mode}"),
                 }
@@ -272,5 +279,47 @@ impl Deserializable for OutAction {
             tag => fail!(BlockError::InvalidConstructorTag { t: tag, s: "OutAction".to_string() }),
         };
         Ok(action)
+    }
+    fn skip(slice: &mut SliceData) -> Result<()> {
+        let tag = slice.get_next_u32()?;
+        match tag {
+            ACTION_SEND_MSG => {
+                let mode = slice.get_next_byte()?;
+                let out_msg_cell = slice.checked_drain_reference()?;
+                if let Err(err) = Message::skip(&mut SliceData::load_cell(out_msg_cell)?) {
+                    fail!(BlockError::OutActionError(err, mode))
+                }
+            }
+            ACTION_SET_CODE => {
+                slice.checked_drain_reference()?;
+            }
+            ACTION_RESERVE => {
+                let mode = slice.get_next_byte()?;
+                if let Err(err) = CurrencyCollection::skip(slice) {
+                    fail!(BlockError::OutActionError(err, mode))
+                }
+            }
+            ACTION_CHANGE_LIB => {
+                let mode = slice.get_next_byte()?;
+                let flags = (mode >> 1) & SET_LIB_CODE_ADD_PRIVATE_OR_PUBLIC_MASK;
+                match (mode & CHANGE_SET_LIB_MASK, flags) {
+                    (CHANGE_LIB_MODE, 0) => {
+                        if let Err(err) = slice.move_by(256) {
+                            fail!(BlockError::OutActionError(err, mode))
+                        }
+                    }
+                    (SET_LIB_CODE_MODE, SET_LIB_CODE_REMOVE)
+                    | (SET_LIB_CODE_MODE, SET_LIB_CODE_ADD_PRIVATE)
+                    | (SET_LIB_CODE_MODE, SET_LIB_CODE_ADD_PUBLIC) => {
+                        if let Err(err) = slice.checked_drain_reference() {
+                            fail!(BlockError::OutActionError(err, mode))
+                        }
+                    }
+                    _ => fail!("wrong mode for ChangeLibrary action: {mode}"),
+                }
+            }
+            tag => fail!(BlockError::InvalidConstructorTag { t: tag, s: "OutAction".to_string() }),
+        }
+        Ok(())
     }
 }

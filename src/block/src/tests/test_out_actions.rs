@@ -12,9 +12,9 @@ use super::*;
 
 #[test]
 fn test_out_action_create() {
-    let msg = Message::default();
-    let action_send = OutAction::new_send(0, msg.clone());
-    assert_eq!(action_send, OutAction::SendMsg { mode: 0, out_msg: msg });
+    let out_msg = Message::default();
+    let action_send = OutAction::new_send(0, out_msg.clone());
+    assert_eq!(action_send, OutAction::SendMsg { mode: 0, out_msg });
     let new_code = Cell::default();
     let action_set = OutAction::new_set(new_code.clone());
     assert_eq!(action_set, OutAction::SetCode { new_code });
@@ -63,7 +63,11 @@ fn get_out_actions() -> OutActions {
     oa.push_back(OutAction::new_set(Cell::default()));
     oa.push_back(OutAction::new_reserve(RESERVE_EXACTLY, CurrencyCollection::with_coins(12345678)));
     oa.push_back(OutAction::new_reserve(RESERVE_ALL_BUT, CurrencyCollection::with_coins(87654321)));
-    oa.push_back(OutAction::new_change_library(CHANGE_LIB_MODE, None, Some(code.repr_hash())));
+    oa.push_back(OutAction::new_change_library(
+        CHANGE_LIB_MODE,
+        None,
+        Some(code.repr_hash().clone()),
+    ));
     oa.push_back(OutAction::new_change_library(SET_LIB_CODE_MODE, Some(code), None));
     oa
 }
@@ -101,7 +105,7 @@ fn test_unpack_out_action_slices_valid_list() {
     actions.push_back(OutAction::new_reserve(RESERVE_EXACTLY, CurrencyCollection::with_coins(1)));
 
     let actions_cell = actions.serialize().unwrap();
-    let slices = unpack_out_action_slices(SliceData::load_cell(actions_cell).unwrap()).unwrap();
+    let slices = unpack_out_action_slices(actions_cell).unwrap();
     assert_eq!(slices.len(), 2);
 
     let mut s0 = slices[0].clone();
@@ -111,6 +115,16 @@ fn test_unpack_out_action_slices_valid_list() {
 
     assert!(matches!(a0, OutAction::SetCode { .. }));
     assert!(matches!(a1, OutAction::ReserveCurrency { .. }));
+}
+
+/// Special (non-Ordinary) cell as action list root must be rejected.
+#[test]
+fn test_unpack_out_action_slices_rejects_special_cell() {
+    let special = Cell::default().as_library_cell();
+    assert_ne!(special.cell_type(), crate::CellType::Ordinary);
+
+    let (pos, _err) = unpack_out_action_slices(special).unwrap_err();
+    assert_eq!(pos, 0);
 }
 
 #[test]
@@ -123,18 +137,75 @@ fn test_unpack_out_action_slices_rejects_non_empty_tail() {
     OutAction::new_set(Cell::default()).write_to(&mut root).unwrap();
     let actions_cell = root.into_cell().unwrap();
 
-    assert!(unpack_out_action_slices(SliceData::load_cell(actions_cell).unwrap()).is_err());
+    assert!(unpack_out_action_slices(actions_cell).is_err());
 }
 
 #[test]
 fn test_deserialize_out_action_slices_valid_list() {
     let actions = get_out_actions();
-    let slice = SliceData::load_cell(actions.serialize().unwrap()).unwrap();
-    let slices = unpack_out_action_slices(slice).unwrap();
+    let slices = unpack_out_action_slices(actions.serialize().unwrap()).unwrap();
     assert_eq!(slices.len(), actions.len());
     for (expected, mut slice) in actions.into_iter().zip(slices.into_iter()) {
         let actual = OutAction::construct_from(&mut slice).unwrap();
         assert_eq!(expected, actual);
+    }
+}
+
+/// Non-canonical Grams in a SendMsg action must trigger OutActionError
+#[test]
+fn test_sendmsg_non_canonical_coins_gives_out_action_error() {
+    let append_addr_std = |b: &mut BuilderData| {
+        b.append_bits(0b10, 2).unwrap();
+        b.append_bit_zero().unwrap();
+        b.append_bits(0, 8).unwrap();
+        for _ in 0..4 {
+            b.append_u64(0).unwrap();
+        }
+    };
+
+    let build_msg_cell = |coins_len: usize, coins_bytes: &[u8]| -> Cell {
+        let mut b = BuilderData::new();
+        b.append_bit_zero().unwrap();
+        b.append_bit_one().unwrap();
+        b.append_bit_zero().unwrap();
+        b.append_bit_zero().unwrap();
+        append_addr_std(&mut b);
+        append_addr_std(&mut b);
+        b.append_bits(coins_len, 4).unwrap();
+        b.append_raw(coins_bytes, coins_len * 8).unwrap();
+        b.append_bit_zero().unwrap();
+        b.append_bits(0, 4).unwrap();
+        b.append_bits(0, 4).unwrap();
+        b.append_u64(0).unwrap();
+        b.append_u32(0).unwrap();
+        b.append_bit_zero().unwrap();
+        b.append_bit_zero().unwrap();
+        b.into_cell().unwrap()
+    };
+
+    let build_action_slice = |msg_cell: Cell, mode: u8| -> SliceData {
+        let mut b = BuilderData::new();
+        ACTION_SEND_MSG.write_to(&mut b).unwrap();
+        mode.write_to(&mut b).unwrap();
+        b.checked_append_reference(msg_cell).unwrap();
+        SliceData::load_cell(b.into_cell().unwrap()).unwrap()
+    };
+
+    // Canonical: 1 TON = 0x3B9ACA00 in 4 bytes -> parses fine
+    let msg_cell = build_msg_cell(4, &[0x3B, 0x9A, 0xCA, 0x00]);
+    let mut slice = build_action_slice(msg_cell, 0);
+    OutAction::skip(&mut slice.clone()).unwrap();
+    let action = OutAction::construct_from(&mut slice).unwrap();
+    assert!(matches!(action, OutAction::SendMsg { mode: 0, .. }));
+
+    // Non-canonical: same value but len=5 with leading 0x00 -> OutActionError
+    let msg_cell = build_msg_cell(5, &[0x00, 0x3B, 0x9A, 0xCA, 0x00]);
+    let mut slice = build_action_slice(msg_cell, 3);
+    OutAction::skip(&mut slice.clone()).unwrap();
+    let err = OutAction::construct_from(&mut slice).unwrap_err();
+    match err.downcast_ref::<BlockError>() {
+        Some(BlockError::OutActionError(_, mode)) => assert_eq!(*mode, 3),
+        other => panic!("expected OutActionError with mode=3, got: {other:?}"),
     }
 }
 

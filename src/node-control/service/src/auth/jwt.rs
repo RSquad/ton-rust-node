@@ -84,8 +84,8 @@ impl JwtAuth {
         let secret_id = SecretId::new(JWT_KEY_SECRET_ID);
 
         if vault.exists(&secret_id).await? {
-            let secret = vault.get(&secret_id).await?;
-            return Self::extract_blob_bytes(&secret).await;
+            let secret = vault.load(&secret_id).await?;
+            return Self::extract_blob_bytes(&secret);
         }
 
         tracing::info!(
@@ -98,14 +98,14 @@ impl JwtAuth {
         let spec = SecretSpec::new(Algorithm::None).extractable(true).size(32);
         let secret = vault.generate_secret(&spec, &secret_id).await?;
 
-        Ok(secret.as_blob()?.data().await?.lock().await?.to_vec())
+        Ok(secret.as_blob()?.data().lock()?.to_vec())
     }
 
-    async fn extract_blob_bytes(secret: &Secret) -> anyhow::Result<Vec<u8>> {
+    fn extract_blob_bytes(secret: &Secret) -> anyhow::Result<Vec<u8>> {
         match secret {
             Secret::Blob { blob } => {
-                let pm = blob.data().await?;
-                let locked = pm.lock().await?;
+                let pm = blob.data();
+                let locked = pm.lock()?;
                 Ok(locked.to_vec())
             }
             _ => anyhow::bail!("expected blob secret for JWT key, got different type"),

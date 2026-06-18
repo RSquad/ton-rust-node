@@ -74,9 +74,9 @@ fn dump_var_impl(item: &StackItem, how: u8, in_tuple: bool) -> String {
             StackItem::None => return String::new(),
             StackItem::Builder(x) => x.data().to_vec(),
             StackItem::Cell(x) => x.data().to_vec(),
-            StackItem::Continuation(x) => x.code().get_bytestring(0),
+            StackItem::Continuation(x) => x.code().get_bytestring(0).into_vec(),
             StackItem::Integer(x) => return format!("{}", Arc::as_ref(x)),
-            StackItem::Slice(x) => x.get_bytestring(0),
+            StackItem::Slice(x) => x.get_bytestring(0).into_vec(),
             StackItem::Tuple(x) => dump_tuple_impl(x, how, in_tuple).as_bytes().to_vec(),
         };
         match str::from_utf8(&string) {

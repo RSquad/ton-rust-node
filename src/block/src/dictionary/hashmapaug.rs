@@ -520,9 +520,9 @@ pub trait HashmapAugType<
         Ok(())
     }
     /// multiset items to hashmapaug
-    fn multiset<I>(&mut self, iter: I) -> Result<()>
+    fn multiset<'a, I>(&mut self, iter: I) -> Result<()>
     where
-        I: Iterator<Item = (SliceData, Option<SliceData>)>,
+        I: IntoIterator<Item = (crate::dictionary::FixedBitsKey<'a>, Option<SliceData>)>,
     {
         self.hashmap_multiset(iter)?;
         self.update_root_extra()?;
@@ -621,7 +621,7 @@ pub trait HashmapAugType<
         let label = LabelReader::read_label(slice, self.bit_len())?;
         if label.remaining_bits() != self.bit_len() {
             // fork
-            slice.shrink_references(2..); // left, right
+            slice.shrink_references(2..)?; // left, right
             self.set_root_extra(Y::construct_from(slice)?);
         } else {
             // single leaf as root
@@ -778,7 +778,7 @@ pub trait HashmapAugType<
         if slice.remaining_references() < 2 {
             fail!(BlockError::InvalidArg("slice must contain 2 or more references".to_string()))
         }
-        let mut references = slice.shrink_references(2..); // left and right, drop extra
+        let mut references = slice.shrink_references(2..)?; // left and right, drop extra
         assert_eq!(references.len(), 2);
         let mut fork_extra = Self::find_extra(&references[1 - next_index], bit_len - 1)?;
         let (result, extra) =
@@ -891,7 +891,7 @@ pub trait HashmapAugType<
             if slice.remaining_references() < 2 {
                 debug_assert!(false, "fork should have at least two refs");
             }
-            slice.shrink_references(2..); // drain left, right
+            slice.shrink_references(2..)?; // drain left, right
         }
         let mut fork_extra = Y::construct_from(&mut slice)?;
         fork_extra.calc(extra)?;
@@ -928,7 +928,7 @@ pub trait HashmapAugType<
             if slice.remaining_references() < 2 {
                 fail!(ExceptionCode::CellUnderflow)
             }
-            slice.shrink_references(2..);
+            slice.shrink_references(2..)?;
         }
         Y::construct_from(&mut slice)
     }

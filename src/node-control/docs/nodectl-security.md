@@ -98,11 +98,19 @@ Cannot:
 Can:
 
 - everything `nominator` can do;
-- perform operational REST changes:
-  - `/v1/elections/exclude`
-  - `/v1/elections/include`
-  - `/v1/stake_strategy`
-  - `/v1/task/elections`
+- perform elections control:
+  - `POST /v1/elections/exclude`
+  - `POST /v1/elections/include`
+  - `POST /v1/elections/settings` (unified: stake policy, per-node overrides, `tick_interval`, `max_factor`)
+  - `POST /v1/task/elections`
+- manage configuration entities via REST:
+  - `POST /v1/nodes`, `DELETE /v1/nodes/{name}`
+  - `POST /v1/wallets`, `DELETE /v1/wallets/{name}`
+  - `POST /v1/pools`, `DELETE /v1/pools/{name}`
+  - `POST /v1/bindings`, `DELETE /v1/bindings/{node}`
+- update service settings via REST:
+  - `POST /v1/ton-http-api`
+  - `POST /v1/log`
 - view users list (`GET /auth/users`).
 
 Cannot:

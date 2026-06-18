@@ -13,9 +13,12 @@ use common::{
     app_config::{AppConfig, Role, UserEntry},
     hash_password, time_format,
 };
-use secrets_vault::{types::secret_id::SecretId, vault_builder::SecretVaultBuilder};
+use secrets_vault::{
+    crypto::factory::CryptoFactory, types::secret_id::SecretId, vault_block::BlockCryptoFactory,
+    vault_builder::SecretVaultBuilder,
+};
 use service::auth::user_store::{store_password_blob, user_secret_id, validate_username};
-use std::path::Path;
+use std::{io::Read, path::Path};
 
 #[derive(clap::Args, Clone)]
 #[command(about = "Manage authentication users")]
@@ -103,6 +106,11 @@ pub struct AddUserCmd {
         help = "User role [possible values: operator, nominator]"
     )]
     role: Role,
+    #[arg(
+        long = "password-stdin",
+        help = "Read password from stdin instead of interactive prompt (no confirmation)"
+    )]
+    password_stdin: bool,
 }
 
 #[derive(clap::Args, Clone)]
@@ -151,8 +159,22 @@ impl AddUserCmd {
         }
         let min_len = auth.min_password_length;
 
-        let password =
-            rpassword::prompt_password("Enter password: ").context("failed to read password")?;
+        let password = if self.password_stdin {
+            let mut input = String::new();
+            std::io::stdin()
+                .read_to_string(&mut input)
+                .context("failed to read password from stdin")?;
+            input.trim_end_matches(['\n', '\r']).to_owned()
+        } else {
+            let pw = rpassword::prompt_password("Enter password: ")
+                .context("failed to read password")?;
+            let confirm = rpassword::prompt_password("Confirm password: ")
+                .context("failed to read password confirmation")?;
+            if pw != confirm {
+                anyhow::bail!("passwords do not match");
+            }
+            pw
+        };
 
         if password.is_empty() {
             anyhow::bail!("password cannot be empty");
@@ -161,15 +183,10 @@ impl AddUserCmd {
             anyhow::bail!("password must be at least {min_len} characters");
         }
 
-        let confirm = rpassword::prompt_password("Confirm password: ")
-            .context("failed to read password confirmation")?;
-
-        if password != confirm {
-            anyhow::bail!("passwords do not match");
-        }
-
         let hash = hash_password(&password).context("failed to hash password")?;
-        let vault = SecretVaultBuilder::from_env().await.context("failed to open vault")?;
+        let vault = SecretVaultBuilder::from_env(BlockCryptoFactory {}.new_crypto()?)
+            .await
+            .context("failed to open vault")?;
         let secret_id = user_secret_id(&self.username);
         let secret_name = secret_id.to_string();
 
@@ -225,7 +242,7 @@ impl RemoveUserCmd {
             .clone();
 
         if let Some(ref secret_name) = entry.password_name {
-            match SecretVaultBuilder::from_env().await {
+            match SecretVaultBuilder::from_env(BlockCryptoFactory {}.new_crypto()?).await {
                 Ok(vault) => {
                     let sid = SecretId::new(secret_name);
                     if vault.exists(&sid).await? {

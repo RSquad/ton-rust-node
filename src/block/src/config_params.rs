@@ -19,9 +19,9 @@ use crate::{
         ChildCell, Coins, ExtraCurrencyCollection, Number12, Number13, Number16, Number32, Number8,
     },
     validators::{ValidatorDescr, ValidatorSet},
-    AccountId, BlockError, BuilderData, Cell, Deserializable, HashmapE, HashmapIterator,
-    HashmapType, IBitstring, MsgAddressInt, Result, Serializable, SliceData, UInt256,
-    BASE_WORKCHAIN_ID, MAX_SPLIT_DEPTH,
+    AccountId, BlockError, BuilderData, Cell, Deserializable, EmptyValue, HashmapE,
+    HashmapIterator, HashmapType, IBitstring, MsgAddressInt, Result, Serializable, SliceData,
+    UInt256, BASE_WORKCHAIN_ID, MAX_SPLIT_DEPTH,
 };
 use num::BigInt;
 use std::collections::BTreeMap;
@@ -432,7 +432,7 @@ pub enum GlobalCapabilities {
     CapResolveMerkleCell      = 0x0000_0200_0000,
 }
 
-pub const SUPPORTED_VERSION: u32 = 13;
+pub const SUPPORTED_VERSION: u32 = 14;
 pub const LT_ALIGN: u64 = 1_000_000;
 
 impl ConfigParams {
@@ -1102,7 +1102,7 @@ impl Serializable for ConfigParam8 {
 
 // _ mandatory_params:(Hashmap 32 True) = ConfigParam 9;
 
-define_HashmapE! {MandatoryParams, 32, ()}
+define_HashmapE! {MandatoryParams, 32, EmptyValue}
 
 ///
 /// Config Param 9 structure
@@ -1381,7 +1381,7 @@ impl StoragePrices {
         Self::default()
     }
 
-    pub fn calc_storage_fee(
+    pub fn calc_storage_fee_part(
         &self,
         cells: u64,
         bits: u64,
@@ -1390,10 +1390,8 @@ impl StoragePrices {
     ) -> BigInt {
         let bit_price = if is_masterchain { self.mc_bit_price_ps } else { self.bit_price_ps };
         let cell_price = if is_masterchain { self.mc_cell_price_ps } else { self.cell_price_ps };
-        (BigInt::from(delta)
-            * (bits as u128 * bit_price as u128 + cells as u128 * cell_price as u128)
-            + 0xffff)
-            >> 16u8
+        let total = bits as u128 * bit_price as u128 + cells as u128 * cell_price as u128;
+        BigInt::from(delta) * total
     }
 }
 
@@ -1990,7 +1988,7 @@ impl Serializable for ConsensusConfig {
 _ fundamental_smc_addr:(HashmapE 256 True) = ConfigParam 31;
 */
 
-define_HashmapE! {FundamentalSmcAddresses, 256, ()}
+define_HashmapE! {FundamentalSmcAddresses, 256, EmptyValue}
 
 impl IntoIterator for &FundamentalSmcAddresses {
     type Item = <HashmapIterator<HashmapE> as std::iter::Iterator>::Item;
@@ -2015,7 +2013,7 @@ impl ConfigParam31 {
     }
 
     pub fn add_address(&mut self, address: AccountId) {
-        self.fundamental_smc_addr.set(&address, &()).unwrap();
+        self.fundamental_smc_addr.set(&address, &EmptyValue).unwrap();
     }
 }
 
@@ -3487,7 +3485,7 @@ impl Deserializable for SuspendedAddressesKey {
     }
 }
 
-define_HashmapE! {SuspendedAddresses, 288, ()}
+define_HashmapE! {SuspendedAddresses, 288, EmptyValue}
 
 #[derive(Default, Clone, Debug, Eq, PartialEq)]
 pub struct SuspendedAddressList {
@@ -3531,7 +3529,7 @@ impl SuspendedAddressList {
     }
     pub fn add_suspended_address(&mut self, wc: i32, addr: SliceData) -> Result<()> {
         let key = SuspendedAddressesKey::new(wc, addr);
-        self.addresses.set(&key, &())
+        self.addresses.set(&key, &EmptyValue)
     }
     pub fn iterate_addresses(
         &self,
@@ -3806,6 +3804,8 @@ pub struct NoncriticalParams {
     pub max_leader_window_desync: u32,                  // idx 10, uint32
     pub bad_signature_ban_duration_ms: u32,             // idx 11, duration
     pub candidate_resolve_rate_limit: u32,              // idx 12, uint32
+    pub min_block_interval_ms: u32,                     // idx 13, duration
+    pub no_empty_blocks_on_error_timeout_ms: u32,       // idx 14, duration
 }
 
 impl Default for NoncriticalParams {
@@ -3824,6 +3824,8 @@ impl Default for NoncriticalParams {
             max_leader_window_desync: 250,
             bad_signature_ban_duration_ms: 5_000,
             candidate_resolve_rate_limit: 10,
+            min_block_interval_ms: 0,
+            no_empty_blocks_on_error_timeout_ms: 15_000,
         }
     }
 }
@@ -3845,6 +3847,8 @@ impl NoncriticalParams {
             10 => self.max_leader_window_desync = value,
             11 => self.bad_signature_ban_duration_ms = value,
             12 => self.candidate_resolve_rate_limit = value,
+            13 => self.min_block_interval_ms = value,
+            14 => self.no_empty_blocks_on_error_timeout_ms = value,
             _ => {}
         }
     }
@@ -3874,6 +3878,8 @@ impl NoncriticalParams {
             (10, self.max_leader_window_desync),
             (11, self.bad_signature_ban_duration_ms),
             (12, self.candidate_resolve_rate_limit),
+            (13, self.min_block_interval_ms),
+            (14, self.no_empty_blocks_on_error_timeout_ms),
         ])
     }
 }
@@ -3887,6 +3893,7 @@ impl NoncriticalParams {
 /// timing/rate parameters live inside `noncritical_params`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SimplexConfig {
+    pub enable_observers: bool,
     pub use_quic: bool,
     pub slots_per_leader_window: u32,
     pub noncritical_params: NoncriticalParams,
@@ -3895,6 +3902,7 @@ pub struct SimplexConfig {
 impl Default for SimplexConfig {
     fn default() -> Self {
         Self {
+            enable_observers: false,
             use_quic: false,
             slots_per_leader_window: 4,
             noncritical_params: NoncriticalParams::default(),
@@ -3902,14 +3910,16 @@ impl Default for SimplexConfig {
     }
 }
 
-/// Maximum noncritical param key defined in the C++ reference (candidate_resolve_rate_limit).
-const NONCRITICAL_PARAMS_MAX_KEY: u8 = 12;
+/// Maximum noncritical param key defined in the C++ reference.
+const NONCRITICAL_PARAMS_MAX_KEY: u8 = 14;
 
 /// Always serializes as simplex_config_v2#22 (the current on-chain format).
 impl Serializable for SimplexConfig {
     fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
         cell.append_u8(SIMPLEX_CONFIG_V2_TAG)?;
-        let flags_byte = if self.use_quic { 1u8 } else { 0u8 };
+        // TL-B layout: 6 zero flag bits, then enable_observers (bit 1), then use_quic (bit 0).
+        let flags_byte =
+            (if self.enable_observers { 1u8 } else { 0u8 }) << 1 | (self.use_quic as u8);
         cell.append_u8(flags_byte)?;
         self.slots_per_leader_window.write_to(cell)?;
         let raw_map = self.noncritical_params.to_raw_map();
@@ -3931,6 +3941,7 @@ impl Deserializable for SimplexConfig {
         let tag = slice.get_next_byte()?;
         match tag {
             SIMPLEX_CONFIG_TAG => {
+                // Legacy v1: bit 0 = use_quic; enable_observers did not exist.
                 let flags_byte = slice.get_next_byte()?;
                 let use_quic = (flags_byte & 1) != 0;
                 let target_rate_ms = u32::construct_from(slice)?;
@@ -3938,6 +3949,7 @@ impl Deserializable for SimplexConfig {
                 let first_block_timeout_ms = u32::construct_from(slice)?;
                 let max_leader_window_desync = u32::construct_from(slice)?;
                 Ok(Self {
+                    enable_observers: false,
                     use_quic,
                     slots_per_leader_window,
                     noncritical_params: NoncriticalParams {
@@ -3949,8 +3961,10 @@ impl Deserializable for SimplexConfig {
                 })
             }
             SIMPLEX_CONFIG_V2_TAG => {
+                // v2 flag-byte layout (BlockSync): 6 zero flag bits, enable_observers (bit 1), use_quic (bit 0).
                 let flags_byte = slice.get_next_byte()?;
-                let use_quic = (flags_byte & 1) != 0;
+                let use_quic = (flags_byte & 0x01) != 0;
+                let enable_observers = (flags_byte & 0x02) != 0;
                 let slots_per_leader_window = u32::construct_from(slice)?;
                 let has_params = slice.get_next_bit()?;
                 let params_cell =
@@ -3964,6 +3978,7 @@ impl Deserializable for SimplexConfig {
                     }
                 }
                 Ok(Self {
+                    enable_observers,
                     use_quic,
                     slots_per_leader_window,
                     noncritical_params: NoncriticalParams::from_raw_map(&raw),

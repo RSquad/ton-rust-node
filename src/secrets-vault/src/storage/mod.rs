@@ -18,5 +18,8 @@ pub mod hashicorp;
 #[cfg(feature = "hashicorp-storage")]
 pub(crate) mod hashicorp_api;
 
+#[cfg(feature = "hashicorp-storage")]
+pub(crate) mod hashicorp_token_provider;
+
 pub mod storage_trait;
 pub mod utils;

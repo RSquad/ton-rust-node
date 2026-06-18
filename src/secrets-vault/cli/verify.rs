@@ -16,7 +16,7 @@ use secrets_vault::{
 pub async fn execute(secret_id: &str, data: &[u8], signature: &[u8]) -> anyhow::Result<()> {
     let vault = open_vault().await?;
     let secret_id: SecretId = secret_id.into();
-    let secret = vault.get(&secret_id).await?;
+    let secret = vault.load(&secret_id).await?;
 
     let key_pair = match secret {
         Secret::Blob { .. } | Secret::SymmetricKey { .. } => {

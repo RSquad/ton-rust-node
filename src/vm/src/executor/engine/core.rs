@@ -12,7 +12,7 @@ use crate::{
     error::{tvm_exception_code, tvm_exception_full, tvm_exception_or_custom_code, TvmError},
     executor::{
         continuation::{switch, switch_to_c0},
-        engine::handlers::Handlers,
+        engine::{fix_gas::check_too_short_code, handlers::Handlers},
         gas::gas_state::Gas,
         math::DivMode,
         microcode::{CTRL, VAR},
@@ -78,6 +78,7 @@ pub struct RunChildVm {
     pub stack: Stack,
     pub gas_max: i64,
     pub gas_limit: i64,
+    pub push_0: bool,
     pub same_c3: bool,
     pub return_data: bool,
     pub return_actions: bool,
@@ -286,6 +287,10 @@ impl Engine {
         self.gas.get_gas_remaining()
     }
 
+    pub fn use_free_gas(&mut self, gas: i64) {
+        self.free_gas_consumed += gas;
+    }
+
     pub fn withdraw_stack(&mut self) -> Stack {
         std::mem::take(&mut self.cc.stack)
     }
@@ -429,7 +434,7 @@ impl Engine {
             if self.trace_bit(Engine::TRACE_CODE) {
                 log::info!(target: "tvm", "code cell hash: {:X} offset: {}\n", info.cmd_code.cell().unwrap().repr_hash(), info.cmd_code.pos());
                 let cmd_str = match info.cmd_str.as_str() {
-                    "POP s0" => "POP",
+                    "POP s0" => "DROP",
                     "POP s1" => "NIP",
                     "PUSH s0" => "DUP",
                     "PUSH s1" => "OVER",
@@ -558,7 +563,6 @@ impl Engine {
             }
         }
     }
-
     pub fn execute(&mut self) -> Result<i32> {
         self.trace_info(EngineTraceInfoType::Start, 0, None);
         let result = loop {
@@ -566,11 +570,27 @@ impl Engine {
                 break result;
             }
             self.cmd_code = SliceProto::from(self.cc.code());
+            if let Some((prefix, bits, gas)) = check_too_short_code(self.cc.code())? {
+                self.cc.code_mut().move_by(bits as usize)?;
+                let err = match self.try_use_gas(gas as i64) {
+                    Err(err) => err,
+                    Ok(_) => error!(
+                        ExceptionCode::InvalidOpcode,
+                        "partial primitive with bits {bits} : 0x{prefix:X}",
+                    ),
+                };
+                self.step += 1;
+                self.raise_exception(err)?;
+                continue;
+            }
             let execution_result = match HANDLERS_CP0.get_handler(self) {
-                Err(err) => match self.basic_use_gas(8) {
-                    Err(err) => Some(err),
-                    Ok(_) => Some(err),
-                },
+                Err(err) => {
+                    self.step += 1;
+                    match self.basic_use_gas(8) {
+                        Err(err) => Some(err),
+                        Ok(_) => Some(err),
+                    }
+                }
                 Ok(Some(handler)) => {
                     match handler(self) {
                         Err(e) => {
@@ -825,7 +845,7 @@ impl Engine {
         loop {
             if !library_loaded {
                 let hash = cell.repr_hash();
-                let first = self.visited_cells.insert(hash);
+                let first = self.visited_cells.insert(hash.clone());
                 self.try_use_gas(Gas::load_cell_price(first))?;
             }
             let mut slice = SliceData::load_cell(cell)?;
@@ -1028,14 +1048,13 @@ impl Engine {
     }
 
     pub(crate) fn run_child_vm(&mut self, params: RunChildVm) -> Status {
-        let (visited_cells, checked_signatures_count, free_gas_consumed) = if params.isolate_gas {
-            (HashSet::new(), 0, 0)
+        let visited_cells = if !params.isolate_gas {
+            std::mem::take(&mut self.visited_cells)
         } else {
-            (
-                std::mem::take(&mut self.visited_cells),
-                self.checked_signatures_count,
-                self.free_gas_consumed,
-            )
+            self.try_use_gas(self.free_gas_consumed)?;
+            self.checked_signatures_count = 0;
+            self.free_gas_consumed = 0;
+            HashSet::new()
         };
         let mut ctrls = SaveList::new();
         let cont = ContinuationType::Quit(ExceptionCode::NormalTermination as i32);
@@ -1065,12 +1084,12 @@ impl Engine {
             ctrls,
             libraries: self.libraries.clone(),
             modifiers: self.modifiers.clone(),
-            checked_signatures_count,
+            checked_signatures_count: self.checked_signatures_count,
             visited_cells,
             cstate: None,
             time: self.time,
             gas,
-            free_gas_consumed,
+            free_gas_consumed: self.free_gas_consumed,
             code_page: 0,
             debug_on: self.debug_on,
             step: 0,
@@ -1084,6 +1103,9 @@ impl Engine {
             capabilities: self.capabilities,
             block_version: self.block_version,
         };
+        if params.push_0 {
+            child.cc.stack.push_int(0);
+        }
         let mut result = match child.execute() {
             Ok(result) => result,
             Err(err) => {
@@ -1102,7 +1124,8 @@ impl Engine {
                 tvm_exception_or_custom_code(&err)
             }
         };
-        // let mut result = child.execute().unwrap_or_else(|err| tvm_exception_or_custom_code(&err));
+        self.free_gas_consumed = child.free_gas_consumed;
+        self.checked_signatures_count = child.checked_signatures_count;
         log::debug!(
             target: "tvm",
             "Child VM finished. res: {result}, steps: {}, gas: {}, stack depth: {}\n",
@@ -1246,11 +1269,11 @@ impl Engine {
             fail!(ExceptionCode::InvalidOpcode)
         }
         code.shrink_data(shift - offset..);
-        code.shrink_references(refs..);
+        code.shrink_references(refs..)?;
         *self.cc.code_mut() = code;
 
         slice.shrink_data(..bits);
-        slice.shrink_references(..refs);
+        slice.shrink_references(..refs)?;
 
         Ok(slice)
     }

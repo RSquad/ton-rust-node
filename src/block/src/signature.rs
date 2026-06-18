@@ -15,7 +15,7 @@ use crate::{
     fail,
     validators::{ValidatorBaseInfo, ValidatorDescr},
     BuilderData, Cell, Deserializable, Ed25519KeyOption, HashmapE, HashmapType, IBitstring,
-    KeyOption, Result, Serializable, SliceData, UInt256, ED25519_PUBLIC_KEY_LENGTH,
+    KeyOption, Result, Serializable, SliceData, UInt256, ZeroizingBytes, ED25519_PUBLIC_KEY_LENGTH,
     ED25519_SIGNATURE_LENGTH,
 };
 use std::{
@@ -175,7 +175,7 @@ impl SigPubKey {
     }
 
     pub fn pub_key(&self) -> Arc<dyn KeyOption> {
-        Ed25519KeyOption::from_public_key(&self.0)
+        Ed25519KeyOption::<ZeroizingBytes>::from_public_key(&self.0)
     }
 
     pub fn key_id(&self) -> [u8; 32] {

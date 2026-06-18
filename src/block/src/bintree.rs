@@ -336,7 +336,7 @@ impl<X: Default + Serializable + Deserializable> Deserializable for BinTree<X> {
     fn read_from(&mut self, slice: &mut SliceData) -> Result<()> {
         self.data = slice.clone();
         if slice.get_next_bit()? {
-            slice.shrink_references(2..);
+            slice.shrink_references(2..)?;
         } else {
             X::skip(slice)?;
         }
@@ -489,7 +489,7 @@ impl<X: Default + Serializable + Deserializable, Y: Augmentable> Deserializable
     fn read_from(&mut self, slice: &mut SliceData) -> Result<()> {
         self.data = slice.clone();
         if slice.get_next_bit()? {
-            slice.shrink_references(2..);
+            slice.shrink_references(2..)?;
         } else {
             X::skip(slice)?;
         }

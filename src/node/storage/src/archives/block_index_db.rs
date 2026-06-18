@@ -123,7 +123,9 @@ impl BlockIndexDb {
     pub fn with_db(db: Arc<RocksDb>, cf_name: String, create_if_not_exist: bool) -> Result<Self> {
         if db.cf_handle(&cf_name).is_none() {
             if create_if_not_exist {
-                db.create_cf(&cf_name, &Self::build_cf_options())?;
+                let (options, cache) = Self::build_cf_options();
+                db.create_cf(&cf_name, &options)?;
+                db.register_cache(cache);
             } else {
                 fail!("Column family `{}` does not exist", cf_name);
             }
@@ -131,7 +133,7 @@ impl BlockIndexDb {
         Ok(Self { db, cf_name })
     }
 
-    fn build_cf_options() -> rocksdb::Options {
+    fn build_cf_options() -> (rocksdb::Options, rocksdb::Cache) {
         let mut options = rocksdb::Options::default();
         let mut block_opts = rocksdb::BlockBasedOptions::default();
 
@@ -154,7 +156,7 @@ impl BlockIndexDb {
         // Enable whole key bloom filter in memtable.
         options.set_memtable_whole_key_filtering(true);
 
-        options
+        (options, cache)
     }
 
     pub fn put(&self, block: &BlockHandle, offset: u32) -> Result<()> {

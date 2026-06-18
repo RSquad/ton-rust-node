@@ -56,10 +56,9 @@
 
 use crate::{
     block::{SlotIndex, ValidatorIndex},
-    simplex_state::MAX_FUTURE_SLOTS,
     ActivityNodePtr, BlockPayloadPtr, ConsensusOverlayListener, ConsensusOverlayLogReplayListener,
     ConsensusOverlayManagerPtr, MetricsHandle, PrivateKey, PublicKey, PublicKeyHash, RawVoteData,
-    SessionId, SessionNode, ValidatorWeight,
+    SessionId, SessionNode, SessionOptions, ValidatorWeight,
 };
 use consensus_common::{
     check_execution_time, instrument,
@@ -69,7 +68,7 @@ use consensus_common::{
 use crossbeam::channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
 use rand::{seq::SliceRandom, Rng};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     mem::discriminant,
     panic::{catch_unwind, AssertUnwindSafe},
     sync::{
@@ -91,12 +90,12 @@ use ton_api::{
                 CandidateAndCert as CandidateAndCertBoxed, Certificate, UnsignedVote,
                 Vote as TlVoteBoxed,
             },
-            CandidateData, CandidateParent,
+            CandidateData, CandidateParent, RequestError as ConsensusRequestError,
         },
         pub_::publickey::Overlay,
         rpc::consensus::simplex::RequestCandidate,
     },
-    IntoBoxed,
+    Constructor, IntoBoxed,
 };
 use ton_block::{base64_encode, error, fail, KeyId, Result, ShardIdent, UInt256};
 
@@ -122,14 +121,9 @@ const SHUFFLE_SEND_ORDER_PERIOD: Duration = Duration::from_secs(10); // Period t
 const ACTIVE_WEIGHT_RECOMPUTE_PERIOD: Duration = Duration::from_secs(1); // Period to recompute active weight
 
 // Candidate request constants (block repair / candidate resolver)
-// Per-request network query timeout (overlay send_query deadline)
-const CANDIDATE_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
-// C++ parity: candidate-resolver.cpp uses indefinite retry with exponential backoff.
-// bus.h defaults: initial=0.5s, multiplier=1.5, max=30.0s
-const CANDIDATE_REQUEST_INITIAL_TIMEOUT: Duration = Duration::from_millis(500);
-const CANDIDATE_REQUEST_TIMEOUT_MULTIPLIER: f64 = 1.5;
-const CANDIDATE_REQUEST_MAX_TIMEOUT: Duration = Duration::from_secs(30);
-const CANDIDATE_REQUEST_MAX_RETRIES: u32 = 50;
+const CANDIDATE_QUERY_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(1);
+const CANDIDATE_RETRY_WARN_INTERVAL: u32 = 50;
+const CANDIDATE_SOFT_GIVEUP_REPORT_INTERVAL: Duration = Duration::from_secs(30);
 
 // Standstill initial range - used before first finalization calls set_standstill_slots()
 // After first finalization, SessionProcessor sets the actual range via set_standstill_slots()
@@ -138,6 +132,187 @@ const STANDSTILL_INITIAL_SLOT_END: u32 = 1_000_000;
 
 // Import ACTIVITY_THRESHOLD from utils.rs for consistency with SimplexState
 use crate::utils::ACTIVITY_THRESHOLD;
+
+/// Runtime candidate resolver knobs sourced from SessionOptions noncritical params.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CandidateResolveConfig {
+    pub timeout: Duration,
+    pub timeout_multiplier: f64,
+    pub timeout_cap: Duration,
+    pub cooldown: Duration,
+    pub rate_limit: u32,
+}
+
+impl CandidateResolveConfig {
+    pub(crate) fn from_session_options(options: &SessionOptions) -> Self {
+        Self {
+            timeout: options.candidate_resolve_timeout,
+            timeout_multiplier: options.candidate_resolve_timeout_multiplier,
+            timeout_cap: options.candidate_resolve_timeout_cap,
+            cooldown: options.candidate_resolve_cooldown,
+            rate_limit: options.candidate_resolve_rate_limit,
+        }
+    }
+}
+
+impl Default for CandidateResolveConfig {
+    fn default() -> Self {
+        Self::from_session_options(&SessionOptions::default())
+    }
+}
+
+/// Bundle of runtime knobs handed to [`ReceiverWrapper::create`].
+///
+/// All fields are derived from [`SessionOptions`] and a few caller-provided
+/// limits; grouping them into a single struct keeps the constructor signature
+/// tractable and makes it easy for tests to start from
+/// `ReceiverSettings::default()` and override the few fields they care about.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReceiverSettings {
+    /// Maximum candidate body size accepted from peers (bytes).
+    pub max_candidate_size: usize,
+    /// Maximum response size advertised to peers for `requestCandidate` queries (bytes).
+    pub max_candidate_query_answer_size: u64,
+    /// On-the-wire protocol version advertised in vote/candidate envelopes.
+    pub proto_version: u32,
+    /// Standstill alarm period - re-broadcasts cached votes/certs after this long
+    /// without finalization progress.
+    pub standstill_timeout: Duration,
+    /// Token-bucket cap on standstill replay egress, in bytes per second.
+    /// Set to 0 to disable shaping.
+    pub standstill_max_egress_bytes_per_s: u32,
+    /// Temporary peer ban after a bad vote/cert signature; mirrors C++
+    /// `pool.cpp` `bad_signature_bans_`.
+    pub bad_signature_ban_duration: Duration,
+    /// Number of consecutive slots assigned to one leader before rotation.
+    pub slots_per_leader_window: u32,
+    /// Maximum number of leader windows ahead of `first_non_progressed_slot`
+    /// that ingress checks accept.
+    pub max_leader_window_desync: u32,
+    /// Use QUIC overlay transport for this session (else ADNL UDP).
+    pub use_quic: bool,
+    /// enable the dedicated block-sync overlay for candidate broadcasts.
+    pub enable_observers: bool,
+    /// `requestCandidate` retry pacing and rate-limit configuration.
+    pub candidate_resolve_config: CandidateResolveConfig,
+    /// Label set attached to per-session metrics republished to the global
+    /// Prometheus recorder.
+    pub prometheus_labels: crate::PrometheusLabels,
+}
+
+impl ReceiverSettings {
+    /// Build settings from [`SessionOptions`] plus the externally-derived
+    /// candidate-size limits (which depend on caller config and aren't
+    /// stored on `SessionOptions` directly).
+    pub(crate) fn from_session_options(
+        options: &SessionOptions,
+        max_candidate_size: usize,
+        max_candidate_query_answer_size: u64,
+    ) -> Self {
+        Self {
+            max_candidate_size,
+            max_candidate_query_answer_size,
+            proto_version: options.proto_version,
+            standstill_timeout: options.standstill_timeout,
+            standstill_max_egress_bytes_per_s: options.standstill_max_egress_bytes_per_s,
+            bad_signature_ban_duration: options.bad_signature_ban_duration,
+            slots_per_leader_window: options.slots_per_leader_window,
+            max_leader_window_desync: options.max_leader_window_desync,
+            use_quic: options.use_quic,
+            enable_observers: options.enable_observers,
+            candidate_resolve_config: CandidateResolveConfig::from_session_options(options),
+            prometheus_labels: options.prometheus_labels,
+        }
+    }
+}
+
+impl Default for ReceiverSettings {
+    fn default() -> Self {
+        let options = SessionOptions::default();
+        let max_candidate_size = options.max_block_size + options.max_collated_data_size + 1024;
+        let max_candidate_query_answer_size: u64 =
+            (options.max_block_size + options.max_collated_data_size) as u64 + (1 << 20);
+        Self::from_session_options(&options, max_candidate_size, max_candidate_query_answer_size)
+    }
+}
+
+#[derive(Default)]
+struct SlidingWindowRateLimiter {
+    timestamps: VecDeque<SystemTime>,
+}
+
+/// Tracks temporary peer bans for sources that send bad vote/certificate
+/// signatures.
+///
+/// Mirrors C++ `PoolImpl::bad_signature_bans_` (`pool.cpp`):
+/// - `record()` arms a ban with absolute expiry `now + duration`.
+/// - `is_banned()` returns whether a source is currently banned and lazily
+///   evicts expired entries so the map cannot grow unbounded.
+///
+/// The ban map is source-keyed (validator index) instead of ADNL-keyed because
+/// Simplex source identities are fixed for the session lifetime, and
+/// SessionProcessor reports certificate verification failures by `source_idx`.
+#[derive(Debug, Default)]
+struct BadSignatureBanState {
+    duration: Duration,
+    bans: HashMap<u32, SystemTime>,
+}
+
+impl BadSignatureBanState {
+    fn new(duration: Duration) -> Self {
+        Self { duration, bans: HashMap::new() }
+    }
+
+    fn ban_duration(&self) -> Duration {
+        self.duration
+    }
+
+    /// Arm a ban for `source_idx`. `now` is parameterized for deterministic
+    /// unit tests; production callers pass `SystemTime::now()`.
+    fn record(&mut self, source_idx: u32, now: SystemTime) {
+        let expiry = now.checked_add(self.duration).unwrap_or(now);
+        self.bans.insert(source_idx, expiry);
+    }
+
+    /// Return true if the source is currently banned, evicting expired entries.
+    fn is_banned(&mut self, source_idx: u32, now: SystemTime) -> bool {
+        let Some(expiry) = self.bans.get(&source_idx).copied() else {
+            return false;
+        };
+        if now < expiry {
+            return true;
+        }
+        self.bans.remove(&source_idx);
+        false
+    }
+
+    #[cfg(test)]
+    fn active_bans(&self) -> usize {
+        self.bans.len()
+    }
+}
+
+impl SlidingWindowRateLimiter {
+    fn allow(&mut self, now: SystemTime, window: Duration, limit: u32) -> bool {
+        if limit == 0 {
+            return false;
+        }
+
+        while let Some(front) = self.timestamps.front() {
+            let expired = now.duration_since(*front).map_or(false, |elapsed| elapsed >= window);
+            if !expired {
+                break;
+            }
+            self.timestamps.pop_front();
+        }
+
+        if self.timestamps.len() as u32 >= limit {
+            return false;
+        }
+        self.timestamps.push_back(now);
+        true
+    }
+}
 
 /*
     Standstill Certificate Types
@@ -157,11 +332,24 @@ pub(crate) enum StandstillCertificateType {
     Final,
 }
 
+/// Standstill trigger notification sent to the session layer.
+///
+/// The receiver owns replay queue construction and pacing, while the
+/// `SessionProcessor` owns the C++-style pool-state diagnostic dump sourced
+/// from `SimplexState`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StandstillTriggerNotification {
+    pub begin: u32,
+    pub end: u32,
+    pub cert_count: u32,
+    pub vote_count: u32,
+}
+
 /*
     Receiver trait and type aliases
 
     These are crate-internal - not exposed in public API.
-    Moved here from lib.rs for encapsulation (CODE-2).
+    Moved here from lib.rs for encapsulation.
 */
 
 /// Shared health counters between receiver and session processor.
@@ -252,6 +440,30 @@ pub(crate) trait Receiver: Send + Sync {
     /// * `up_to_slot` - Clean up all data for slots < up_to_slot
     fn cleanup(&self, up_to_slot: u32);
 
+    /// Update ingress slot lower bound for vote/certificate filtering.
+    ///
+    /// This tracks the consensus `first_non_finalized_slot` frontier and is
+    /// intentionally independent from history retention cleanup.
+    ///
+    /// # Arguments
+    /// * `slot` - First acceptable slot (inclusive) for ingress filtering
+    fn set_ingress_slot_begin(&self, slot: u32);
+
+    /// Update ingress progress cursor used for the future-slot horizon.
+    ///
+    /// This tracks the consensus `first_non_progressed_slot` / C++ `now_`
+    /// cursor and controls how far ahead votes/certificates may be accepted.
+    ///
+    /// # Arguments
+    /// * `slot` - First non-progressed slot for ingress horizon calculations
+    fn set_ingress_progress_slot(&self, slot: u32);
+
+    /// Cancel pending candidate-repair requests for a conclusively skipped slot.
+    ///
+    /// This mirrors the C++ model where skip/final/notar state advancement
+    /// resolves obsolete pending work instead of continuing to retry it.
+    fn cancel_candidate_requests_for_slot(&self, slot: u32);
+
     /// Request a missing candidate from peers (block repair)
     ///
     /// Called by SessionProcessor when a finalization event requires a candidate
@@ -264,6 +476,15 @@ pub(crate) trait Receiver: Send + Sync {
     /// * `slot` - Slot number of the missing candidate
     /// * `block_hash` - Block hash of the missing candidate
     fn request_candidate(&self, slot: u32, block_hash: UInt256);
+
+    /// Arm standstill detection.
+    ///
+    /// Called when the session is promoted to current and `Session::start(seqno)`
+    /// has been invoked.  Before this call the standstill alarm is disarmed
+    /// (overlay warms up silently).  Matches C++ behavior where the bridge
+    /// publishes the Start event only after both `create_session` and `start`
+    /// have completed.
+    fn start(&self);
 
     /// Reschedule standstill alarm
     ///
@@ -330,6 +551,28 @@ pub(crate) trait Receiver: Send + Sync {
     /// Reference: C++ pool.cpp alarm() always includes last_final_cert_ first
     fn cache_last_final_certificate(&self, slot: u32, cert_bytes: Vec<u8>);
 
+    /// Notify receiver that a certificate kind has been accepted by the FSM.
+    ///
+    /// This enables C++-equivalent `certs.needs()` pre-filtering on the receiver
+    /// thread: once a (slot, kind) is accepted, duplicate certificates of the same
+    /// kind for the same slot are dropped before they reach the Session main queue.
+    ///
+    /// Must be called only after `SimplexState` has successfully stored the cert
+    /// (i.e. `set_notarize_certificate` / `set_skip_certificate` /
+    /// `set_finalize_certificate` returned `Ok(true)`).
+    ///
+    /// Reference: C++ pool.cpp `CertificateBundle::needs()` checks whether a cert
+    /// kind is already present or being_saved before processing.
+    fn notify_certificate_accepted(&self, slot: u32, kind: StandstillCertificateType);
+
+    /// Temporarily ban a validator source for sending bad vote/certificate signatures.
+    ///
+    /// Subsequent ingress messages from this source are dropped at the receiver
+    /// thread until `bad_signature_ban_duration` (from `SessionOptions`) elapses.
+    ///
+    /// Reference: C++ `PoolImpl::ban(peer)` (`pool.cpp`).
+    fn ban_source_for_bad_signature(&self, source_idx: u32);
+
     /// Stop the receiver
     fn stop(&self);
 }
@@ -376,25 +619,50 @@ pub(crate) trait ReceiverListener: Send + Sync {
         notar_cert: Option<Vec<u8>>,
     );
 
+    /// Incoming notarization signature-set bytes from requestCandidate repair path.
+    ///
+    /// Used when a query response carries notar bytes but the candidate body is still
+    /// unavailable (or unchanged). This allows SessionProcessor to ingest notarization
+    /// progress without waiting for a full candidate+notar pair callback.
+    fn on_candidate_notar_received(
+        &self,
+        source_idx: u32,
+        slot: SlotIndex,
+        block_hash: UInt256,
+        notar_cert: Vec<u8>,
+    );
+
     /// Periodic activity update from receiver
     /// - active_weight: sum of weights for validators with recent activity
     /// - last_activity: last receive time per validator (None if never received)
-    fn on_activity(&self, active_weight: ValidatorWeight, last_activity: Vec<Option<SystemTime>>);
+    /// - snapshot: full per-source activity snapshot for dump diagnostics
+    fn on_activity(
+        &self,
+        active_weight: ValidatorWeight,
+        last_activity: Vec<Option<SystemTime>>,
+        snapshot: ReceiverActivitySnapshot,
+    );
 
-    /// Fallback for RequestCandidate queries when resolver_cache misses.
+    /// Standstill alarm fired and a fresh replay snapshot was built.
     ///
-    /// Called by `handle_query()` when `want_candidate=true` but the resolver_cache
-    /// does not have the candidate data. Delegates to SessionProcessor which can
-    /// reconstruct the response from its in-memory `candidate_data_cache`, rebuild
-    /// an empty candidate from `CandidateInfo`, or load persisted payloads from SimplexDB.
+    /// The session layer uses this to emit the C++-style standstill diagnostic
+    /// dump from `SimplexState` at the same logical trigger point as the
+    /// receiver's standstill replay handling.
+    fn on_standstill_trigger(&self, notification: StandstillTriggerNotification);
+
+    /// Fallback for RequestCandidate queries when resolver_cache misses requested parts.
+    ///
+    /// Delegates to SessionProcessor which can reconstruct candidate body and/or notar
+    /// from in-memory cache, metadata, and SimplexDB payload/certificate storage.
     ///
     /// This achieves parity with C++ `CandidateResolver::try_load_candidate_data_from_db()`.
     ///
-    /// Reference: Alpenglow-Implementation-Plan.md Section 7.14a
+    /// Reference: Simplex implementation plan Section 7.14a
     fn on_candidate_query_fallback(
         &self,
         slot: SlotIndex,
         block_hash: UInt256,
+        want_candidate: bool,
         want_notar: bool,
         response_callback: QueryResponseCallback,
     );
@@ -439,6 +707,14 @@ struct CandidateRequestState {
     retry_count: u32,
     /// Current timeout for this request (grows with exponential backoff)
     current_timeout: Duration,
+    /// Monotonic attempt id for stale timeout/response filtering.
+    attempt_id: u64,
+    /// True while exactly one outbound query is in-flight for this request.
+    in_flight: bool,
+    /// Requested candidate body flag for the current in-flight attempt.
+    in_flight_want_candidate: bool,
+    /// Requested notar cert flag for the current in-flight attempt.
+    in_flight_want_notar: bool,
     /// Validator index of the peer being queried
     source_idx: ValidatorIndex,
     /// Accumulated notar bytes from partial responses (C++ CandidateAndCert::merge parity).
@@ -449,6 +725,12 @@ struct CandidateRequestState {
     /// Peers may return candidate-only while notar is still missing; cache the body so
     /// a later notar-only response can complete the merged result.
     cached_candidate: Option<Vec<u8>>,
+    /// Number of soft-giveup reports emitted for this request.
+    giveup_reports: u32,
+    /// Per-peer dedup window for identical partial repairs.
+    /// Keyed by validator index; the peer should not be re-queried for this
+    /// `(slot, hash)` before the stored timestamp.
+    peer_retry_not_before: HashMap<u32, SystemTime>,
 }
 
 /*
@@ -616,7 +898,7 @@ impl ReceiverThreads {
 
                 if let Err(panic_payload) = result {
                     log::error!(
-                        "FATAL PANIC (PANIC-1): caught panic in {}: payload=\"{}\"; forcing receiver stop",
+                        "FATAL PANIC: caught panic in {}: payload=\"{}\"; forcing receiver stop",
                         thread::current().name().unwrap_or("<unnamed>"),
                         crate::utils::panic_payload_to_string(panic_payload.as_ref())
                     );
@@ -732,6 +1014,26 @@ struct SourceStats {
     last_recv_time: Option<SystemTime>,
     /// Last send time
     last_send_time: Option<SystemTime>,
+    // Typed vote counters
+    votes_in_notarize: u64,
+    votes_in_finalize: u64,
+    votes_in_skip: u64,
+    // Typed cert counters
+    certs_in_notar: u64,
+    certs_in_final: u64,
+    certs_in_skip: u64,
+    // Candidate counters
+    candidates_received: u64,
+    candidate_requests_sent: u64,
+    candidate_requests_received: u64,
+    // Typed last-receive timestamps
+    last_vote_recv_time: Option<SystemTime>,
+    last_notar_cert_recv_time: Option<SystemTime>,
+    last_final_cert_recv_time: Option<SystemTime>,
+    last_candidate_recv_time: Option<SystemTime>,
+    // Duplicate counters
+    duplicate_votes: u64,
+    duplicate_broadcasts: u64,
 }
 
 impl SourceStats {
@@ -752,8 +1054,62 @@ impl SourceStats {
             out_broadcasts: 0,
             last_recv_time: None,
             last_send_time: None,
+            votes_in_notarize: 0,
+            votes_in_finalize: 0,
+            votes_in_skip: 0,
+            certs_in_notar: 0,
+            certs_in_final: 0,
+            certs_in_skip: 0,
+            candidates_received: 0,
+            candidate_requests_sent: 0,
+            candidate_requests_received: 0,
+            last_vote_recv_time: None,
+            last_notar_cert_recv_time: None,
+            last_final_cert_recv_time: None,
+            last_candidate_recv_time: None,
+            duplicate_votes: 0,
+            duplicate_broadcasts: 0,
         }
     }
+}
+
+/// Snapshot of per-source activity for the session dump.
+///
+/// Passed from receiver thread to session processor via `on_activity()`.
+#[derive(Clone, Debug)]
+pub(crate) struct SourceActivitySnapshot {
+    pub source_idx: u32,
+    pub weight: ValidatorWeight,
+    pub adnl_id_base64: String,
+    pub in_messages: u64,
+    pub out_messages: u64,
+    pub in_broadcasts: u64,
+    pub out_broadcasts: u64,
+    pub last_recv_time: Option<SystemTime>,
+    pub last_send_time: Option<SystemTime>,
+    pub votes_in_notarize: u64,
+    pub votes_in_finalize: u64,
+    pub votes_in_skip: u64,
+    pub certs_in_notar: u64,
+    pub certs_in_final: u64,
+    pub certs_in_skip: u64,
+    pub candidates_received: u64,
+    pub candidate_requests_sent: u64,
+    pub candidate_requests_received: u64,
+    pub last_vote_recv_time: Option<SystemTime>,
+    pub last_notar_cert_recv_time: Option<SystemTime>,
+    pub last_final_cert_recv_time: Option<SystemTime>,
+    pub last_candidate_recv_time: Option<SystemTime>,
+    pub duplicate_votes: u64,
+    pub duplicate_broadcasts: u64,
+}
+
+/// Aggregate snapshot of receiver activity for session dump.
+#[derive(Clone, Debug)]
+pub(crate) struct ReceiverActivitySnapshot {
+    pub active_weight: ValidatorWeight,
+    pub last_activity: Vec<Option<SystemTime>>,
+    pub sources: Vec<SourceActivitySnapshot>,
 }
 
 /*
@@ -764,6 +1120,18 @@ impl SourceStats {
 struct DeduplicationKey {
     source_idx: u32,
     vote_hash: UInt256,
+}
+
+#[derive(Hash, Eq, PartialEq, Clone)]
+struct StandstillVoteKey {
+    slot: u32,
+    kind: u8,
+    candidate_hash: Option<UInt256>,
+}
+
+enum StandstillReplayItem {
+    Vote(TlVote),
+    Certificate(Vec<u8>),
 }
 
 /*
@@ -801,6 +1169,12 @@ pub(crate) struct ReceiverImpl {
     /// Note: Cleaned up via cleanup_slot() when slots are finalized
     /// Key: (source_idx, signature_hash), Value: received flag
     dedup_votes: HashMap<u32, HashMap<DeduplicationKey, bool>>,
+    /// Accepted certificate kinds per slot (feedback from SessionProcessor).
+    /// C++ parity: mirrors `CertificateBundle::needs()` — once a (slot, kind) is
+    /// accepted by the FSM, duplicate incoming certificates of the same kind are
+    /// dropped before they enter the Session main queue.
+    /// Cleaned up together with `dedup_votes` in `cleanup()`.
+    accepted_certs: HashMap<u32, u8>,
     /// Shard identifier for this consensus session (for BlockIdExt construction)
     shard: ShardIdent,
     /// Maximum block + collated data size for candidate verification
@@ -810,6 +1184,8 @@ pub(crate) struct ReceiverImpl {
     max_candidate_query_answer_size: u64,
     /// Protocol version from consensus config (determines BOC serialization flags)
     proto_version: u32,
+    /// Candidate resolver runtime config sourced from SessionOptions.
+    candidate_resolve_config: CandidateResolveConfig,
     /// Metrics
     in_messages_bytes: metrics::Counter,
     out_messages_bytes: metrics::Counter,
@@ -824,6 +1200,8 @@ pub(crate) struct ReceiverImpl {
     _activity_node: ActivityNodePtr,
     /// Standstill timeout duration
     standstill_timeout: Duration,
+    /// Standstill replay egress budget in bytes/sec.
+    standstill_max_egress_bytes_per_s: u32,
     /// Next standstill alarm timestamp (reset on finalization and after re-broadcast)
     standstill_alarm: Option<SystemTime>,
     /// Standstill slot range [begin, end) for vote re-broadcast
@@ -839,6 +1217,14 @@ pub(crate) struct ReceiverImpl {
     /// Stored when send_vote_impl() is called
     /// Format: (slot, signed_vote)
     our_votes: Vec<(u32, TlVote)>,
+    /// Dedup set for `our_votes` replay cache.
+    our_vote_keys: HashSet<StandstillVoteKey>,
+    /// Pending standstill replay items to be sent under egress shaping.
+    standstill_replay_queue: VecDeque<StandstillReplayItem>,
+    /// Current token bucket quota for standstill replay (bytes).
+    standstill_egress_quota_bytes: f64,
+    /// Last token bucket update time.
+    standstill_egress_quota_time: SystemTime,
     /// Candidate resolver cache (local to this thread)
     resolver_cache: CandidateResolverCache,
     /// Delayed actions to execute at scheduled times
@@ -847,6 +1233,11 @@ pub(crate) struct ReceiverImpl {
     /// Pending candidate requests (outbound): (slot, block_hash) → request state
     /// Used to track ongoing block repair requests to other validators
     pending_requests: HashMap<(SlotIndex, UInt256), CandidateRequestState>,
+    /// Per-peer inbound requestCandidate rate limiters.
+    candidate_query_rate_limiters: HashMap<PublicKeyHash, SlidingWindowRateLimiter>,
+    /// TN-1034 / NODE-75: temporary bad-signature peer bans (C++ parity:
+    /// `pool.cpp` `bad_signature_bans_` driven by `bad_signature_ban_duration`).
+    bad_signature_ban_state: BadSignatureBanState,
     /// Task queues for posting callbacks from overlay responses
     task_queues: Arc<ReceiverTaskQueues>,
     /// Standstill certificate cache: slot → certificate bundle bytes
@@ -858,11 +1249,19 @@ pub(crate) struct ReceiverImpl {
     /// Format: (slot, serialized_cert_bytes)
     /// Reference: C++ pool.cpp last_final_cert_
     last_final_cert: Option<(u32, Vec<u8>)>,
-    /// Finalization cursor for ingress DoS protection.
-    /// Updated by `cleanup()` when SessionProcessor advances finalization.
+    /// Ingress slot lower bound for DoS protection.
+    /// Updated from SessionProcessor's finalized frontier.
     /// Used to reject far-future votes/certificates before expensive operations
     /// (signature verification, dedup HashMap insertion).
     first_active_slot: u32,
+    /// Ingress progress cursor for far-future DoS protection.
+    /// Updated from SessionProcessor's progress frontier (`first_non_progressed_slot` / C++ `now_`).
+    /// Used as the base for the acceptable future horizon.
+    ingress_progress_slot: u32,
+    /// Session slots-per-leader-window config (for C++-parity slot bounds).
+    slots_per_leader_window: u32,
+    /// Session max-leader-window-desync config (for C++-parity slot bounds).
+    max_leader_window_desync: u32,
     candidate_requests_counter: metrics::Counter,
     candidate_request_retries_counter: metrics::Counter,
     candidate_request_timeouts_counter: metrics::Counter,
@@ -888,6 +1287,56 @@ struct StandstillCertificateBundleBuffers {
 }
 
 impl ReceiverImpl {
+    const ACCEPTED_CERT_NOTAR: u8 = 1;
+    const ACCEPTED_CERT_SKIP: u8 = 2;
+    const ACCEPTED_CERT_FINAL: u8 = 4;
+
+    fn cert_kind_bit(kind: StandstillCertificateType) -> u8 {
+        match kind {
+            StandstillCertificateType::Notar => Self::ACCEPTED_CERT_NOTAR,
+            StandstillCertificateType::Skip => Self::ACCEPTED_CERT_SKIP,
+            StandstillCertificateType::Final => Self::ACCEPTED_CERT_FINAL,
+        }
+    }
+
+    fn is_certificate_kind_accepted(&self, slot: u32, kind: StandstillCertificateType) -> bool {
+        self.accepted_certs.get(&slot).map_or(false, |bits| bits & Self::cert_kind_bit(kind) != 0)
+    }
+
+    fn mark_certificate_kind_accepted(&mut self, slot: u32, kind: StandstillCertificateType) {
+        let entry = self.accepted_certs.entry(slot).or_insert(0);
+        *entry |= Self::cert_kind_bit(kind);
+    }
+
+    /// Apply a temporary bad-signature ban to a source index.
+    ///
+    /// C++ parity: mirrors `PoolImpl::ban(peer)` recording an absolute expiry
+    /// driven by `params_.bad_signature_ban_duration`.
+    fn ban_source_for_bad_signature_impl(&mut self, source_idx: u32) {
+        if (source_idx as usize) >= self.sources.len() {
+            log::trace!(
+                "SimplexReceiver {}: ignoring ban request for unknown source {}",
+                self.session_id.to_hex_string(),
+                source_idx
+            );
+            return;
+        }
+
+        self.bad_signature_ban_state.record(source_idx, SystemTime::now());
+
+        log::warn!(
+            "SimplexReceiver {}: temporarily banning source {} for {:?} due to bad vote/cert signature",
+            self.session_id.to_hex_string(),
+            source_idx,
+            self.bad_signature_ban_state.ban_duration()
+        );
+    }
+
+    /// Check whether a source index is currently banned, expiring stale entries.
+    fn is_source_temporarily_banned(&mut self, source_idx: u32) -> bool {
+        self.bad_signature_ban_state.is_banned(source_idx, SystemTime::now())
+    }
+
     /// Process incoming vote message
     ///
     /// # Arguments
@@ -898,29 +1347,59 @@ impl ReceiverImpl {
         //check_execution_time!(20_000); //TODO: LK: restore during performance testing
         instrument!();
 
+        // C++ parity (`pool.cpp` `is_banned()` precheck): drop messages from
+        // temporarily banned peers before any per-vote bookkeeping.
+        if self.is_source_temporarily_banned(source_idx) {
+            log::trace!(
+                "SimplexReceiver {}: dropping vote from temporarily banned source {}",
+                self.session_id.to_hex_string(),
+                source_idx
+            );
+            return;
+        }
+
         // Update source stats
         if let Some(stats) = self.sources.get_mut(source_idx as usize) {
             stats.in_messages += 1;
             stats.last_recv_time = Some(SystemTime::now());
         }
 
-        // DoS protection: reject far-future/negative slots BEFORE expensive
-        // signature verification and dedup HashMap insertion.
+        // Keep the receiver prefilter cheap; SessionProcessor mirrors the C++
+        // warning behavior while the receiver only traces Rust-side drops.
         let slot = Self::get_vote_slot(&vote);
-        if self.is_slot_out_of_bounds(slot) {
-            log::warn!(
-                "SimplexReceiver {}: REJECTED vote from source {} - slot {} out of bounds [{}, {}]",
+        if self.is_vote_slot_out_of_bounds(slot) {
+            log::trace!(
+                "SimplexReceiver {}: dropped vote from source {} - slot {} outside [{}, {})",
                 self.session_id.to_hex_string(),
                 source_idx,
                 slot,
                 self.first_active_slot,
-                self.max_acceptable_slot()
+                self.first_too_new_vote_slot()
             );
             return;
         }
 
-        // Verify signature before processing
-        // C++ simplex-pool.cpp: serialize vote (was unsignedVote), check_signature against signature
+        // C++ parity: deduplicate BEFORE signature verification to avoid wasted
+        // crypto on identical replays (standstill rebroadcasts from multiple peers).
+        // Conflicting votes from the same source have different signatures, so they
+        // still pass through to SessionProcessor for misbehavior handling.
+        let signature_hash = Self::compute_signature_hash(&vote);
+        let dedup_key = DeduplicationKey { source_idx, vote_hash: signature_hash };
+
+        if self.dedup_votes.get(&slot).map_or(false, |m| m.contains_key(&dedup_key)) {
+            log::trace!(
+                "SimplexReceiver {}: duplicate vote from source {} slot {}, skipping",
+                self.session_id.to_hex_string(),
+                source_idx,
+                slot
+            );
+            if let Some(stats) = self.sources.get_mut(source_idx as usize) {
+                stats.duplicate_votes += 1;
+            }
+            return;
+        }
+
+        // Verify signature after dedup check (expensive operation)
         if let Err(err) = self.verify_vote_signature(source_idx, &vote) {
             log::warn!(
                 "SimplexReceiver {}: MISBEHAVIOR: Dropping invalid vote from validator {}: {}",
@@ -928,24 +1407,23 @@ impl ReceiverImpl {
                 source_idx,
                 err
             );
+            // C++ parity: `pool.cpp` calls `ban(message->source)` on bad vote sig.
+            self.ban_source_for_bad_signature_impl(source_idx);
             return;
         }
 
-        // Deduplicate based on signature (unique per vote, no serialization needed)
-        let signature_hash = Self::compute_signature_hash(&vote);
-        let dedup_key = DeduplicationKey { source_idx, vote_hash: signature_hash };
+        // Insert into dedup table only after signature verification succeeds
+        self.dedup_votes.entry(slot).or_default().insert(dedup_key, true);
 
-        let slot_dedup = self.dedup_votes.entry(slot).or_default();
-        if slot_dedup.contains_key(&dedup_key) {
-            log::trace!(
-                "SimplexReceiver {}: duplicate vote from source {} slot {}, skipping",
-                self.session_id.to_hex_string(),
-                source_idx,
-                slot
-            );
-            return;
+        if let Some(stats) = self.sources.get_mut(source_idx as usize) {
+            let now = SystemTime::now();
+            stats.last_vote_recv_time = Some(now);
+            match vote.vote() {
+                UnsignedVote::Consensus_Simplex_NotarizeVote(_) => stats.votes_in_notarize += 1,
+                UnsignedVote::Consensus_Simplex_FinalizeVote(_) => stats.votes_in_finalize += 1,
+                UnsignedVote::Consensus_Simplex_SkipVote(_) => stats.votes_in_skip += 1,
+            }
         }
-        slot_dedup.insert(dedup_key, true);
 
         // Forward to listener with raw bytes for misbehavior proof storage
         if let Some(listener) = self.listener.upgrade() {
@@ -966,6 +1444,17 @@ impl ReceiverImpl {
     /// * `certificate` - Deserialized TL certificate object
     fn process_incoming_certificate(&mut self, source_idx: u32, certificate: Certificate) {
         instrument!();
+
+        // C++ parity (`pool.cpp` `is_banned()` precheck): skip processing of
+        // certificate messages from temporarily banned peers entirely.
+        if self.is_source_temporarily_banned(source_idx) {
+            log::trace!(
+                "SimplexReceiver {}: dropping certificate from temporarily banned source {}",
+                self.session_id.to_hex_string(),
+                source_idx
+            );
+            return;
+        }
 
         // Update source stats
         if let Some(stats) = self.sources.get_mut(source_idx as usize) {
@@ -1006,18 +1495,57 @@ impl ReceiverImpl {
             sigs
         );
 
-        // DoS protection: reject far-future/negative slots before forwarding.
-        if self.is_slot_out_of_bounds(slot) {
-            log::warn!(
-                "SimplexReceiver {}: REJECTED certificate from source {} - slot {} out of bounds [{}, {}] kind={}",
+        // Mirror C++: drop finalized/old certificates cheaply, but do not reject
+        // a certificate only because its slot is ahead of the current vote horizon.
+        if self.is_certificate_slot_too_old(slot) {
+            log::trace!(
+                "SimplexReceiver {}: dropped old certificate from source {} - slot {} < {} kind={}",
                 self.session_id.to_hex_string(),
                 source_idx,
                 slot,
                 self.first_active_slot,
-                self.max_acceptable_slot(),
                 kind
             );
             return;
+        }
+
+        // C++ parity: `certs.needs()` — drop certificates whose kind is already
+        // accepted by the FSM for this slot. This prevents duplicate certificate
+        // replays (especially during standstill) from flooding the Session main queue.
+        let cert_kind = match kind {
+            "notarize" => StandstillCertificateType::Notar,
+            "finalize" => StandstillCertificateType::Final,
+            "skip" => StandstillCertificateType::Skip,
+            _ => StandstillCertificateType::Notar,
+        };
+        if self.is_certificate_kind_accepted(slot, cert_kind) {
+            log::trace!(
+                "SimplexReceiver {}: dropped duplicate certificate from source {} - \
+                slot {} kind={} already accepted by FSM",
+                self.session_id.to_hex_string(),
+                source_idx,
+                slot,
+                kind
+            );
+            return;
+        }
+
+        if let Some(stats) = self.sources.get_mut(source_idx as usize) {
+            let now = SystemTime::now();
+            match kind {
+                "notarize" => {
+                    stats.certs_in_notar += 1;
+                    stats.last_notar_cert_recv_time = Some(now);
+                }
+                "finalize" => {
+                    stats.certs_in_final += 1;
+                    stats.last_final_cert_recv_time = Some(now);
+                }
+                "skip" => {
+                    stats.certs_in_skip += 1;
+                }
+                _ => {}
+            }
         }
 
         // Forward to listener for verification and application
@@ -1055,6 +1583,18 @@ impl ReceiverImpl {
     fn process_block_broadcast(&mut self, source_idx: u32, candidate_bytes: Vec<u8>) {
         check_execution_time!(50_000);
         instrument!();
+
+        // C++ parity (`pool.cpp` `is_banned()` precheck): broadcasts from
+        // temporarily banned peers are dropped before deserialization to avoid
+        // amplification of repeated bad-actor traffic.
+        if self.is_source_temporarily_banned(source_idx) {
+            log::trace!(
+                "SimplexReceiver {}: dropping block broadcast from temporarily banned source {}",
+                self.session_id.to_hex_string(),
+                source_idx
+            );
+            return;
+        }
 
         // Deserialize TL message
         let candidate = match deserialize_boxed(&candidate_bytes) {
@@ -1190,6 +1730,9 @@ impl ReceiverImpl {
                 source_idx,
                 slot
             );
+            // C++ parity: bad-signature traffic results in a temporary ban so
+            // repeated forged broadcasts cannot starve the receiver thread.
+            self.ban_source_for_bad_signature_impl(source_idx);
             return;
         }
 
@@ -1209,6 +1752,11 @@ impl ReceiverImpl {
         // Cache candidate for query responses (candidate resolver)
         // Reference: C++ CandidateResolver caches candidates on CandidateReceived event
         self.resolver_cache.cache_candidate(slot_idx, candidate_hash.clone(), candidate_bytes);
+
+        if let Some(stats) = self.sources.get_mut(source_idx as usize) {
+            stats.candidates_received += 1;
+            stats.last_candidate_recv_time = Some(SystemTime::now());
+        }
 
         // Forward to listener (no deduplication for blocks - SessionProcessor handles it)
         // None notar_cert for broadcasts - certificate comes separately or via query
@@ -1357,7 +1905,7 @@ impl ReceiverImpl {
     /// which can reconstruct the response from in-memory or DB-backed storage.
     fn handle_query(
         &mut self,
-        _adnl_id: PublicKeyHash,
+        adnl_id: PublicKeyHash,
         data: BlockPayloadPtr,
         response_callback: QueryResponseCallback,
     ) {
@@ -1384,6 +1932,19 @@ impl ReceiverImpl {
                 let want_candidate: bool = req.want_candidate.into();
                 let want_notar: bool = req.want_notar.into();
 
+                if !self.check_candidate_query_rate_limit(&adnl_id) {
+                    log::warn!(
+                        "SimplexReceiver {}: requestCandidate rate-limited \
+                        slot={} hash={} from {}",
+                        self.session_id.to_hex_string(),
+                        slot,
+                        &block_hash.to_hex_string()[..8],
+                        key_to_base64(&adnl_id),
+                    );
+                    response_callback(Err(error!("too many requests")));
+                    return;
+                }
+
                 log::trace!(
                     "SimplexReceiver {}: requestCandidate slot={} hash={} want_candidate={} want_notar={}",
                     self.session_id.to_hex_string(),
@@ -1396,22 +1957,31 @@ impl ReceiverImpl {
                 let candidate_bytes = if want_candidate {
                     self.resolver_cache.get_candidate(slot, &block_hash).cloned()
                 } else {
-                    None
+                    Some(Vec::new())
                 };
+                let notar_bytes = if want_notar {
+                    self.resolver_cache.get_notar_cert(slot, &block_hash).cloned()
+                } else {
+                    Some(Vec::new())
+                };
+                let candidate_miss = want_candidate && candidate_bytes.is_none();
+                let notar_miss = want_notar && notar_bytes.is_none();
 
-                let cache_miss = want_candidate && candidate_bytes.is_none();
-
-                if cache_miss {
+                if candidate_miss || notar_miss {
                     if let Some(listener) = self.listener.upgrade() {
                         log::debug!(
                             "SimplexReceiver {}: requestCandidate cache MISS \
-                            for slot={slot} hash={}, delegating to SessionProcessor",
+                            for slot={slot} hash={} (candidate_miss={}, notar_miss={}), \
+                            delegating to SessionProcessor",
                             self.session_id.to_hex_string(),
                             &block_hash.to_hex_string()[..8],
+                            candidate_miss,
+                            notar_miss,
                         );
                         listener.on_candidate_query_fallback(
                             slot,
                             block_hash,
+                            want_candidate,
                             want_notar,
                             response_callback,
                         );
@@ -1426,14 +1996,7 @@ impl ReceiverImpl {
                 }
 
                 let candidate_bytes = candidate_bytes.unwrap_or_default();
-                let notar_bytes = if want_notar {
-                    self.resolver_cache
-                        .get_notar_cert(slot, &block_hash)
-                        .cloned()
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
+                let notar_bytes = notar_bytes.unwrap_or_default();
 
                 let response = CandidateAndCert {
                     candidate: candidate_bytes.into(),
@@ -1471,6 +2034,15 @@ impl ReceiverImpl {
             tag_from_data(request_data),
         );
         response_callback(Err(error!("Unknown query type")));
+    }
+
+    fn check_candidate_query_rate_limit(&mut self, adnl_id: &PublicKeyHash) -> bool {
+        let limiter = self.candidate_query_rate_limiters.entry(adnl_id.clone()).or_default();
+        limiter.allow(
+            SystemTime::now(),
+            CANDIDATE_QUERY_RATE_LIMIT_WINDOW,
+            self.candidate_resolve_config.rate_limit,
+        )
     }
 
     /// Cache candidate data for resolver queries
@@ -1575,16 +2147,14 @@ impl ReceiverImpl {
         Reference: C++ CandidateResolver in validator/consensus/candidate-resolver.cpp
     */
 
-    /// Request a missing candidate from peers
+    /// Request a missing candidate from peers.
     ///
-    /// Sends a requestCandidate query to a peer and schedules retry on timeout.
-    /// On successful response, calls on_candidate_received on the listener.
+    /// C++ parity: one in-flight request per id; retries happen only after
+    /// the prior attempt resolves (response/timeout), with backoff + cooldown.
     fn request_candidate_impl(&mut self, slot: SlotIndex, block_hash: UInt256) {
         check_execution_time!(50_000);
 
         let key = (slot, block_hash.clone());
-
-        // Check if already pending
         if self.pending_requests.contains_key(&key) {
             log::trace!(
                 "SimplexReceiver {}: request_candidate slot={} hash={} - already pending",
@@ -1595,8 +2165,8 @@ impl ReceiverImpl {
             return;
         }
 
-        // Select a random peer to query (skip self)
-        let source_idx = match self.select_peer_for_candidate_request(None) {
+        let source_idx = match self.select_peer_for_candidate_request(None, None, SystemTime::now())
+        {
             Some(idx) => idx,
             None => {
                 log::warn!(
@@ -1610,37 +2180,50 @@ impl ReceiverImpl {
         };
 
         self.candidate_requests_counter.increment(1);
-
-        // Create request state
-        let request_state = CandidateRequestState {
-            start_time: SystemTime::now(),
-            retry_count: 0,
-            current_timeout: CANDIDATE_REQUEST_INITIAL_TIMEOUT,
-            source_idx,
-            cached_notar: None,
-            cached_candidate: None,
-        };
-        self.pending_requests.insert(key.clone(), request_state);
-
-        // Send the query
-        self.send_candidate_request(slot, block_hash.clone(), source_idx);
-
-        // Schedule timeout handler
-        let slot_clone = slot;
-        let hash_clone = block_hash.clone();
-        self.post_delayed_action(
-            SystemTime::now() + CANDIDATE_REQUEST_INITIAL_TIMEOUT,
-            move |receiver: &mut ReceiverImpl| {
-                receiver.handle_candidate_request_timeout(slot_clone, hash_clone);
+        self.pending_requests.insert(
+            key,
+            CandidateRequestState {
+                start_time: SystemTime::now(),
+                retry_count: 0,
+                current_timeout: self.candidate_resolve_config.timeout,
+                attempt_id: 0,
+                in_flight: false,
+                in_flight_want_candidate: false,
+                in_flight_want_notar: false,
+                source_idx,
+                cached_notar: None,
+                cached_candidate: None,
+                giveup_reports: 0,
+                peer_retry_not_before: HashMap::new(),
             },
         );
+
+        self.send_candidate_request(slot, block_hash);
+    }
+
+    fn peer_retry_window_open(
+        state: &CandidateRequestState,
+        validator_idx: u32,
+        now: SystemTime,
+    ) -> bool {
+        state
+            .peer_retry_not_before
+            .get(&validator_idx)
+            .map(|not_before| now.duration_since(*not_before).is_ok())
+            .unwrap_or(true)
     }
 
     /// Select a peer for candidate request, skipping self and (optionally) a specific peer.
+    /// If state is provided, enforce per-peer dedup windows for identical partial repairs.
     ///
     /// This reduces repeated queries to the same peer across retries, improving
     /// convergence when only a subset of peers have the requested candidate.
-    fn select_peer_for_candidate_request(&self, exclude: Option<u32>) -> Option<ValidatorIndex> {
+    fn select_peer_for_candidate_request(
+        &self,
+        state: Option<&CandidateRequestState>,
+        exclude: Option<u32>,
+        now: SystemTime,
+    ) -> Option<ValidatorIndex> {
         let len = self.send_order.len();
         if len <= 1 {
             return None; // Only self or empty
@@ -1662,27 +2245,99 @@ impl ReceiverImpl {
                     continue;
                 }
             }
+            if let Some(state_ro) = state {
+                if !Self::peer_retry_window_open(state_ro, validator_idx, now) {
+                    continue;
+                }
+            }
             return Some(ValidatorIndex::new(validator_idx));
         }
 
-        // Fallback: ignore exclude, but still skip self
+        // Fallback: ignore exclude, but still skip self and respect dedup windows
         for offset in 0..len {
             let idx = (start_idx + offset) % len;
             let validator_idx = self.send_order[idx];
-            if validator_idx != self.local_idx {
-                return Some(ValidatorIndex::new(validator_idx));
+            if validator_idx == self.local_idx {
+                continue;
             }
+            if let Some(state_ro) = state {
+                if !Self::peer_retry_window_open(state_ro, validator_idx, now) {
+                    continue;
+                }
+            }
+            return Some(ValidatorIndex::new(validator_idx));
         }
         None
     }
 
-    /// Send the actual requestCandidate query to a peer
-    fn send_candidate_request(
-        &mut self,
-        slot: SlotIndex,
-        block_hash: UInt256,
-        source_idx: ValidatorIndex,
-    ) {
+    fn earliest_peer_retry_ready(
+        &self,
+        state: &CandidateRequestState,
+        now: SystemTime,
+    ) -> Option<(ValidatorIndex, SystemTime)> {
+        self.send_order
+            .iter()
+            .copied()
+            .filter(|idx| *idx != self.local_idx)
+            .filter_map(|validator_idx| {
+                let not_before = state.peer_retry_not_before.get(&validator_idx).copied()?;
+                if not_before.duration_since(now).is_ok() {
+                    Some((ValidatorIndex::new(validator_idx), not_before))
+                } else {
+                    None
+                }
+            })
+            .min_by_key(|(_, not_before)| not_before.duration_since(UNIX_EPOCH).unwrap_or_default())
+    }
+
+    fn next_candidate_timeout(&self, current_timeout: Duration) -> Duration {
+        let next_timeout_ms = (current_timeout.as_millis() as f64
+            * self.candidate_resolve_config.timeout_multiplier)
+            as u128;
+        Duration::from_millis(
+            next_timeout_ms.min(self.candidate_resolve_config.timeout_cap.as_millis()) as u64,
+        )
+    }
+
+    /// Send one requestCandidate attempt for a pending request.
+    fn send_candidate_request(&mut self, slot: SlotIndex, block_hash: UInt256) {
+        let key = (slot, block_hash.clone());
+        let (source_idx, request_timeout, want_candidate, want_notar) = {
+            let Some(state_ro) = self.pending_requests.get(&key) else {
+                return;
+            };
+            let have_candidate = state_ro.cached_candidate.is_some()
+                || self.resolver_cache.get_candidate(slot, &block_hash).is_some();
+            let have_notar = state_ro.cached_notar.is_some()
+                || self.resolver_cache.get_notar_cert(slot, &block_hash).is_some();
+            let want_candidate = !have_candidate;
+            let want_notar = !have_notar;
+            (state_ro.source_idx, state_ro.current_timeout, want_candidate, want_notar)
+        };
+
+        if !want_candidate && !want_notar {
+            log::trace!(
+                "SimplexReceiver {}: requestCandidate slot={slot} hash={} \
+                already complete in cache, cancelling pending request",
+                self.session_id.to_hex_string(),
+                &block_hash.to_hex_string()[..8],
+            );
+            self.pending_requests.remove(&key);
+            return;
+        }
+
+        let attempt_id = {
+            let Some(state) = self.pending_requests.get_mut(&key) else {
+                return;
+            };
+            // Use monotonic attempt ids for stale timeout/response filtering.
+            state.attempt_id = state.attempt_id.saturating_add(1);
+            state.in_flight = true;
+            state.in_flight_want_candidate = want_candidate;
+            state.in_flight_want_notar = want_notar;
+            state.attempt_id
+        };
+
         let peer_adnl_id = match self.sources.get(source_idx.value() as usize) {
             Some(stats) => stats.adnl_id.clone(),
             None => {
@@ -1698,8 +2353,8 @@ impl ReceiverImpl {
         let candidate_id = CandidateId { slot: slot.value() as i32, hash: block_hash.clone() };
         let request = RequestCandidate {
             id: candidate_id.into_boxed(),
-            want_candidate: true.into(),
-            want_notar: true.into(),
+            want_candidate: want_candidate.into(),
+            want_notar: want_notar.into(),
         };
         let (serialized, query_name) = (serialize_boxed(&request), "requestCandidate");
 
@@ -1718,22 +2373,20 @@ impl ReceiverImpl {
         let payload = ConsensusCommonFactory::create_block_payload(serialized);
 
         log::trace!(
-            "SimplexReceiver {}: sending {} slot={} hash={} to validator {}",
+            "SimplexReceiver {}: sending {query_name} slot={slot} hash={} \
+            to validator {source_idx} (attempt={attempt_id} timeout={request_timeout:?} \
+            want_candidate={want_candidate} want_notar={want_notar})",
             self.session_id.to_hex_string(),
-            query_name,
-            slot,
             &block_hash.to_hex_string()[..8],
-            source_idx,
         );
 
         // Capture data for callback (we need to move these into the closure)
         let slot_for_cb = slot;
         let hash_for_cb = block_hash.clone();
-        let session_id = self.session_id.clone();
         let task_queues = self.get_task_queues();
 
         // Send query via RLDP overlay with explicit response size budget (C++ PR #2195 parity)
-        let timeout_deadline = SystemTime::now() + CANDIDATE_REQUEST_TIMEOUT;
+        let timeout_deadline = SystemTime::now() + request_timeout;
         self.overlay.send_query_via_rldp(
             peer_adnl_id,
             query_name.to_string(),
@@ -1743,7 +2396,7 @@ impl ReceiverImpl {
                         slot_for_cb,
                         hash_for_cb,
                         result,
-                        session_id,
+                        attempt_id,
                     );
                 }));
             }),
@@ -1752,6 +2405,13 @@ impl ReceiverImpl {
             self.max_candidate_query_answer_size,
             true, // RLDPv2
         );
+
+        // Timeout callback for this exact attempt.
+        let slot_clone = slot;
+        let hash_clone = block_hash;
+        self.post_delayed_action(SystemTime::now() + request_timeout, move |receiver| {
+            receiver.handle_candidate_request_timeout(slot_clone, hash_clone, attempt_id);
+        });
     }
 
     /// Get task queues for callback posting
@@ -1819,54 +2479,115 @@ impl ReceiverImpl {
         slot: SlotIndex,
         block_hash: UInt256,
         result: Result<consensus_common::BlockPayloadPtr>,
-        _session_id: SessionId,
+        attempt_id: u64,
     ) {
         check_execution_time!(50_000);
 
         let key = (slot, block_hash.clone());
 
-        // Check if request is still pending (might have been fulfilled by broadcast)
-        if !self.pending_requests.contains_key(&key) {
-            log::trace!(
-                "SimplexReceiver {}: candidate response for slot={} hash={} - no longer pending",
-                self.session_id.to_hex_string(),
-                slot,
-                &block_hash.to_hex_string()[..8]
-            );
-            return;
-        }
+        let (source_idx, want_candidate, want_notar) = match self.pending_requests.get_mut(&key) {
+            Some(state) if state.attempt_id == attempt_id && state.in_flight => {
+                state.in_flight = false;
+                (
+                    state.source_idx.value(),
+                    state.in_flight_want_candidate,
+                    state.in_flight_want_notar,
+                )
+            }
+            Some(_) => {
+                log::trace!(
+                    "SimplexReceiver {}: stale candidate response slot={} hash={} attempt={} ignored",
+                    self.session_id.to_hex_string(),
+                    slot,
+                    &block_hash.to_hex_string()[..8],
+                    attempt_id
+                );
+                return;
+            }
+            None => {
+                log::trace!(
+                    "SimplexReceiver {}: candidate response for slot={} hash={} - no longer pending",
+                    self.session_id.to_hex_string(),
+                    slot,
+                    &block_hash.to_hex_string()[..8]
+                );
+                return;
+            }
+        };
 
         match result {
             Ok(response_payload) => {
                 // Deserialize response
                 let response_data = response_payload.data();
                 match deserialize_boxed(response_data) {
-                    Ok(message) => {
-                        if let Ok(response) = message.downcast::<CandidateAndCertBoxed>() {
-                            // Get source_idx from pending request before removing
-                            let source_idx = self
-                                .pending_requests
-                                .get(&key)
-                                .map(|state| state.source_idx.value())
-                                .unwrap_or(0);
-
-                            // Successfully received response
+                    Ok(message) => match message.downcast::<CandidateAndCertBoxed>() {
+                        Ok(response) => {
                             let candidate_bytes = response.candidate();
                             let notar_bytes = response.notar();
 
+                            if !want_candidate && !candidate_bytes.is_empty() {
+                                log::warn!(
+                                    "SimplexReceiver {}: unexpected candidate bytes in \
+                                    requestCandidate response for slot={} hash={} \
+                                    (candidate was not requested)",
+                                    self.session_id.to_hex_string(),
+                                    slot,
+                                    &block_hash.to_hex_string()[..8],
+                                );
+                                self.retry_candidate_request(
+                                    slot,
+                                    block_hash,
+                                    false,
+                                    "unexpected_candidate_when_not_requested",
+                                );
+                                return;
+                            }
+                            if !want_notar && !notar_bytes.is_empty() {
+                                log::warn!(
+                                    "SimplexReceiver {}: unexpected notar bytes in \
+                                    requestCandidate response for slot={} hash={} \
+                                    (notar was not requested)",
+                                    self.session_id.to_hex_string(),
+                                    slot,
+                                    &block_hash.to_hex_string()[..8],
+                                );
+                                self.retry_candidate_request(
+                                    slot,
+                                    block_hash,
+                                    false,
+                                    "unexpected_notar_when_not_requested",
+                                );
+                                return;
+                            }
+
                             log::trace!(
                                 "SimplexReceiver {}: received candidate response slot={} hash={} \
-                                candidate_len={} notar_len={} from validator {}",
+                                candidate_len={} notar_len={} from validator {} (attempt={})",
                                 self.session_id.to_hex_string(),
                                 slot,
                                 &block_hash.to_hex_string()[..8],
                                 candidate_bytes.len(),
                                 notar_bytes.len(),
-                                source_idx
+                                source_idx,
+                                attempt_id
                             );
 
-                            // C++ CandidateAndCert::merge parity: cache both partial fields and
-                            // complete only when the merged result has both candidate+notar.
+                            let candidate_part_new = !candidate_bytes.is_empty()
+                                && self
+                                    .pending_requests
+                                    .get(&key)
+                                    .and_then(|state| state.cached_candidate.as_ref())
+                                    .map(|cached| cached.as_slice() != candidate_bytes)
+                                    .unwrap_or(true);
+                            let notar_part_new = !notar_bytes.is_empty()
+                                && self
+                                    .pending_requests
+                                    .get(&key)
+                                    .and_then(|state| state.cached_notar.as_ref())
+                                    .map(|cached| cached.as_slice() != notar_bytes)
+                                    .unwrap_or(true);
+
+                            // C++ CandidateAndCert::merge parity: cache both partial fields.
                             let (merged_candidate_bytes, merged_notar) =
                                 Self::merge_candidate_response_parts(
                                     &mut self.resolver_cache,
@@ -1877,15 +2598,90 @@ impl ReceiverImpl {
                                     notar_bytes,
                                 );
 
-                            // If body is still missing after merge, keep pending for retry.
+                            // Forward newly observed parts immediately. SessionProcessor can merge
+                            // body/notar callbacks in any order.
+                            if candidate_part_new {
+                                let candidate = match deserialize_boxed(candidate_bytes) {
+                                    Ok(msg) => match msg.downcast::<CandidateData>() {
+                                        Ok(c) => c,
+                                        Err(_) => {
+                                            self.resolver_cache.remove_candidate(slot, &block_hash);
+                                            if let Some(state) = self.pending_requests.get_mut(&key)
+                                            {
+                                                state.cached_candidate = None;
+                                            }
+                                            log::warn!(
+                                                "SimplexReceiver {}: unexpected candidate type in \
+                                                partial response",
+                                                self.session_id.to_hex_string()
+                                            );
+                                            self.retry_candidate_request(
+                                                slot,
+                                                block_hash,
+                                                false,
+                                                "bad_candidate_type_partial",
+                                            );
+                                            return;
+                                        }
+                                    },
+                                    Err(e) => {
+                                        self.resolver_cache.remove_candidate(slot, &block_hash);
+                                        if let Some(state) = self.pending_requests.get_mut(&key) {
+                                            state.cached_candidate = None;
+                                        }
+                                        log::warn!(
+                                            "SimplexReceiver {}: failed to deserialize candidate \
+                                            from partial response: {}",
+                                            self.session_id.to_hex_string(),
+                                            e
+                                        );
+                                        self.retry_candidate_request(
+                                            slot,
+                                            block_hash,
+                                            false,
+                                            "candidate_deserialize_error_partial",
+                                        );
+                                        return;
+                                    }
+                                };
+
+                                if let Some(listener) = self.listener.upgrade() {
+                                    let notar_for_candidate = if notar_part_new {
+                                        Some(notar_bytes.to_vec())
+                                    } else {
+                                        None
+                                    };
+                                    listener.on_candidate_received(
+                                        source_idx,
+                                        candidate,
+                                        notar_for_candidate,
+                                    );
+                                }
+                            } else if notar_part_new {
+                                if let Some(listener) = self.listener.upgrade() {
+                                    listener.on_candidate_notar_received(
+                                        source_idx,
+                                        slot,
+                                        block_hash.clone(),
+                                        notar_bytes.to_vec(),
+                                    );
+                                }
+                            }
+
                             if merged_candidate_bytes.is_empty() {
                                 log::debug!(
                                     "SimplexReceiver {}: body-empty response for slot={} hash={} \
-                                    (notar_len={}), will retry on timeout",
+                                    (notar_len={}), scheduling retry",
                                     self.session_id.to_hex_string(),
                                     slot,
                                     &block_hash.to_hex_string()[..8],
                                     notar_bytes.len(),
+                                );
+                                self.retry_candidate_request(
+                                    slot,
+                                    block_hash,
+                                    false,
+                                    "missing_body_after_merge",
                                 );
                                 return;
                             }
@@ -1893,22 +2689,26 @@ impl ReceiverImpl {
                             if merged_notar.is_empty() {
                                 log::debug!(
                                     "SimplexReceiver {}: candidate-only partial response for \
-                                    slot={} hash={}, keep pending until notar arrives",
+                                    slot={} hash={}, scheduling retry",
                                     self.session_id.to_hex_string(),
                                     slot,
                                     &block_hash.to_hex_string()[..8],
                                 );
+                                self.retry_candidate_request(
+                                    slot,
+                                    block_hash,
+                                    false,
+                                    "missing_notar_after_merge",
+                                );
                                 return;
                             }
 
-                            let candidate = match deserialize_boxed(
+                            let _candidate = match deserialize_boxed(
                                 merged_candidate_bytes.as_slice(),
                             ) {
                                 Ok(msg) => match msg.downcast::<CandidateData>() {
                                     Ok(c) => c,
                                     Err(_) => {
-                                        // Drop cached candidate so retry can fetch a fresh body;
-                                        // also purge resolver_cache to avoid serving bad data to peers.
                                         self.resolver_cache.remove_candidate(slot, &block_hash);
                                         if let Some(state) = self.pending_requests.get_mut(&key) {
                                             state.cached_candidate = None;
@@ -1917,12 +2717,16 @@ impl ReceiverImpl {
                                             "SimplexReceiver {}: unexpected candidate type in response",
                                             self.session_id.to_hex_string()
                                         );
+                                        self.retry_candidate_request(
+                                            slot,
+                                            block_hash,
+                                            false,
+                                            "bad_candidate_type",
+                                        );
                                         return;
                                     }
                                 },
                                 Err(e) => {
-                                    // Drop cached candidate so retry can fetch a fresh body;
-                                    // also purge resolver_cache to avoid serving bad data to peers.
                                     self.resolver_cache.remove_candidate(slot, &block_hash);
                                     if let Some(state) = self.pending_requests.get_mut(&key) {
                                         state.cached_candidate = None;
@@ -1932,144 +2736,469 @@ impl ReceiverImpl {
                                         self.session_id.to_hex_string(),
                                         e
                                     );
+                                    self.retry_candidate_request(
+                                        slot,
+                                        block_hash,
+                                        false,
+                                        "candidate_deserialize_error",
+                                    );
                                     return;
                                 }
                             };
 
                             // Remove from pending only when merged candidate+notar is complete.
                             self.pending_requests.remove(&key);
-
-                            // Call listener with source_idx, using merged notar.
-                            if let Some(listener) = self.listener.upgrade() {
-                                listener.on_candidate_received(
-                                    source_idx,
-                                    candidate,
-                                    Some(merged_notar),
+                        }
+                        Err(message) => {
+                            if message.downcast::<ConsensusRequestError>().is_ok() {
+                                log::debug!(
+                                    "SimplexReceiver {}: peer returned requestError for slot={} hash={}",
+                                    self.session_id.to_hex_string(),
+                                    slot,
+                                    &block_hash.to_hex_string()[..8]
+                                );
+                                self.retry_candidate_request(
+                                    slot,
+                                    block_hash,
+                                    true,
+                                    "request_error",
+                                );
+                            } else {
+                                log::warn!(
+                                    "SimplexReceiver {}: \
+                                    unexpected response type for requestCandidate",
+                                    self.session_id.to_hex_string()
+                                );
+                                self.retry_candidate_request(
+                                    slot,
+                                    block_hash,
+                                    false,
+                                    "unexpected_response_type",
                                 );
                             }
-                        } else {
-                            log::warn!(
-                                "SimplexReceiver {}: unexpected response type for requestCandidate",
-                                self.session_id.to_hex_string()
-                            );
                         }
-                    }
+                    },
                     Err(e) => {
                         log::warn!(
                             "SimplexReceiver {}: failed to deserialize candidate response: {}",
                             self.session_id.to_hex_string(),
                             e
                         );
+                        self.retry_candidate_request(
+                            slot,
+                            block_hash,
+                            false,
+                            "response_deserialize_error",
+                        );
                     }
                 }
             }
             Err(e) => {
                 log::trace!(
-                    "SimplexReceiver {}: candidate request failed slot={} hash={}: {}",
+                    "SimplexReceiver {}: candidate request failed slot={} hash={} \
+                    attempt={}: {}",
                     self.session_id.to_hex_string(),
                     slot,
                     &block_hash.to_hex_string()[..8],
+                    attempt_id,
                     e
                 );
-                // Error will be handled by timeout - don't retry here to avoid duplicates
+                self.retry_candidate_request(slot, block_hash, true, "request_timeout_or_error");
             }
         }
     }
 
-    /// Handle request timeout - retry with next peer using exponential backoff.
-    /// C++ parity: candidate-resolver.cpp retries indefinitely until resolved.
-    fn handle_candidate_request_timeout(&mut self, slot: SlotIndex, block_hash: UInt256) {
+    fn retry_candidate_request(
+        &mut self,
+        slot: SlotIndex,
+        block_hash: UInt256,
+        count_timeout: bool,
+        reason: &'static str,
+    ) {
         let key = (slot, block_hash.clone());
-
-        // Check if request is still pending and get current state
-        let (retry_count, prev_source_idx, current_timeout) = match self.pending_requests.get(&key)
-        {
-            Some(state) => (state.retry_count, state.source_idx.value(), state.current_timeout),
-            None => {
-                log::trace!(
-                    "SimplexReceiver {}: handle_candidate_request_timeout slot={} hash={} - request already fulfilled or cancelled",
-                    self.session_id.to_hex_string(),
-                    slot,
-                    &block_hash.to_hex_string()[..8]
-                );
-                return;
-            }
+        let Some(state_ro) = self.pending_requests.get(&key) else {
+            return;
         };
-        self.candidate_request_timeouts_counter.increment(1);
+        let prev_source_idx = state_ro.source_idx.value();
+        let current_timeout = state_ro.current_timeout;
+        let start_time = state_ro.start_time;
+        let prev_giveup_reports = state_ro.giveup_reports;
+        let now = SystemTime::now();
 
-        let new_retry_count = retry_count + 1;
-        if new_retry_count % CANDIDATE_REQUEST_MAX_RETRIES == 0 {
+        let next_timeout = self.next_candidate_timeout(current_timeout);
+
+        let (retry_count, emit_soft_giveup, partial_notar_phase) = {
+            let Some(state) = self.pending_requests.get_mut(&key) else {
+                return;
+            };
+            state.retry_count = state.retry_count.saturating_add(1);
+            state.current_timeout = next_timeout;
+            state.in_flight = false;
+            state.in_flight_want_candidate = false;
+            state.in_flight_want_notar = false;
+            state
+                .peer_retry_not_before
+                .insert(prev_source_idx, now + CANDIDATE_QUERY_RATE_LIMIT_WINDOW);
+
+            let partial_notar_phase =
+                state.cached_candidate.is_some() && state.cached_notar.is_none();
+
+            let elapsed = now.duration_since(start_time).unwrap_or_default();
+            let threshold_secs = CANDIDATE_SOFT_GIVEUP_REPORT_INTERVAL
+                .as_secs()
+                .saturating_mul((prev_giveup_reports as u64).saturating_add(1))
+                .max(1);
+            let emit_soft_giveup = elapsed >= Duration::from_secs(threshold_secs);
+            if emit_soft_giveup {
+                state.giveup_reports = state.giveup_reports.saturating_add(1);
+            }
+            (state.retry_count, emit_soft_giveup, partial_notar_phase)
+        };
+
+        let mut retry_delay = self.candidate_resolve_config.cooldown;
+        if partial_notar_phase {
+            // Completion policy for partial repairs:
+            // once body is known and only notar is missing, avoid sub-second hammering.
+            retry_delay = retry_delay.max(CANDIDATE_QUERY_RATE_LIMIT_WINDOW);
+        }
+
+        let mut wait_for_peer_window = false;
+        let selected_source = self.pending_requests.get(&key).and_then(|state_ro| {
+            self.select_peer_for_candidate_request(Some(state_ro), Some(prev_source_idx), now)
+                .or_else(|| {
+                    let (peer_idx, ready_at) = self.earliest_peer_retry_ready(state_ro, now)?;
+                    if let Ok(wait_for_peer) = ready_at.duration_since(now) {
+                        retry_delay = retry_delay.max(wait_for_peer);
+                        wait_for_peer_window = true;
+                    }
+                    Some(peer_idx)
+                })
+        });
+        let next_source_idx =
+            selected_source.unwrap_or_else(|| ValidatorIndex::new(prev_source_idx));
+        if let Some(state) = self.pending_requests.get_mut(&key) {
+            state.source_idx = next_source_idx;
+        } else {
+            return;
+        }
+
+        if count_timeout {
+            self.candidate_request_timeouts_counter.increment(1);
+        }
+        self.candidate_request_retries_counter.increment(1);
+
+        if retry_count % CANDIDATE_RETRY_WARN_INTERVAL == 0 {
             log::warn!(
                 "SimplexReceiver {}: candidate request slot={slot} hash={} \
-                still pending after {new_retry_count} retries, continuing",
+                still pending after {} retries (reason={})",
                 self.session_id.to_hex_string(),
-                &block_hash.to_hex_string()[..8]
+                &block_hash.to_hex_string()[..8],
+                retry_count,
+                reason
             );
         }
 
-        // Exponential backoff: timeout * multiplier, capped at max
-        let next_timeout_ms =
-            (current_timeout.as_millis() as f64 * CANDIDATE_REQUEST_TIMEOUT_MULTIPLIER) as u128;
-        let next_timeout = Duration::from_millis(
-            next_timeout_ms.min(CANDIDATE_REQUEST_MAX_TIMEOUT.as_millis()) as u64,
-        );
-
-        // Select next peer (random, excluding previous)
-        let next_source_idx = match self.select_peer_for_candidate_request(Some(prev_source_idx)) {
-            Some(idx) => idx,
-            None => {
-                // No peers available right now -- schedule a retry after backoff anyway,
-                // peers may come back online.
-                self.candidate_request_retries_counter.increment(1);
-                log::warn!(
-                    "SimplexReceiver {}: no peers for candidate request slot={slot} hash={}, \
-                    will retry in {next_timeout:?}",
-                    self.session_id.to_hex_string(),
-                    &block_hash.to_hex_string()[..8]
-                );
-                if let Some(state) = self.pending_requests.get_mut(&key) {
-                    state.retry_count = new_retry_count;
-                    state.current_timeout = next_timeout;
-                }
-                let slot_clone = slot;
-                let hash_clone = block_hash;
-                self.post_delayed_action(
-                    SystemTime::now() + next_timeout,
-                    move |receiver: &mut ReceiverImpl| {
-                        receiver.handle_candidate_request_timeout(slot_clone, hash_clone);
-                    },
-                );
-                return;
-            }
-        };
-
-        // Update request state
-        self.candidate_request_retries_counter.increment(1);
-        if let Some(state) = self.pending_requests.get_mut(&key) {
-            state.retry_count = new_retry_count;
-            state.source_idx = next_source_idx;
-            state.current_timeout = next_timeout;
+        if emit_soft_giveup {
+            self.candidate_request_giveups_counter.increment(1);
+            self.health_counters.candidate_giveups.fetch_add(1, Ordering::Relaxed);
+            log::warn!(
+                "SimplexReceiver {}: candidate request slot={slot} hash={} soft_giveup_report \
+                retry_count={} reason={}",
+                self.session_id.to_hex_string(),
+                &block_hash.to_hex_string()[..8],
+                retry_count,
+                reason
+            );
         }
 
         log::trace!(
-            "SimplexReceiver {}: retrying candidate request slot={slot} hash={} \
-            to validator {next_source_idx} (retry {new_retry_count}, timeout {next_timeout:?})",
+            "SimplexReceiver {}: scheduling candidate retry slot={} hash={} \
+            to validator {} in {:?} (retry {}, reason={}, next_query_timeout={:?}, \
+            peer_window_wait={})",
             self.session_id.to_hex_string(),
-            &block_hash.to_hex_string()[..8]
+            slot,
+            &block_hash.to_hex_string()[..8],
+            next_source_idx,
+            retry_delay,
+            retry_count,
+            reason,
+            next_timeout,
+            wait_for_peer_window
         );
 
-        // Send to next peer
-        self.send_candidate_request(slot, block_hash.clone(), next_source_idx);
-
-        // Schedule next timeout with backoff
         let slot_clone = slot;
         let hash_clone = block_hash;
-        self.post_delayed_action(
-            SystemTime::now() + next_timeout,
-            move |receiver: &mut ReceiverImpl| {
-                receiver.handle_candidate_request_timeout(slot_clone, hash_clone);
+        self.post_delayed_action(now + retry_delay, move |receiver: &mut ReceiverImpl| {
+            receiver.send_candidate_request(slot_clone, hash_clone);
+        });
+    }
+
+    /// Handle timeout for one specific attempt id.
+    fn handle_candidate_request_timeout(
+        &mut self,
+        slot: SlotIndex,
+        block_hash: UInt256,
+        attempt_id: u64,
+    ) {
+        let key = (slot, block_hash.clone());
+        let timed_out = match self.pending_requests.get_mut(&key) {
+            Some(state) if state.attempt_id == attempt_id && state.in_flight => {
+                state.in_flight = false;
+                true
+            }
+            _ => false,
+        };
+        if !timed_out {
+            log::trace!(
+                "SimplexReceiver {}: candidate timeout slot={slot} hash={} attempt={attempt_id} \
+                ignored (stale or completed)",
+                self.session_id.to_hex_string(),
+                &block_hash.to_hex_string()[..8]
+            );
+            return;
+        }
+
+        self.retry_candidate_request(slot, block_hash, true, "timeout");
+    }
+
+    fn standstill_vote_key(vote: &TlVote) -> StandstillVoteKey {
+        match &vote.vote {
+            UnsignedVote::Consensus_Simplex_NotarizeVote(v) => StandstillVoteKey {
+                slot: *v.id.slot() as u32,
+                kind: 0,
+                candidate_hash: Some(v.id.hash().clone()),
             },
-        );
+            UnsignedVote::Consensus_Simplex_SkipVote(v) => {
+                StandstillVoteKey { slot: v.slot as u32, kind: 1, candidate_hash: None }
+            }
+            UnsignedVote::Consensus_Simplex_FinalizeVote(v) => StandstillVoteKey {
+                slot: *v.id.slot() as u32,
+                kind: 2,
+                candidate_hash: Some(v.id.hash().clone()),
+            },
+        }
+    }
+
+    fn cache_vote_for_standstill(&mut self, vote: TlVote) {
+        let key = Self::standstill_vote_key(&vote);
+        if !self.our_vote_keys.insert(key) {
+            return;
+        }
+        let slot = Self::get_vote_slot_from_inner(&vote);
+        self.our_votes.push((slot, vote));
+        self.standstill_slot_end = self.standstill_slot_end.max(slot.saturating_add(1));
+    }
+
+    fn rebuild_standstill_vote_keys(&mut self) {
+        self.our_vote_keys.clear();
+        for (_, vote) in &self.our_votes {
+            self.our_vote_keys.insert(Self::standstill_vote_key(vote));
+        }
+    }
+
+    fn standstill_send_recipient_count(&self) -> u64 {
+        self.send_order.iter().filter(|&&idx| idx != self.local_idx).count() as u64
+    }
+
+    fn standstill_cost_recipient_count(&self) -> u64 {
+        self.send_order.len() as u64
+    }
+
+    fn estimate_standstill_replay_item_cost(&self, item: &StandstillReplayItem) -> u64 {
+        let recipient_count = self.standstill_cost_recipient_count();
+        if recipient_count == 0 {
+            return 0;
+        }
+        match item {
+            StandstillReplayItem::Vote(vote) => {
+                let serialized =
+                    consensus_common::serialize_tl_boxed_object!(&vote.clone().into_boxed());
+                serialized.len() as u64 * recipient_count
+            }
+            StandstillReplayItem::Certificate(bytes) => bytes.len() as u64 * recipient_count,
+        }
+    }
+
+    fn send_serialized_certificate_to_all(&mut self, bytes: Vec<u8>) {
+        let payload = ConsensusCommonFactory::create_block_payload(bytes.into());
+        let msg_size = payload.data().len() as u64;
+        let recipient_count = self.standstill_send_recipient_count();
+
+        self.out_messages_bytes.increment(msg_size * recipient_count);
+        self.out_bytes.increment(msg_size * recipient_count);
+        self.out_messages_count.increment(recipient_count);
+
+        for &target_idx in &self.send_order {
+            if target_idx == self.local_idx {
+                continue;
+            }
+
+            if let Some(stats) = self.sources.get_mut(target_idx as usize) {
+                stats.out_messages += 1;
+                stats.last_send_time = Some(SystemTime::now());
+
+                self.overlay.send_message(
+                    &stats.adnl_id,
+                    &self.local_adnl_id,
+                    &payload,
+                    false, // is_retransmission=false for simplex
+                );
+            }
+        }
+    }
+
+    fn send_standstill_replay_item(&mut self, item: StandstillReplayItem) {
+        match item {
+            StandstillReplayItem::Vote(vote) => self.send_vote_impl(vote, true),
+            StandstillReplayItem::Certificate(bytes) => {
+                self.send_serialized_certificate_to_all(bytes)
+            }
+        }
+    }
+
+    fn refill_standstill_egress_quota(&mut self) {
+        if self.standstill_max_egress_bytes_per_s == 0 {
+            self.standstill_egress_quota_bytes = f64::INFINITY;
+            self.standstill_egress_quota_time = SystemTime::now();
+            return;
+        }
+
+        let now = SystemTime::now();
+        if let Ok(elapsed) = now.duration_since(self.standstill_egress_quota_time) {
+            let max_bytes = self.standstill_max_egress_bytes_per_s as f64;
+            // Allow accumulation across multiple seconds; otherwise a replay item bigger
+            // than one-second budget could starve forever.
+            self.standstill_egress_quota_bytes += elapsed.as_secs_f64() * max_bytes;
+        }
+        self.standstill_egress_quota_time = now;
+    }
+
+    fn reset_standstill_egress_budget_for_replay(&mut self) {
+        if self.standstill_max_egress_bytes_per_s == 0 {
+            self.standstill_egress_quota_bytes = f64::INFINITY;
+            self.standstill_egress_quota_time = SystemTime::now();
+            return;
+        }
+
+        let now = SystemTime::now();
+        self.standstill_egress_quota_bytes = 0.0;
+        self.standstill_egress_quota_time =
+            now.checked_sub(Duration::from_millis(10)).unwrap_or(now);
+    }
+
+    fn drain_standstill_replay_queue(&mut self) {
+        if self.standstill_replay_queue.is_empty() {
+            return;
+        }
+
+        if self.standstill_max_egress_bytes_per_s == 0 {
+            while let Some(item) = self.standstill_replay_queue.pop_front() {
+                self.send_standstill_replay_item(item);
+            }
+            return;
+        }
+
+        self.refill_standstill_egress_quota();
+
+        while let Some(front) = self.standstill_replay_queue.front() {
+            let cost = self.estimate_standstill_replay_item_cost(front) as f64;
+            if cost > 0.0 && self.standstill_egress_quota_bytes < cost {
+                break;
+            }
+            if cost > 0.0 {
+                self.standstill_egress_quota_bytes -= cost;
+            }
+            let item = self.standstill_replay_queue.pop_front().expect("queue front exists");
+            self.send_standstill_replay_item(item);
+        }
+    }
+
+    fn collect_standstill_certificate_payloads(&self, begin: u32, end: u32) -> Vec<Vec<u8>> {
+        let mut cert_bytes_list: Vec<Vec<u8>> = Vec::new();
+
+        if let Some((_slot, bytes)) = &self.last_final_cert {
+            cert_bytes_list.push(bytes.clone());
+        }
+
+        let mut slots: Vec<u32> = self
+            .standstill_certs
+            .keys()
+            .copied()
+            .filter(|slot| *slot >= begin && *slot < end)
+            .collect();
+        slots.sort_unstable();
+        for slot in slots {
+            if let Some(bundle) = self.standstill_certs.get(&slot) {
+                if let Some(bytes) = &bundle.notar {
+                    cert_bytes_list.push(bytes.clone());
+                }
+                if let Some(bytes) = &bundle.skip {
+                    cert_bytes_list.push(bytes.clone());
+                }
+                if let Some(bytes) = &bundle.final_ {
+                    cert_bytes_list.push(bytes.clone());
+                }
+            }
+        }
+
+        cert_bytes_list
+    }
+
+    fn collect_standstill_votes_for_replay(&self, begin: u32, end: u32) -> Vec<TlVote> {
+        let mut votes: Vec<_> = self
+            .our_votes
+            .iter()
+            .filter(|(slot, vote)| {
+                if *slot < begin || *slot >= end {
+                    return false;
+                }
+
+                let bundle = self.standstill_certs.get(slot);
+                match &vote.vote {
+                    UnsignedVote::Consensus_Simplex_NotarizeVote(_) => {
+                        bundle.map_or(true, |b| b.notar.is_none())
+                    }
+                    UnsignedVote::Consensus_Simplex_SkipVote(_) => {
+                        bundle.map_or(true, |b| b.skip.is_none())
+                    }
+                    UnsignedVote::Consensus_Simplex_FinalizeVote(_) => {
+                        bundle.map_or(true, |b| b.final_.is_none())
+                    }
+                }
+            })
+            .map(|(_, vote)| vote.clone())
+            .collect();
+
+        votes.sort_by(|left, right| {
+            let left_key = Self::standstill_vote_key(left);
+            let right_key = Self::standstill_vote_key(right);
+            left_key.slot.cmp(&right_key.slot).then(left_key.kind.cmp(&right_key.kind))
+        });
+        votes
+    }
+
+    fn rebuild_standstill_replay_queue(&mut self, begin: u32, end: u32) -> (u32, u32, usize) {
+        let cert_payloads = self.collect_standstill_certificate_payloads(begin, end);
+        let cert_count = cert_payloads.len() as u32;
+        let votes_to_rebroadcast = self.collect_standstill_votes_for_replay(begin, end);
+        let vote_count = votes_to_rebroadcast.len() as u32;
+        let replaced_items = self.standstill_replay_queue.len();
+
+        self.standstill_replay_queue.clear();
+        for bytes in cert_payloads {
+            self.standstill_replay_queue.push_back(StandstillReplayItem::Certificate(bytes));
+        }
+        for vote in votes_to_rebroadcast {
+            self.standstill_replay_queue.push_back(StandstillReplayItem::Vote(vote));
+        }
+        if replaced_items == 0 {
+            self.reset_standstill_egress_budget_for_replay();
+        }
+
+        self.standstill_certs_rebroadcast_counter.increment(cert_count as u64);
+        self.standstill_votes_rebroadcast_counter.increment(vote_count as u64);
+
+        (cert_count, vote_count, replaced_items)
     }
 
     /// Send a signed vote to all validators
@@ -2083,11 +3212,7 @@ impl ReceiverImpl {
 
         // Store vote for potential standstill re-broadcast (only on first send)
         if !is_rebroadcast {
-            let slot = Self::get_vote_slot_from_inner(&vote);
-            self.our_votes.push((slot, vote.clone()));
-            // Keep standstill end large enough to include newly sent votes.
-            // This avoids relying on external range updates for window growth (C++ parity: alarm() uses current state).
-            self.standstill_slot_end = self.standstill_slot_end.max(slot.saturating_add(1));
+            self.cache_vote_for_standstill(vote.clone());
         }
 
         // Serialize vote for network transmission
@@ -2161,8 +3286,7 @@ impl ReceiverImpl {
             slot,
             discriminant(&vote.vote)
         );
-        self.our_votes.push((slot, vote));
-        self.standstill_slot_end = self.standstill_slot_end.max(slot.saturating_add(1));
+        self.cache_vote_for_standstill(vote);
     }
 
     /// Send block candidate to all validators
@@ -2340,6 +3464,44 @@ impl ReceiverImpl {
             .collect()
     }
 
+    fn build_activity_snapshot(
+        &self,
+        active_weight: ValidatorWeight,
+        last_activity: Vec<Option<SystemTime>>,
+    ) -> ReceiverActivitySnapshot {
+        let sources = self
+            .sources
+            .iter()
+            .map(|s| SourceActivitySnapshot {
+                source_idx: s.source_idx,
+                weight: s.weight,
+                adnl_id_base64: key_to_base64(&s.adnl_id),
+                in_messages: s.in_messages,
+                out_messages: s.out_messages,
+                in_broadcasts: s.in_broadcasts,
+                out_broadcasts: s.out_broadcasts,
+                last_recv_time: s.last_recv_time,
+                last_send_time: s.last_send_time,
+                votes_in_notarize: s.votes_in_notarize,
+                votes_in_finalize: s.votes_in_finalize,
+                votes_in_skip: s.votes_in_skip,
+                certs_in_notar: s.certs_in_notar,
+                certs_in_final: s.certs_in_final,
+                certs_in_skip: s.certs_in_skip,
+                candidates_received: s.candidates_received,
+                candidate_requests_sent: s.candidate_requests_sent,
+                candidate_requests_received: s.candidate_requests_received,
+                last_vote_recv_time: s.last_vote_recv_time,
+                last_notar_cert_recv_time: s.last_notar_cert_recv_time,
+                last_final_cert_recv_time: s.last_final_cert_recv_time,
+                last_candidate_recv_time: s.last_candidate_recv_time,
+                duplicate_votes: s.duplicate_votes,
+                duplicate_broadcasts: s.duplicate_broadcasts,
+            })
+            .collect();
+        ReceiverActivitySnapshot { active_weight, last_activity, sources }
+    }
+
     /// Debug dump of receiver state
     fn debug_dump(&self) {
         if !log::log_enabled!(log::Level::Debug) {
@@ -2416,18 +3578,77 @@ impl ReceiverImpl {
         }
     }
 
-    /// Maximum slot the receiver will accept (inclusive).
-    /// Mirrors `SimplexState::max_acceptable_slot()` using the receiver's own
-    /// finalization cursor, which is updated by `cleanup()`.
-    fn max_acceptable_slot(&self) -> u32 {
-        self.first_active_slot.saturating_add(MAX_FUTURE_SLOTS)
+    /// Returns the first slot that is considered "too new" for votes.
+    ///
+    /// Mirrors C++ `pool.cpp`:
+    /// `(now_ / slots_per_leader_window + max_desync + 1) * slots_per_leader_window`
+    fn first_too_new_vote_slot(&self) -> u32 {
+        let current_window = self.ingress_progress_slot / self.slots_per_leader_window;
+        current_window
+            .saturating_add(self.max_leader_window_desync)
+            .saturating_add(1)
+            .saturating_mul(self.slots_per_leader_window)
     }
 
-    /// Returns `true` if `slot` is outside the acceptable range
-    /// `[first_active_slot, first_active_slot + MAX_FUTURE_SLOTS]`.
-    /// Rejects both already-finalized slots and far-future slots.
-    fn is_slot_out_of_bounds(&self, slot: u32) -> bool {
-        slot < self.first_active_slot || slot > self.max_acceptable_slot()
+    /// Returns `true` if a vote slot is outside the C++ vote ingress range
+    /// `[first_active_slot, first_too_new_vote_slot())`.
+    fn is_vote_slot_out_of_bounds(&self, slot: u32) -> bool {
+        slot < self.first_active_slot || slot >= self.first_too_new_vote_slot()
+    }
+
+    /// Returns `true` if a certificate references an already finalized slot.
+    fn is_certificate_slot_too_old(&self, slot: u32) -> bool {
+        slot < self.first_active_slot
+    }
+
+    /// Advance ingress slot lower bound used by pre-filter bounds checks.
+    fn set_ingress_slot_begin_impl(&mut self, slot: SlotIndex) {
+        let slot_value = slot.value();
+        if slot_value <= self.first_active_slot {
+            return;
+        }
+
+        log::trace!(
+            "SimplexReceiver {}: set_ingress_slot_begin {} -> {}",
+            self.session_id.to_hex_string(),
+            self.first_active_slot,
+            slot_value
+        );
+        self.first_active_slot = slot_value;
+        if self.ingress_progress_slot < self.first_active_slot {
+            self.ingress_progress_slot = self.first_active_slot;
+        }
+    }
+
+    /// Advance ingress progress cursor used for the future-slot upper bound.
+    fn set_ingress_progress_slot_impl(&mut self, slot: SlotIndex) {
+        let slot_value = slot.value().max(self.first_active_slot);
+        if slot_value <= self.ingress_progress_slot {
+            return;
+        }
+
+        log::trace!(
+            "SimplexReceiver {}: set_ingress_progress_slot {} -> {}",
+            self.session_id.to_hex_string(),
+            self.ingress_progress_slot,
+            slot_value
+        );
+        self.ingress_progress_slot = slot_value;
+    }
+
+    fn cancel_candidate_requests_for_slot_impl(&mut self, slot: SlotIndex) {
+        let before = self.pending_requests.len();
+        self.pending_requests.retain(|(pending_slot, _), _| *pending_slot != slot);
+        let removed = before.saturating_sub(self.pending_requests.len());
+
+        if removed > 0 {
+            log::trace!(
+                "SimplexReceiver {}: cancelled {} pending candidate requests for slot {}",
+                self.session_id.to_hex_string(),
+                removed,
+                slot
+            );
+        }
     }
 
     /// Cleanup old slots data
@@ -2448,11 +3669,14 @@ impl ReceiverImpl {
             up_to_slot
         );
 
-        self.first_active_slot = up_to_slot.value();
+        self.standstill_replay_queue.clear();
 
         // Clean up old votes (keep votes for slot >= up_to_slot)
         let old_count = self.our_votes.len();
         self.our_votes.retain(|(s, _)| *s >= up_to_slot.value());
+        if self.our_votes.len() != old_count {
+            self.rebuild_standstill_vote_keys();
+        }
         if self.our_votes.len() < old_count {
             log::trace!(
                 "SimplexReceiver {}: cleaned up {} old votes (up_to_slot={})",
@@ -2465,8 +3689,14 @@ impl ReceiverImpl {
         // Clean up deduplication entries (keep entries for slot >= up_to_slot)
         self.dedup_votes.retain(|&slot, _| slot >= up_to_slot.value());
 
+        // Clean up accepted certificate bitmap for old slots
+        self.accepted_certs.retain(|&slot, _| slot >= up_to_slot.value());
+
         // Clean up resolver cache for old slots
         self.cleanup_resolver_cache(up_to_slot);
+
+        // Clean up in-flight candidate requests for old slots
+        self.pending_requests.retain(|(slot, _), _| *slot >= up_to_slot);
 
         // Clean up standstill certificate cache
         let old_cert_count = self.standstill_certs.len();
@@ -2483,6 +3713,15 @@ impl ReceiverImpl {
         // Note: standstill timer is NOT reset here - it's done separately via
         // reschedule_standstill() which is only called on finalization, not on skip.
         // Reference: C++ pool.cpp only calls reschedule_standstill_resolution() in on_finalization()
+    }
+
+    /// Arm standstill detection after session promotion to current.
+    fn start(&mut self) {
+        log::info!(
+            "SimplexReceiver {}: started, standstill detection armed",
+            self.session_id.to_hex_string(),
+        );
+        self.reschedule_standstill();
     }
 
     /// Reschedule standstill alarm
@@ -2505,6 +3744,7 @@ impl ReceiverImpl {
     /// Reference: C++ pool.cpp alarm()
     fn check_standstill(&mut self) {
         check_execution_time!(10_000);
+        self.drain_standstill_replay_queue();
 
         let now = SystemTime::now();
 
@@ -2523,61 +3763,38 @@ impl ReceiverImpl {
         let begin = self.standstill_slot_begin;
         let end = self.standstill_slot_end;
 
-        // 1. Re-broadcast cached certificates
-        let cert_count = self.rebroadcast_standstill_certificates(begin, end);
-
-        // 2. Re-broadcast our votes in tracked range, but ONLY if matching cert doesn't exist
-        // Reference: C++ Tsentrizbirkom::serialize_to(messages, bundle):
-        //   if (notarize_.has_value() && !bundle.notarize_.has_value()) { ... }
-        //   if (skip_.has_value() && !bundle.skip_.has_value()) { ... }
-        //   if (finalize_.has_value() && !bundle.finalize_.has_value()) { ... }
-        let votes_to_rebroadcast: Vec<_> = self
-            .our_votes
-            .iter()
-            .filter(|(slot, vote)| {
-                if *slot < begin || *slot >= end {
-                    return false;
-                }
-                // Check if we have the matching cert cached
-                let bundle = self.standstill_certs.get(slot);
-                match &vote.vote {
-                    UnsignedVote::Consensus_Simplex_NotarizeVote(_) => {
-                        // Only send notar vote if no notar cert cached
-                        bundle.map_or(true, |b| b.notar.is_none())
-                    }
-                    UnsignedVote::Consensus_Simplex_SkipVote(_) => {
-                        // Only send skip vote if no skip cert cached
-                        bundle.map_or(true, |b| b.skip.is_none())
-                    }
-                    UnsignedVote::Consensus_Simplex_FinalizeVote(_) => {
-                        // Only send finalize vote if no final cert cached
-                        bundle.map_or(true, |b| b.final_.is_none())
-                    }
-                }
-            })
-            .map(|(_, v)| v.clone())
-            .collect();
-
-        // Standstill detected - log summary
         self.standstill_triggers_counter.increment(1);
         self.health_counters.standstill_triggers.fetch_add(1, Ordering::Relaxed);
-        self.standstill_certs_rebroadcast_counter.increment(cert_count as u64);
-        self.standstill_votes_rebroadcast_counter.increment(votes_to_rebroadcast.len() as u64);
-
-        log::warn!(
-            "SimplexReceiver {}: Standstill detected, re-broadcasting {} certs + {} votes \
-            (range [{}, {}))",
-            self.session_id.to_hex_string(),
-            cert_count,
-            votes_to_rebroadcast.len(),
-            begin,
-            end
-        );
-
-        // Re-broadcast each vote in range (already signed, no loopback)
-        for vote in votes_to_rebroadcast {
-            self.send_vote_impl(vote, true /* is_rebroadcast */);
+        let (cert_count, vote_count, replaced_items) =
+            self.rebuild_standstill_replay_queue(begin, end);
+        if replaced_items > 0 {
+            log::trace!(
+                "SimplexReceiver {}: replaced {} pending standstill replay items with a fresh \
+                snapshot",
+                self.session_id.to_hex_string(),
+                replaced_items
+            );
         }
+
+        if let Some(listener) = self.listener.upgrade() {
+            listener.on_standstill_trigger(StandstillTriggerNotification {
+                begin,
+                end,
+                cert_count,
+                vote_count,
+            });
+        } else {
+            log::warn!(
+                "SimplexReceiver {}: Standstill detected, re-broadcasting {} certs + {} votes \
+                (range [{}, {}))",
+                self.session_id.to_hex_string(),
+                cert_count,
+                vote_count,
+                begin,
+                end
+            );
+        }
+        self.drain_standstill_replay_queue();
 
         // Reschedule standstill timer (reschedule after re-broadcast)
         self.reschedule_standstill();
@@ -2588,6 +3805,10 @@ impl ReceiverImpl {
     /// Sets `[begin, end)` range and removes votes outside this range.
     /// Reference: C++ pool.cpp tracked_slots_interval() = [first_non_finalized, current_window_end)
     fn set_standstill_slots_impl(&mut self, begin: u32, end: u32) {
+        if self.standstill_slot_begin == begin && self.standstill_slot_end == end {
+            return;
+        }
+
         log::trace!(
             "SimplexReceiver {}: set_standstill_slots [{}, {})",
             self.session_id.to_hex_string(),
@@ -2597,10 +3818,14 @@ impl ReceiverImpl {
 
         self.standstill_slot_begin = begin;
         self.standstill_slot_end = end;
+        self.standstill_replay_queue.clear();
 
         // Remove votes outside the range
         let old_count = self.our_votes.len();
         self.our_votes.retain(|(slot, _)| *slot >= begin && *slot < end);
+        if self.our_votes.len() != old_count {
+            self.rebuild_standstill_vote_keys();
+        }
         if self.our_votes.len() < old_count {
             log::trace!(
                 "SimplexReceiver {}: removed {} votes outside standstill range",
@@ -2704,6 +3929,17 @@ impl ReceiverImpl {
                 }
             }
         }
+    }
+
+    /// Mark a certificate kind as accepted by the FSM for receiver-side dedup.
+    fn notify_certificate_accepted_impl(&mut self, slot: u32, kind: StandstillCertificateType) {
+        log::trace!(
+            "SimplexReceiver {}: marking certificate accepted slot={} kind={:?}",
+            self.session_id.to_hex_string(),
+            slot,
+            kind
+        );
+        self.mark_certificate_kind_accepted(slot, kind);
     }
 
     /// Cache last finalization certificate for standstill replay
@@ -2890,6 +4126,17 @@ impl Drop for ReceiverImpl {
     }
 }
 
+/// TL constructor sniff (first 4 bytes) to detect a candidate-data broadcast
+fn is_candidate_payload(data: &BlockPayloadPtr) -> bool {
+    let bytes = data.data();
+    if bytes.len() < 4 {
+        return false;
+    }
+    let tag = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    tag == ton_api::ton::consensus::candidatedata::Block::constructor_const()
+        || tag == ton_api::ton::consensus::candidatedata::Empty::constructor_const()
+}
+
 /*
     OverlayListenerImpl - implementation of CatchainOverlayListener
 */
@@ -2904,6 +4151,11 @@ struct OverlayListenerImpl {
     in_messages_count: metrics::Counter,
     in_broadcasts_count: metrics::Counter,
     in_queries_count: metrics::Counter,
+    /// When true, candidate broadcasts on the consensus private overlay are dropped
+    /// (block-sync overlay carries candidates exclusively)
+    enable_observers: bool,
+    /// Counter for dropped candidate broadcasts on the consensus overlay
+    in_broadcasts_dropped_observers: metrics::Counter,
 }
 
 impl ConsensusOverlayLogReplayListener for OverlayListenerImpl {
@@ -2942,12 +4194,32 @@ impl ConsensusOverlayListener for OverlayListenerImpl {
         }));
     }
 
-    fn on_broadcast(&self, source_key_hash: PublicKeyHash, data: &BlockPayloadPtr) {
+    fn on_broadcast(
+        &self,
+        source_key_hash: PublicKeyHash,
+        data: &BlockPayloadPtr,
+        source: consensus_common::BroadcastSource,
+    ) {
         instrument!();
 
         self.in_broadcasts_count.increment(1);
         self.in_broadcasts_bytes.increment(data.data().len() as u64);
         self.in_bytes.increment(data.data().len() as u64);
+
+        // Drop candidates on the consensus overlay when block-sync is the canonical path
+        // (C++ ref: `private-overlay.cpp` early-return when `enable_observers`)
+        if self.enable_observers
+            && source == consensus_common::BroadcastSource::ConsensusOverlay
+            && is_candidate_payload(data)
+        {
+            self.in_broadcasts_dropped_observers.increment(1);
+            log::warn!(
+                "SimplexReceiver {}: dropping candidate broadcast from {} on consensus overlay",
+                self.session_id.to_hex_string(),
+                key_to_base64(&source_key_hash),
+            );
+            return;
+        }
 
         let source_key_hash = source_key_hash.clone();
         let data = data.clone();
@@ -2958,10 +4230,11 @@ impl ConsensusOverlayListener for OverlayListenerImpl {
                 .unwrap_or_else(|_| Duration::new(0, 0))
                 .as_millis();
             log::trace!(
-                "SimplexReceiver {}: on_broadcast, size={}, source={}, timestamp={}",
+                "SimplexReceiver {}: on_broadcast, size={}, source={}, overlay={:?}, timestamp={}",
                 self.session_id.to_hex_string(),
                 data.data().len(),
                 key_to_base64(&source_key_hash),
+                source,
                 elapsed
             );
         }
@@ -3059,6 +4332,27 @@ impl Receiver for ReceiverWrapper {
         }));
     }
 
+    fn set_ingress_slot_begin(&self, slot: u32) {
+        let slot = SlotIndex::new(slot);
+        self.task_queues.post_closure(Box::new(move |receiver: &mut ReceiverImpl| {
+            receiver.set_ingress_slot_begin_impl(slot);
+        }));
+    }
+
+    fn set_ingress_progress_slot(&self, slot: u32) {
+        let slot = SlotIndex::new(slot);
+        self.task_queues.post_closure(Box::new(move |receiver: &mut ReceiverImpl| {
+            receiver.set_ingress_progress_slot_impl(slot);
+        }));
+    }
+
+    fn cancel_candidate_requests_for_slot(&self, slot: u32) {
+        let slot = SlotIndex::new(slot);
+        self.task_queues.post_closure(Box::new(move |receiver: &mut ReceiverImpl| {
+            receiver.cancel_candidate_requests_for_slot_impl(slot);
+        }));
+    }
+
     fn cache_notarization_cert(&self, slot: u32, block_hash: UInt256, notar_cert_data: Vec<u8>) {
         let slot_idx = SlotIndex::new(slot);
         self.task_queues.post_closure(Box::new(move |receiver: &mut ReceiverImpl| {
@@ -3070,6 +4364,12 @@ impl Receiver for ReceiverWrapper {
         let slot_idx = SlotIndex::new(slot);
         self.task_queues.post_closure(Box::new(move |receiver: &mut ReceiverImpl| {
             receiver.request_candidate_impl(slot_idx, block_hash);
+        }));
+    }
+
+    fn start(&self) {
+        self.task_queues.post_closure(Box::new(move |receiver: &mut ReceiverImpl| {
+            receiver.start();
         }));
     }
 
@@ -3109,6 +4409,18 @@ impl Receiver for ReceiverWrapper {
         }));
     }
 
+    fn notify_certificate_accepted(&self, slot: u32, kind: StandstillCertificateType) {
+        self.task_queues.post_closure(Box::new(move |receiver: &mut ReceiverImpl| {
+            receiver.notify_certificate_accepted_impl(slot, kind);
+        }));
+    }
+
+    fn ban_source_for_bad_signature(&self, source_idx: u32) {
+        self.task_queues.post_closure(Box::new(move |receiver: &mut ReceiverImpl| {
+            receiver.ban_source_for_bad_signature_impl(source_idx);
+        }));
+    }
+
     fn cache_last_final_certificate(&self, slot: u32, cert_bytes: Vec<u8>) {
         self.task_queues.post_closure(Box::new(move |receiver: &mut ReceiverImpl| {
             receiver.cache_last_final_certificate_impl(slot, cert_bytes);
@@ -3145,18 +4457,30 @@ impl ReceiverWrapper {
     pub(crate) fn create(
         session_id: SessionId,
         shard: &ShardIdent,
-        max_candidate_size: usize,
-        max_candidate_query_answer_size: u64,
-        proto_version: u32,
         ids: &[SessionNode],
         local_key: &PrivateKey,
         overlay_manager: ConsensusOverlayManagerPtr,
         listener: ReceiverListenerPtr,
-        standstill_timeout: Duration,
         panicked_flag: Arc<AtomicBool>,
-        use_quic: bool,
         health_counters: Arc<ReceiverHealthCounters>,
+        settings: ReceiverSettings,
     ) -> Result<ReceiverPtr> {
+        // Destructure once at the top so the rest of the function reads as if
+        // each setting were still a free-standing parameter.
+        let ReceiverSettings {
+            max_candidate_size,
+            max_candidate_query_answer_size,
+            proto_version,
+            standstill_timeout,
+            standstill_max_egress_bytes_per_s,
+            bad_signature_ban_duration,
+            slots_per_leader_window,
+            max_leader_window_desync,
+            use_quic,
+            enable_observers,
+            candidate_resolve_config,
+            prometheus_labels,
+        } = settings;
         log::info!(
             "Creating SimplexReceiver for session {} (shard={}) with {} nodes",
             session_id.to_hex_string(),
@@ -3170,11 +4494,13 @@ impl ReceiverWrapper {
         // Compute overlay ID (must match C++ implementation)
         let (overlay_id, overlay_short_id) = Self::compute_overlay_id(&session_id, ids)?;
 
-        log::debug!(
-            "SimplexReceiver {}: overlay_id={}, overlay_short_id={}",
+        log::info!(
+            "SimplexReceiver {}: overlay_id={}, overlay_short_id={}, quic={}, blocksync_overlay={}",
             session_id.to_hex_string(),
             overlay_id.to_hex_string(),
-            overlay_short_id
+            overlay_short_id,
+            use_quic,
+            enable_observers,
         );
 
         // Create task queues
@@ -3213,6 +4539,9 @@ impl ReceiverWrapper {
             metrics_receiver.sink().register_counter(&"simplex_receiver_in_queries_count".into());
 
         // Create overlay listener
+        let in_broadcasts_dropped_observers = metrics_receiver
+            .sink()
+            .register_counter(&"simplex_receiver_in_broadcasts_dropped_observers".into());
         let overlay_listener = Arc::new(OverlayListenerImpl {
             session_id: session_id.clone(),
             task_queues: task_queues.clone(),
@@ -3223,6 +4552,8 @@ impl ReceiverWrapper {
             in_messages_count,
             in_broadcasts_count,
             in_queries_count,
+            enable_observers,
+            in_broadcasts_dropped_observers,
         });
 
         let overlay_data_listener: Arc<dyn ConsensusOverlayListener + Send + Sync> =
@@ -3242,6 +4573,8 @@ impl ReceiverWrapper {
         } else {
             consensus_common::OverlayTransportType::Simplex
         };
+        // Block-sync overlay params (including overlay_id) live on the
+        // validator-side ConsensusOverlayManagerImpl; simplex passes None.
         let overlay = overlay_manager.start_overlay(
             local_key,
             &overlay_short_id,
@@ -3249,6 +4582,7 @@ impl ReceiverWrapper {
             Arc::downgrade(&overlay_data_listener),
             Arc::downgrade(&overlay_replay_listener),
             transport_type,
+            None,
         )?;
 
         // Find local index
@@ -3304,6 +4638,8 @@ impl ReceiverWrapper {
         let out_messages_count_clone = out_messages_count.clone();
         let out_broadcasts_count_clone = out_broadcasts_count.clone();
         let health_counters_clone = health_counters.clone();
+        let prometheus_labels_clone = prometheus_labels;
+        let prometheus_shard_label = shard.to_string();
 
         // Start processing thread
         receiver_threads.start_thread(
@@ -3328,10 +4664,12 @@ impl ReceiverWrapper {
                     send_order,
                     last_shuffle_time: SystemTime::now(),
                     dedup_votes: HashMap::new(),
+                    accepted_certs: HashMap::new(),
                     shard: shard_clone,
                     max_candidate_size,
                     max_candidate_query_answer_size,
                     proto_version,
+                    candidate_resolve_config,
                     in_messages_bytes: in_messages_bytes_clone,
                     out_messages_bytes: out_messages_bytes_clone,
                     in_broadcasts_bytes: in_broadcasts_bytes_clone,
@@ -3342,17 +4680,29 @@ impl ReceiverWrapper {
                     out_broadcasts_count: out_broadcasts_count_clone,
                     _activity_node: activity_node.clone(),
                     standstill_timeout,
-                    standstill_alarm: Some(SystemTime::now() + standstill_timeout), // Initial scheduling
+                    standstill_max_egress_bytes_per_s,
+                    standstill_alarm: None, // Armed by Receiver::start() when session becomes current
                     standstill_slot_begin: STANDSTILL_INITIAL_SLOT_BEGIN,
                     standstill_slot_end: STANDSTILL_INITIAL_SLOT_END,
                     our_votes: Vec::new(),
+                    our_vote_keys: HashSet::new(),
+                    standstill_replay_queue: VecDeque::new(),
+                    standstill_egress_quota_bytes: 0.0,
+                    standstill_egress_quota_time: SystemTime::now(),
                     resolver_cache,
                     delayed_actions: Vec::new(),
                     pending_requests: HashMap::new(),
+                    candidate_query_rate_limiters: HashMap::new(),
+                    bad_signature_ban_state: BadSignatureBanState::new(
+                        bad_signature_ban_duration,
+                    ),
                     task_queues: task_queues_clone.clone(),
                     standstill_certs: HashMap::new(),
                     last_final_cert: None,
                     first_active_slot: 0,
+                    ingress_progress_slot: 0,
+                    slots_per_leader_window,
+                    max_leader_window_desync,
                     candidate_requests_counter: metrics_receiver_clone
                         .sink()
                         .register_counter(&"simplex_candidate_requests".into()),
@@ -3403,9 +4753,17 @@ impl ReceiverWrapper {
                 metrics_dumper.add_derivative_metric("simplex_standstill_votes_rebroadcast");
                 metrics_dumper.add_derivative_metric("simplex_standstill_certs_rebroadcast");
 
-                // Processing loop
+                // Processing loop.
+                //
+                // The first metric dump is intentionally pushed out by one full
+                // dump period so we never emit an all-zero snapshot at session
+                // start (overlay handshake, peer discovery, and bootstrap recovery
+                // are still in flight). Reporting that snapshot would trigger
+                // SIMPLEX_HEALTH `low_activity` warnings and pollute downstream
+                // monitors that read these dumps from the log stream.
                 let mut last_warn_dump_time = SystemTime::now();
-                let mut next_metrics_dump_time = SystemTime::now();
+                let mut next_metrics_dump_time =
+                    SystemTime::now() + Duration::from_millis(RECEIVER_METRICS_DUMP_PERIOD_MS);
                 let mut next_active_weight_time = SystemTime::now();
                 let loop_iterations_counter = metrics_receiver_clone
                     .sink()
@@ -3497,8 +4855,12 @@ impl ReceiverWrapper {
                         let active_weight =
                             receiver_impl.calculate_active_weight(ACTIVITY_THRESHOLD);
                         let last_activity = receiver_impl.get_last_activity();
+                        let snapshot = receiver_impl.build_activity_snapshot(
+                            active_weight,
+                            last_activity.clone(),
+                        );
                         if let Some(listener) = receiver_impl.listener.upgrade() {
-                            listener.on_activity(active_weight, last_activity);
+                            listener.on_activity(active_weight, last_activity, snapshot);
                         }
                         next_active_weight_time =
                             SystemTime::now() + ACTIVE_WEIGHT_RECOMPUTE_PERIOD;
@@ -3509,16 +4871,39 @@ impl ReceiverWrapper {
                         check_execution_time!(10_000);
                         metrics_dumper.update(&metrics_receiver_clone);
 
-                        if log::log_enabled!(log::Level::Debug) {
-                            let session_id_str = session_id_clone.to_hex_string();
-                            log::debug!("SimplexReceiver {} metrics:", &session_id_str);
+                        let session_id_str = session_id_clone.to_hex_string();
 
-                            metrics_dumper.dump(|string| {
-                                log::debug!("{}{}", session_id_str, string);
-                            });
+                        if log::log_enabled!(log::Level::Info) {
+                            log::info!("SimplexReceiver {} metrics:", &session_id_str);
+
+                            {
+                                check_execution_time!(5_000);
+                                metrics_dumper.dump(|string| {
+                                    log::info!("{}{}", session_id_str, string);
+                                });
+                            }
                         }
 
                         receiver_impl.debug_dump();
+
+                        // Republish the same receiver snapshot to the global
+                        // Prometheus recorder so it surfaces on the node's
+                        // `/metrics` endpoint. `.speed` derivative keys are
+                        // dropped on purpose; see `prometheus_publisher`
+                        // module docs for label semantics.
+                        {
+                            check_execution_time!(5_000);
+                            let session_id8 = &session_id_str
+                                [..8.min(session_id_str.len())];
+                            crate::prometheus_publisher::publish_snapshot(
+                                &metrics_dumper,
+                                prometheus_labels_clone,
+                                crate::prometheus_publisher::SessionIdentity {
+                                    shard: &prometheus_shard_label,
+                                    session_id8,
+                                },
+                            );
+                        }
 
                         next_metrics_dump_time = SystemTime::now()
                             + Duration::from_millis(RECEIVER_METRICS_DUMP_PERIOD_MS);
@@ -3555,10 +4940,17 @@ impl ReceiverWrapper {
         Ok(Arc::new(wrapper))
     }
 
+    /// Compute block-sync overlay short id from `session_id`
+    /// (C++ `block-sync-overlay.cpp:48-50`; seed excludes the node list,
+    /// so the short id differs from the consensus overlay's)
+    fn compute_block_sync_overlay_short_id(session_id: &SessionId) -> Result<PublicKeyHash> {
+        crate::utils::compute_block_sync_overlay_short_id(session_id)
+    }
+
     /// Compute overlay ID matching C++ consensus.overlayId
     ///
     /// CRITICAL: Must match C++ implementation exactly.
-    /// See: docs/ton-node-cpp-alpenglow/validator/consensus/private-overlay.cpp
+    /// See: ton-node-cpp/validator/consensus/private-overlay.cpp
     fn compute_overlay_id(
         session_id: &SessionId,
         nodes: &[SessionNode],
@@ -3607,3 +4999,74 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/test_slot_bounds.rs"]
 mod slot_bounds_tests;
+
+#[cfg(test)]
+mod payload_classifier_tests {
+    //! `is_candidate_payload` must match `consensus.block` / `consensus.empty` only;
+    //! other consensus TL (votes, certs) and truncated payloads must not match
+
+    use super::*;
+    use consensus_common::ConsensusCommonFactory;
+    use ton_api::ton::consensus::{
+        broadcastextra::BroadcastExtra,
+        candidatedata::{Block as ConsensusBlock, Empty as ConsensusEmpty},
+    };
+
+    fn serialize<T: ton_api::BareSerialize + ton_api::IntoBoxed>(obj: T) -> Vec<u8>
+    where
+        <T as ton_api::IntoBoxed>::Boxed: ton_api::BoxedSerialize,
+    {
+        ton_api::serialize_boxed(&obj.into_boxed()).unwrap()
+    }
+
+    #[test]
+    fn consensus_block_is_candidate() {
+        let block: ConsensusBlock = Default::default();
+        let bytes = serialize(block);
+        let payload = ConsensusCommonFactory::create_block_payload(bytes);
+        assert!(
+            is_candidate_payload(&payload),
+            "consensus.block must be classified as a candidate"
+        );
+    }
+
+    #[test]
+    fn consensus_empty_is_candidate() {
+        let empty: ConsensusEmpty = Default::default();
+        let bytes = serialize(empty);
+        let payload = ConsensusCommonFactory::create_block_payload(bytes);
+        assert!(
+            is_candidate_payload(&payload),
+            "consensus.empty must be classified as a candidate"
+        );
+    }
+
+    #[test]
+    fn broadcast_extra_is_not_candidate() {
+        // broadcastExtra is the envelope, not a candidate
+        let extra: BroadcastExtra = Default::default();
+        let bytes = serialize(extra);
+        let payload = ConsensusCommonFactory::create_block_payload(bytes);
+        assert!(!is_candidate_payload(&payload));
+    }
+
+    #[test]
+    fn empty_payload_is_not_candidate() {
+        let payload = ConsensusCommonFactory::create_block_payload(Vec::new());
+        assert!(!is_candidate_payload(&payload));
+    }
+
+    #[test]
+    fn truncated_payload_is_not_candidate() {
+        // Less than 4 bytes => no constructor tag to read
+        let payload = ConsensusCommonFactory::create_block_payload(vec![0x12, 0x22, 0x79]);
+        assert!(!is_candidate_payload(&payload));
+    }
+
+    #[test]
+    fn random_4_bytes_is_not_candidate() {
+        // Some random 4-byte tag that isn't either constructor
+        let payload = ConsensusCommonFactory::create_block_payload(vec![0xde, 0xad, 0xbe, 0xef]);
+        assert!(!is_candidate_payload(&payload));
+    }
+}

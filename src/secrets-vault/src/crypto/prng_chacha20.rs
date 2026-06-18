@@ -10,22 +10,22 @@ use crate::crypto::prng::Prng;
 use rand_chacha::rand_core::{RngCore, SeedableRng};
 use std::sync::LazyLock;
 
-static SECURE_RNG: LazyLock<anyhow::Result<tokio::sync::Mutex<rand_chacha::ChaCha20Rng>>> =
+static SECURE_RNG: LazyLock<anyhow::Result<std::sync::Mutex<rand_chacha::ChaCha20Rng>>> =
     LazyLock::new(|| {
         rand_chacha::ChaCha20Rng::try_from_os_rng()
-            .map(tokio::sync::Mutex::new)
+            .map(std::sync::Mutex::new)
             .map_err(|e| anyhow::anyhow!("Failed to initialize RNG: {}", e))
     });
 
 pub struct PrngChacha20 {}
 
-#[async_trait::async_trait]
 impl Prng for PrngChacha20 {
-    async fn fill_random(&self, dest: &mut [u8]) -> anyhow::Result<()> {
+    fn fill_random(&self, dest: &mut [u8]) -> anyhow::Result<()> {
         let rng_mutex = SECURE_RNG.as_ref().or_else(|e| anyhow::bail!(e))?;
 
         {
-            let mut rng = rng_mutex.lock().await;
+            let mut rng =
+                rng_mutex.lock().map_err(|e| anyhow::anyhow!("RNG lock poisoned: {e}"))?;
             rng.fill_bytes(dest);
         }
 

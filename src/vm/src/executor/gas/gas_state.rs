@@ -180,12 +180,11 @@ impl Gas {
         self.use_gas(TUPLE_ENTRY_GAS_PRICE * tuple_length as i64)
     }
 
-    pub const fn check_signature_price(count: usize) -> i64 {
-        if count > CHECK_SIGNATURE_THRESHOLD {
-            CHECK_SIGNATURE_GAS_PRICE
-        } else {
-            0
-        }
+    pub const fn check_signature_threshold() -> usize {
+        CHECK_SIGNATURE_THRESHOLD
+    }
+    pub const fn check_signature_price() -> i64 {
+        CHECK_SIGNATURE_GAS_PRICE
     }
 
     pub const fn check_p256_signature_price() -> i64 {

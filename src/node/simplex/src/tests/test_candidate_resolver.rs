@@ -15,12 +15,15 @@ use crate::{
     block::{SlotIndex, ValidatorIndex},
     SessionId, SessionNode,
 };
-use std::time::{Duration, SystemTime};
+use std::{
+    collections::HashMap,
+    time::{Duration, SystemTime},
+};
 use ton_api::{
     ton::{consensus::overlayid::OverlayId, pub_::publickey::Overlay},
     IntoBoxed,
 };
-use ton_block::{Ed25519KeyOption, KeyId, UInt256};
+use ton_block::{Ed25519KeyOption, KeyId, UInt256, ZeroizingBytes};
 
 #[test]
 fn test_candidate_resolver_cache_new() {
@@ -173,8 +176,9 @@ fn test_receiver_compute_overlay_id_matches_cpp_private_overlay() {
 
     let session_id: SessionId = UInt256::rand();
 
-    let keys: Vec<_> =
-        (0..4).map(|_| Ed25519KeyOption::generate().expect("failed to generate key")).collect();
+    let keys: Vec<_> = (0..4)
+        .map(|_| Ed25519KeyOption::<ZeroizingBytes>::generate().expect("failed to generate key"))
+        .collect();
 
     let nodes: Vec<SessionNode> = keys
         .iter()
@@ -237,9 +241,15 @@ fn test_merge_candidate_response_parts_body_then_notar_completes_merge() {
         start_time: SystemTime::now(),
         retry_count: 0,
         current_timeout: Duration::from_millis(500),
+        attempt_id: 0,
+        in_flight: false,
+        in_flight_want_candidate: false,
+        in_flight_want_notar: false,
         source_idx: ValidatorIndex::new(0),
         cached_notar: None,
         cached_candidate: None,
+        giveup_reports: 0,
+        peer_retry_not_before: HashMap::new(),
     };
 
     // First partial response: candidate body only -> notar remains missing.
@@ -288,9 +298,15 @@ fn test_merge_candidate_response_parts_uses_locally_cached_notar() {
         start_time: SystemTime::now(),
         retry_count: 0,
         current_timeout: Duration::from_millis(500),
+        attempt_id: 0,
+        in_flight: false,
+        in_flight_want_candidate: false,
+        in_flight_want_notar: false,
         source_idx: ValidatorIndex::new(1),
         cached_notar: None,
         cached_candidate: None,
+        giveup_reports: 0,
+        peer_retry_not_before: HashMap::new(),
     };
 
     // No notar in this response, but resolver cache already has one.
@@ -307,4 +323,143 @@ fn test_merge_candidate_response_parts_uses_locally_cached_notar() {
         merged_notar, cached_notar,
         "candidate-only response should complete when notar already exists in local cache"
     );
+}
+
+#[test]
+fn test_merge_candidate_response_parts_notar_then_body_completes_merge() {
+    let slot = SlotIndex::new(99);
+    let block_hash = UInt256::rand();
+    let candidate_bytes = vec![5, 4, 3, 2, 1];
+    let notar_bytes = vec![9, 9, 9];
+
+    let mut cache = super::CandidateResolverCache::new();
+    let mut state = super::CandidateRequestState {
+        start_time: SystemTime::now(),
+        retry_count: 0,
+        current_timeout: Duration::from_millis(500),
+        attempt_id: 0,
+        in_flight: false,
+        in_flight_want_candidate: false,
+        in_flight_want_notar: false,
+        source_idx: ValidatorIndex::new(1),
+        cached_notar: None,
+        cached_candidate: None,
+        giveup_reports: 0,
+        peer_retry_not_before: HashMap::new(),
+    };
+
+    // First partial response: notar only.
+    let (merged_candidate_1, merged_notar_1) = super::ReceiverImpl::merge_candidate_response_parts(
+        &mut cache,
+        Some(&mut state),
+        slot,
+        &block_hash,
+        &[],
+        &notar_bytes,
+    );
+    assert!(
+        merged_candidate_1.is_empty(),
+        "notar-only partial response must not be considered complete"
+    );
+    assert_eq!(merged_notar_1, notar_bytes);
+
+    // Second partial response: candidate only, merged result should include cached notar.
+    let (merged_candidate_2, merged_notar_2) = super::ReceiverImpl::merge_candidate_response_parts(
+        &mut cache,
+        Some(&mut state),
+        slot,
+        &block_hash,
+        &candidate_bytes,
+        &[],
+    );
+    assert_eq!(merged_candidate_2, candidate_bytes);
+    assert_eq!(merged_notar_2, notar_bytes);
+}
+
+#[test]
+fn test_sliding_window_rate_limiter_enforces_window_limit() {
+    let mut limiter = super::SlidingWindowRateLimiter::default();
+    let window = Duration::from_secs(1);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+
+    assert!(limiter.allow(now, window, 2));
+    assert!(limiter.allow(now, window, 2));
+    assert!(!limiter.allow(now, window, 2));
+    assert!(limiter.allow(now + Duration::from_millis(1_001), window, 2));
+    assert!(!limiter.allow(now + Duration::from_millis(1_001), window, 0));
+}
+
+// ============================================================================
+// TN-1034 / NODE-75: BadSignatureBanState (temporary peer ban) tests
+// ============================================================================
+//
+// C++ parity: PoolImpl::bad_signature_bans_ in pool.cpp arms a ban for
+// `params_.bad_signature_ban_duration` whenever a peer sends a bad
+// vote/certificate signature; subsequent traffic from that peer is dropped
+// until the ban expires.
+
+/// A freshly constructed ban state must not consider any source banned.
+#[test]
+fn test_bad_signature_ban_state_starts_empty() {
+    let mut state = super::BadSignatureBanState::new(Duration::from_secs(5));
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+
+    assert!(!state.is_banned(0, now));
+    assert!(!state.is_banned(7, now));
+    assert_eq!(state.active_bans(), 0);
+}
+
+/// `record()` must arm a ban that is active until `now + duration` and then
+/// auto-expires.
+#[test]
+fn test_bad_signature_ban_state_record_and_expire() {
+    let duration = Duration::from_secs(5);
+    let mut state = super::BadSignatureBanState::new(duration);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+
+    state.record(3, now);
+
+    assert!(state.is_banned(3, now), "source must be banned immediately after record()");
+    assert!(state.is_banned(3, now + duration / 2), "source must remain banned mid-window");
+
+    let expired_at = now + duration + Duration::from_millis(1);
+    assert!(!state.is_banned(3, expired_at), "ban must lift at expiry");
+    assert_eq!(
+        state.active_bans(),
+        0,
+        "expired ban entries must be evicted by is_banned() so the map stays bounded"
+    );
+}
+
+/// Re-recording extends the existing ban window without producing duplicate
+/// entries (parity with C++ `bad_signature_bans_[peer] = ts::in(duration)`).
+#[test]
+fn test_bad_signature_ban_state_record_refreshes_existing_entry() {
+    let duration = Duration::from_secs(5);
+    let mut state = super::BadSignatureBanState::new(duration);
+    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+
+    state.record(2, t0);
+    let t1 = t0 + Duration::from_secs(3);
+    state.record(2, t1);
+
+    assert_eq!(state.active_bans(), 1, "second record() must not create a new entry");
+    let after_first_expiry = t0 + duration + Duration::from_millis(1);
+    assert!(
+        state.is_banned(2, after_first_expiry),
+        "refreshed ban must extend past the original expiry"
+    );
+}
+
+/// Bans are scoped per source — banning one source must not affect others.
+#[test]
+fn test_bad_signature_ban_state_is_per_source() {
+    let mut state = super::BadSignatureBanState::new(Duration::from_secs(5));
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+
+    state.record(4, now);
+
+    assert!(state.is_banned(4, now));
+    assert!(!state.is_banned(5, now));
+    assert!(!state.is_banned(0, now));
 }

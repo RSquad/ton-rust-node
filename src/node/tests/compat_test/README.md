@@ -38,7 +38,10 @@ compat_test/
 │   ├── test_twostep_fec_relay.rs     # TwostepFec broadcast relay (6-node topology)
 │   ├── test_quic_transport.rs        # QUIC transport: raw queries, large messages, TLS
 │   ├── test_quic_overlay.rs          # QUIC overlay: messages and queries via QUIC
-│   └── test_quic_private_overlay.rs  # QUIC private overlay: ADNL vs QUIC transport
+│   ├── test_quic_private_overlay.rs  # QUIC private overlay: ADNL vs QUIC transport
+│   ├── test_raptorq.rs              # RaptorQ FEC codec cross-implementation tests
+│   ├── test_block_sync_overlay_id.rs # consensus.blockSyncOverlayId wire compat
+│   └── test_simplex_config_v2_wire.rs # simplex_config_v2 flag-byte layout compat
 └── build/                 # Build artifacts (gitignored)
     └── cpp/               # C++ binary output
 ```
@@ -80,6 +83,7 @@ CPP_SRC_PATH=/path/to/ton-cpp-testnet make build
 make clean
 ```
 
+
 ## Compatibility Status
 
 | Test Suite | Tests | Pass | Ignored | Status |
@@ -97,7 +101,10 @@ make clean
 | `test_quic_transport` | 3 | 3 | 0 | Compatible |
 | `test_quic_overlay` | 4 | 4 | 0 | Compatible |
 | `test_quic_private_overlay` | 5 | 5 | 0 | Compatible |
-| **Total** | **53** | **52** | **1** | |
+| `test_raptorq` | 14 | 14 | 0 | Compatible |
+| `test_block_sync_overlay_id` | 3 | 3 | 0 | Compatible |
+| `test_simplex_config_v2_wire` | 2 | 2 | 0 | Compatible |
+| **Total** | **71** | **70** | **1** | |
 
 ## Test Suites
 
@@ -205,6 +212,39 @@ Both RLDP v1 and v2, both directions, three payload sizes:
 - QUIC overlay query (Rust → C++)
 - Private overlay message (C++ → Rust, with receipt verification)
 
+### 14. RaptorQ FEC Codec (`test_raptorq`)
+Cross-implementation RaptorQ encode/decode — symbols produced by one side are fed to the other's decoder. No networking involved; the C++ test node exposes `raptorq_encode`/`raptorq_decode` commands that operate on raw data:
+
+| Test | Direction | Payload | Scenario | Result |
+|------|-----------|---------|----------|--------|
+| `test_rust_encode_cpp_decode_small` | Rust → C++ | 500 B | Source-only | PASS |
+| `test_rust_encode_cpp_decode_medium` | Rust → C++ | 10 KB | With repair symbols | PASS |
+| `test_rust_encode_cpp_decode_large` | Rust → C++ | 100 KB | Large payload | PASS |
+| `test_cpp_encode_rust_decode_small` | C++ → Rust | 500 B | Source-only | PASS |
+| `test_cpp_encode_rust_decode_medium` | C++ → Rust | 10 KB | With repair symbols | PASS |
+| `test_cpp_encode_rust_decode_large` | C++ → Rust | 100 KB | Large payload | PASS |
+| `test_rust_encode_cpp_decode_with_loss` | Rust → C++ | 10 KB | 2 source symbols dropped, repaired | PASS |
+| `test_cpp_encode_rust_decode_with_loss` | C++ → Rust | 10 KB | 2 source symbols dropped, repaired | PASS |
+| `test_params_match` | Both | 9 sizes | Parameters identical (100B–100KB) | PASS |
+| `test_source_symbols_identical` | Both | 3 sizes | Source symbols byte-identical | PASS |
+| `test_4mb_rust_encode_cpp_decode` | Rust → C++ | 4 MB | 4/8/16/32/64 symbols (>=64KB each), SHA-256 verified | PASS |
+| `test_4mb_cpp_encode_rust_decode` | C++ → Rust | 4 MB | 4/8/16/32/64 symbols (>=64KB each), SHA-256 verified | PASS |
+| `test_4mb_large_symbol_params_match` | Both | 4 MB | Parameters identical for all 5 symbol counts | PASS |
+| `test_4mb_large_symbol_source_identical` | Both | 4 MB | Source symbols byte-identical for all 5 symbol counts | PASS |
+
+### 15. Block-Sync Overlay ID (`test_block_sync_overlay_id`)
+Wire-format test for the `consensus.blockSyncOverlayId` TL type:
+- Boxed seed bytes for `consensus.blockSyncOverlayId{session_id}` are byte-equal between Rust and C++ (constructor `0x9d792212` + 32-byte session_id).
+- The derived `OverlayIdShort` (SHA256 of `pub.overlay{name = seed}`) matches.
+- The block-sync overlay short-id is distinct from the legacy `consensus.overlayId` short-id for the same `session_id` (so the two overlays don't collide).
+
+### 16. SimplexConfig v2 Wire (`test_simplex_config_v2_wire`)
+Bit-layout test for the v2 flag byte. The flag byte goes from `flags:(## 7) use_quic:Bool` to `flags:(## 6) enable_observers:Bool use_quic:Bool`. Both directions are exercised across all 4 `(enable_observers, use_quic)` combinations:
+- Rust-built `simplex_config_v2#22` cells unpack on C++ to the same field values.
+- C++-built cells deserialize on Rust to the same field values.
+
+Catches silent bit-order mistakes that single-implementation tests can't see.
+
 ## Environment Variables
 
 | Variable | Description | Required |
@@ -236,6 +276,8 @@ The C++ test node (`compat_test_node`) communicates via JSON over stdin/stdout:
 {"cmd": "enable_quic"}
 {"cmd": "send_quic_message", "peer_adnl_id": "HEX", "data": "BASE64"}
 {"cmd": "send_quic_query", "peer_adnl_id": "HEX", "data": "BASE64", "timeout_ms": 5000}
+{"cmd": "raptorq_encode", "data": "BASE64", "symbol_size": 768, "repair_count": 2}
+{"cmd": "raptorq_decode", "data_size": 10000, "symbol_size": 768, "symbols_count": 14, "symbols": [{"id": 0, "data": "BASE64"}, ...]}
 {"cmd": "shutdown"}
 
 // Responses:
@@ -259,6 +301,7 @@ Tests use different port ranges to avoid conflicts:
 - `test_quic_transport`: 18000-18099
 - `test_quic_overlay`: 18100-18199
 - `test_quic_private_overlay`: 18200-18299
+- `test_raptorq`: 19000-19099
 
 ## Troubleshooting
 
@@ -268,7 +311,7 @@ Tests use different port ranges to avoid conflicts:
 - Verify C++20 compiler support
 
 ### Tests Timeout
-- Ensure no firewall blocks UDP ports 14000-19000 on localhost
+- Ensure no firewall blocks UDP ports 14000-20000 on localhost
 - Check that no other processes use the same ports
 - Try increasing sleep durations in tests if running on slow hardware
 

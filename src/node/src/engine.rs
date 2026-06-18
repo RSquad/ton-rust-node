@@ -15,6 +15,7 @@ use crate::{
     config::{
         CollatorConfig, CollatorTestBundlesGeneralConfig, TonNodeConfig, ValidatorManagerConfig,
     },
+    confirmed_blocks::{ConfirmedBlockEvent, ConfirmedBlockEvents, ConfirmedBlockSource},
     engine_traits::{EngineAlloc, EngineOperations, PrivateOverlayOperations},
     ext_messages::MessagesPool,
     full_node::{
@@ -62,7 +63,7 @@ use catchain::SessionId;
 #[cfg(feature = "telemetry")]
 use std::fmt::Write;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     ops::Deref,
     path::Path,
     sync::{
@@ -71,13 +72,13 @@ use std::{
     },
     time::Duration,
 };
-use storage::{block_handle_db::BlockHandle, StorageAlloc};
 #[cfg(feature = "telemetry")]
-use storage::{types::StoredCell, StorageTelemetry};
+use storage::StorageTelemetry;
+use storage::{block_handle_db::BlockHandle, StorageAlloc};
 use ton_api::ton::ton_node::broadcast::NewShardBlockBroadcast;
 use ton_block::{
-    error, fail, BlockIdExt, Cell, ConfigParams, OutMsgQueue, Result, ShardIdent, UInt256,
-    UnixTime, SHARD_FULL,
+    error, fail, time_checker, BlockIdExt, Cell, ConfigParams, OutMsgQueue, Result, ShardIdent,
+    UInt256, UnixTime, SHARD_FULL,
 };
 
 #[cfg(test)]
@@ -89,7 +90,7 @@ struct StorageDictInfo {
     size: u64,
 }
 
-pub type SplitQueues = Option<(OutMsgQueue, OutMsgQueue, HashSet<UInt256>)>;
+pub type SplitQueues = Option<(OutMsgQueue, OutMsgQueue, ahash::AHashSet<UInt256>)>;
 pub struct Engine {
     db: Arc<InternalDb>,
     candidate_db: CandidateDbPool,
@@ -101,6 +102,7 @@ pub struct Engine {
     next_block_applying_awaiters: AwaitersPool<BlockIdExt, BlockIdExt>,
     download_block_awaiters: AwaitersPool<BlockIdExt, (BlockStuff, BlockProofStuff)>,
     external_messages: Arc<MessagesPool>,
+    confirmed_block_events: ConfirmedBlockEvents,
 
     servers: lockfree::queue::Queue<Box<dyn Stoppable>>,
     stopper: Arc<Stopper>,
@@ -113,6 +115,7 @@ pub struct Engine {
     shard_blocks: ShardBlocksPool,
     candidates_cache: parking_lot::Mutex<lru::LruCache<BlockIdExt, Arc<Vec<u8>>>>,
     last_applied_mc_block_seqno: AtomicU32,
+    last_applied_mc_block_utime: AtomicU32,
     last_known_mc_block_seqno: AtomicU32,
     last_known_keyblock_seqno: AtomicU32,
     will_validate: AtomicBool,
@@ -174,7 +177,7 @@ impl<T> DownloadContext<'_, T> {
             if self.engine.check_stop() {
                 fail!("{} id: {}, stop flag was set", self.name, self.id);
             }
-            match self.downloader.try_download(self).await {
+            match self.downloader.try_download(self, attempt).await {
                 Err(e) => self.log(e.to_string().as_str(), attempt),
                 Ok(ret) => break Ok(ret),
             }
@@ -205,10 +208,23 @@ impl<T> DownloadContext<'_, T> {
     }
 }
 
+// Switch to fan-out prepare after the first unsuccessful attempt for both
+// download_block_full and the "stale" branch of download_next_block_full.
+const FAN_OUT_AFTER_ATTEMPT: u32 = 1;
+// For download_next_block_full when our last applied MC block is fresh
+// (network is healthy), avoid fan-out until we've already failed 10 times.
+const FAN_OUT_AFTER_ATTEMPT_FRESH: u32 = 10;
+// MC block is considered "stale" if gen_utime is older than this many seconds.
+const MC_BLOCK_STALE_THRESHOLD_SECS: u32 = 10;
+
 #[async_trait::async_trait]
 trait Downloader: Send + Sync {
     type Item;
-    async fn try_download(&self, context: &DownloadContext<'_, Self::Item>) -> Result<Self::Item>;
+    async fn try_download(
+        &self,
+        context: &DownloadContext<'_, Self::Item>,
+        attempt: u32,
+    ) -> Result<Self::Item>;
 }
 
 struct BlockDownloader;
@@ -216,7 +232,11 @@ struct BlockDownloader;
 #[async_trait::async_trait]
 impl Downloader for BlockDownloader {
     type Item = (BlockStuff, BlockProofStuff);
-    async fn try_download(&self, context: &DownloadContext<'_, Self::Item>) -> Result<Self::Item> {
+    async fn try_download(
+        &self,
+        context: &DownloadContext<'_, Self::Item>,
+        attempt: u32,
+    ) -> Result<Self::Item> {
         if let Some(handle) = context.engine.db.load_block_handle(context.id)? {
             let mut is_link = false;
             if handle.has_data() && handle.has_proof_or_link(&mut is_link) {
@@ -256,7 +276,8 @@ impl Downloader for BlockDownloader {
         }
         #[cfg(feature = "telemetry")]
         context.engine.full_node_telemetry.new_downloading_block_attempt(context.id);
-        let ret = context.client.download_block_full(context.id).await;
+        let fan_out_prepare = attempt > FAN_OUT_AFTER_ATTEMPT;
+        let ret = context.client.download_block_full(context.id, fan_out_prepare).await;
         #[cfg(feature = "telemetry")]
         if ret.is_ok() {
             context.engine.full_node_telemetry.new_downloaded_block(context.id);
@@ -273,7 +294,11 @@ struct BlockProofDownloader {
 #[async_trait::async_trait]
 impl Downloader for BlockProofDownloader {
     type Item = BlockProofStuff;
-    async fn try_download(&self, context: &DownloadContext<'_, Self::Item>) -> Result<Self::Item> {
+    async fn try_download(
+        &self,
+        context: &DownloadContext<'_, Self::Item>,
+        _attempt: u32,
+    ) -> Result<Self::Item> {
         if let Some(handle) = context.engine.db.load_block_handle(context.id)? {
             let mut is_link = false;
             if handle.has_proof_or_link(&mut is_link) {
@@ -289,7 +314,11 @@ struct NextBlockDownloader;
 #[async_trait::async_trait]
 impl Downloader for NextBlockDownloader {
     type Item = (BlockStuff, BlockProofStuff);
-    async fn try_download(&self, context: &DownloadContext<'_, Self::Item>) -> Result<Self::Item> {
+    async fn try_download(
+        &self,
+        context: &DownloadContext<'_, Self::Item>,
+        attempt: u32,
+    ) -> Result<Self::Item> {
         if let Some(prev_handle) = context.engine.db.load_block_handle(context.id)? {
             if prev_handle.has_next1() {
                 let next_id = context.engine.db.load_block_next1(context.id)?;
@@ -304,7 +333,18 @@ impl Downloader for NextBlockDownloader {
                 }
             }
         }
-        context.client.download_next_block_full(context.id).await
+        // If we're trailing the network, peers are likely behind us too and the
+        // single-peer probe often hits a node that doesn't have the next block
+        // yet. Switch to fan-out earlier (after attempt 1) in that case.
+        let last_mc_utime = context.engine.get_last_applied_mc_utime();
+        let mc_age = (UnixTime::now() as u32).saturating_sub(last_mc_utime);
+        let threshold = if mc_age > MC_BLOCK_STALE_THRESHOLD_SECS {
+            FAN_OUT_AFTER_ATTEMPT
+        } else {
+            FAN_OUT_AFTER_ATTEMPT_FRESH
+        };
+        let fan_out_prepare = attempt > threshold;
+        context.client.download_next_block_full(context.id, fan_out_prepare).await
     }
 }
 
@@ -313,7 +353,11 @@ struct ZeroStateDownloader;
 #[async_trait::async_trait]
 impl Downloader for ZeroStateDownloader {
     type Item = (Arc<ShardStateStuff>, Vec<u8>);
-    async fn try_download(&self, context: &DownloadContext<'_, Self::Item>) -> Result<Self::Item> {
+    async fn try_download(
+        &self,
+        context: &DownloadContext<'_, Self::Item>,
+        _attempt: u32,
+    ) -> Result<Self::Item> {
         if let Some(handle) = context.engine.db.load_block_handle(context.id)? {
             if handle.has_state() {
                 let zs = context.engine.db.load_shard_state_dynamic(context.id)?;
@@ -475,6 +519,7 @@ impl Engine {
             is_broken: Option<&AtomicBool>,
             stopper: &Arc<Stopper>,
             monitor_min_split: Arc<AtomicU8>,
+            truncate_db: Option<u32>,
             #[cfg(feature = "telemetry")] telemetry: Arc<EngineTelemetry>,
             allocated: Arc<EngineAlloc>,
         ) -> Result<Arc<InternalDb>> {
@@ -489,6 +534,7 @@ impl Engine {
                 restore_db_enabled,
                 force_check_db,
                 true,
+                truncate_db,
                 &check_stop,
                 is_broken,
                 monitor_min_split,
@@ -515,6 +561,7 @@ impl Engine {
             validator_adnl_keys: Arc::new(AtomicU64::new(0)),
             validator_peers: Arc::new(AtomicU64::new(0)),
             validator_sets: Arc::new(AtomicU64::new(0)),
+            account_state_cache_bytes: Arc::new(AtomicU64::new(0)),
         });
 
         let archives_life_time_hours = general_config.gc_archives_life_time_hours();
@@ -525,6 +572,8 @@ impl Engine {
         };
         let enable_shard_state_persistent_gc = general_config.enable_shard_state_persistent_gc();
         let skip_saving_persistent_states = general_config.skip_saving_persistent_states();
+        let pss_cells_cache_max_count = general_config.pss_cells_cache_max_count();
+        let pss_prev_part_max_size = general_config.pss_prev_part_max_size();
         let states_cache_mode = general_config.states_cache_mode();
         let restore_db = general_config.restore_db();
 
@@ -583,6 +632,7 @@ impl Engine {
             },
             &stopper,
             monitor_min_split.clone(),
+            flags.truncate_db,
             #[cfg(feature = "telemetry")]
             engine_telemetry.clone(),
             engine_allocated.clone(),
@@ -648,6 +698,8 @@ impl Engine {
             db.clone(),
             enable_shard_state_persistent_gc,
             skip_saving_persistent_states,
+            pss_cells_cache_max_count,
+            pss_prev_part_max_size,
             states_cache_mode,
             cells_lifetime_sec,
             stopper.clone(),
@@ -660,6 +712,8 @@ impl Engine {
         log::info!("Engine is created.");
 
         let now = UnixTime::now() as u32;
+        let (ext_messages_pool, applied_blocks_rx) =
+            MessagesPool::new(now, external_messages_maximum_queue_length);
         let candidate_db = CandidateDbPool::with_path(db.db_root_dir()?);
         let engine = Arc::new(Engine {
             db,
@@ -688,10 +742,8 @@ impl Engine {
                 engine_telemetry.clone(),
                 engine_allocated.clone(),
             ),
-            external_messages: Arc::new(MessagesPool::new(
-                now,
-                external_messages_maximum_queue_length,
-            )),
+            external_messages: Arc::new(ext_messages_pool),
+            confirmed_block_events: ConfirmedBlockEvents::new(),
 
             servers: lockfree::queue::Queue::new(),
             stopper,
@@ -707,6 +759,7 @@ impl Engine {
                 Self::CANDIDATES_CACHE_SIZE.try_into()?,
             )),
             last_applied_mc_block_seqno: AtomicU32::new(0),
+            last_applied_mc_block_utime: AtomicU32::new(0),
             last_known_mc_block_seqno: AtomicU32::new(0),
             last_known_keyblock_seqno: AtomicU32::new(0),
             will_validate: AtomicBool::new(false),
@@ -745,6 +798,7 @@ impl Engine {
 
         engine.acquire_stop(Self::MASK_SERVICE_SHARDSTATE_GC);
         save_top_shard_blocks_worker(engine.clone(), shard_blocks_receiver);
+        engine.external_messages().clone().start_applied_blocks_worker(applied_blocks_rx);
         Ok(engine)
     }
 
@@ -755,6 +809,14 @@ impl Engine {
 
     pub fn get_last_applied_mc_seqno(&self) -> u32 {
         self.last_applied_mc_block_seqno.load(Ordering::Relaxed)
+    }
+
+    pub fn get_last_applied_mc_utime(&self) -> u32 {
+        self.last_applied_mc_block_utime.load(Ordering::Relaxed)
+    }
+
+    pub fn confirmed_block_events(&self) -> ConfirmedBlockEvents {
+        self.confirmed_block_events.clone()
     }
 
     pub fn set_sync_status(&self, status: u32) {
@@ -1069,11 +1131,19 @@ impl Engine {
                 }
                 let mut is_link = false;
                 if handle.has_data() && handle.has_proof_or_link(&mut is_link) {
+                    log::debug!(
+                        "download_and_apply_block_worker: block {} has data+proof, entering \
+                        apply awaiter loop (pre_apply: {}, applied: {}, has_state: {})",
+                        id,
+                        pre_apply,
+                        handle.is_applied(),
+                        handle.has_state()
+                    );
                     while !((pre_apply && handle.has_state()) || handle.is_applied()) {
                         let s = self.clone();
                         let res = self
                             .block_applying_awaiters()
-                            .do_or_wait(handle.id(), None, async {
+                            .do_or_wait(handle.id(), Some(10_000), async {
                                 let block = s.load_block(&handle).await?;
                                 s.apply_block_worker(
                                     &handle,
@@ -1143,7 +1213,7 @@ impl Engine {
                 let handle = handle.to_non_created().ok_or_else(|| {
                     error!("INTERNAL ERROR: bad result for store block {} proof", id)
                 })?;
-                log::trace!(
+                log::debug!(
                     "Downloaded block for {}apply {} TIME download: {}ms, check & save: {}",
                     if pre_apply { "pre-" } else { "" },
                     block.id(),
@@ -1200,6 +1270,7 @@ impl Engine {
         let gen_utime = block.gen_utime()?;
         let ago = UnixTime::now() as i32 - gen_utime as i32;
         self.save_last_applied_mc_block_id(block.id())?;
+        self.last_applied_mc_block_utime.store(gen_utime, Ordering::Relaxed);
         metrics::gauge!("ton_node_engine_last_mc_block_seqno").set(block.id().seq_no() as f64);
         metrics::gauge!("ton_node_engine_timediff_seconds").set(ago as f64);
         metrics::gauge!("ton_node_engine_last_mc_block_utime").set(gen_utime as f64);
@@ -1261,6 +1332,23 @@ impl Engine {
         )
         .await?;
 
+        if !id.shard().is_masterchain() {
+            let source = if pre_apply {
+                ConfirmedBlockSource::PRE_APPLIED
+            } else {
+                ConfirmedBlockSource::APPLIED
+            };
+            self.confirmed_block_events.notify(ConfirmedBlockEvent {
+                id: id.clone(),
+                data: block.data_arc(),
+                source,
+            });
+        }
+
+        if !pre_apply {
+            self.external_messages().push_applied_block(Arc::new(block.clone()));
+        }
+
         let gen_utime = block.gen_utime()?;
         let ago = UnixTime::now() as i32 - gen_utime as i32;
         let mut transactions = 0;
@@ -1278,6 +1366,7 @@ impl Engine {
                         log::error!("Can't save last applied mc block {}: {}", block.id(), e);
                     }
                 }
+                self.last_applied_mc_block_utime.store(gen_utime, Ordering::Relaxed);
                 metrics::gauge!("ton_node_engine_last_mc_block_seqno")
                     .set(block.id().seq_no() as f64);
                 metrics::gauge!("ton_node_engine_timediff_seconds").set(ago as f64);
@@ -1454,20 +1543,13 @@ impl Engine {
             file_entries: create_metric("Alloc NODE file entries"),
             handles: create_metric("Alloc NODE block handles"),
             packages: create_metric("Alloc NODE packages"),
-            stored_cells: create_metric("Alloc NODE stored cells"),
             storing_cells: create_metric("Alloc NODE storing cells"),
+            storing_cells_bytes: create_metric("Alloc NODE storing cells, bytes"),
             shardstates_queue: create_metric("Alloc NODE shardstates queue"),
-            cached_cells_counters: create_metric("Alloc NODE cells counters"),
 
             loaded_cells_from_db: create_metric_per_sec("NODE loaded from db cells/sec"),
             load_cell_from_db_time_nanos: create_metric_with_total_average(
                 "NODE cell load time from db, nanos",
-            ),
-            load_cell_from_cache_time_nanos: create_metric_with_total_average(
-                "NODE cell load time from cache, nanos",
-            ),
-            store_cell_to_cache_time_nanos: create_metric_with_total_average(
-                "NODE cell store time to cache, nanos",
             ),
             stored_new_cells: create_metric_per_sec("NODE stored new cells & counters/sec"),
             deleted_cells: create_metric_per_sec("NODE deleted cells & counters/sec"),
@@ -1511,30 +1593,42 @@ impl Engine {
             cell_cache_hits: create_metric_per_sec("NODE cell cache hits/sec"),
             cell_cache_misses: create_metric_per_sec("NODE cell cache misses/sec"),
             cell_cache_len: create_metric("NODE cell cache len"),
+            counter_cache_hits: create_metric_per_sec("NODE counter cache hits/sec"),
+            counter_cache_misses: create_metric_per_sec("NODE counter cache misses/sec"),
+            counter_cache_len: create_metric("NODE counter cache len"),
+            rocksdb_mem_table_mb: create_metric("Alloc NODE RocksDB mem tables, MB"),
+            rocksdb_block_cache_mb: create_metric("Alloc NODE RocksDB block cache, MB"),
+            rocksdb_table_readers_mb: create_metric("Alloc NODE RocksDB table readers, MB"),
         });
         let engine_telemetry = Arc::new(EngineTelemetry {
             storage: storage_telemetry,
             awaiters: create_metric("Alloc NODE awaiters"),
             catchain_clients: create_metric("Alloc NODE catchains"),
             cells: create_metric("Alloc NODE cells"),
+            cells_mb: create_metric("Alloc NODE cells, MB"),
+            arena_cells: create_metric("Alloc NODE arena cells"),
+            arena_bytes_mb: create_metric("Alloc NODE arena size, MB"),
+            jemalloc_allocated_mb: create_metric("Alloc NODE jemalloc allocated, MB"),
+            jemalloc_resident_mb: create_metric("Alloc NODE jemalloc resident, MB"),
+            jemalloc_mapped_mb: create_metric("Alloc NODE jemalloc mapped, MB"),
+            jemalloc_retained_mb: create_metric("Alloc NODE jemalloc retained, MB"),
             shard_states: create_metric("Alloc NODE shard states"),
             top_blocks: create_metric("Alloc NODE top blocks"),
             validator_adnl_keys: create_metric("Alloc NODE validator ADNL keys"),
             validator_peers: create_metric("Alloc NODE validator peers"),
             validator_sets: create_metric("Alloc NODE validator sets"),
+            account_state_cache_mb: create_metric("Alloc NODE account state cache, MB"),
+            storage_dicts_cache_cells: create_metric("Alloc NODE storage dicts cache cells"),
         });
         let metrics = vec![
             TelemetryItem::Metric(engine_telemetry.storage.file_entries.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.handles.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.packages.clone()),
-            TelemetryItem::Metric(engine_telemetry.storage.stored_cells.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.storing_cells.clone()),
+            TelemetryItem::Metric(engine_telemetry.storage.storing_cells_bytes.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.shardstates_queue.clone()),
-            TelemetryItem::Metric(engine_telemetry.storage.cached_cells_counters.clone()),
             TelemetryItem::MetricBuilder(engine_telemetry.storage.loaded_cells_from_db.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.load_cell_from_db_time_nanos.clone()),
-            TelemetryItem::Metric(engine_telemetry.storage.load_cell_from_cache_time_nanos.clone()),
-            TelemetryItem::Metric(engine_telemetry.storage.store_cell_to_cache_time_nanos.clone()),
             TelemetryItem::MetricBuilder(engine_telemetry.storage.stored_new_cells.clone()),
             TelemetryItem::MetricBuilder(engine_telemetry.storage.deleted_cells.clone()),
             TelemetryItem::MetricBuilder(engine_telemetry.storage.loaded_counters.clone()),
@@ -1550,14 +1644,32 @@ impl Engine {
             TelemetryItem::Metric(engine_telemetry.storage.delete_boc_traverse_micros.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.delete_boc_tr_build_micros.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.delete_boc_commit_micros.clone()),
+            TelemetryItem::Metric(engine_telemetry.storage.rocksdb_mem_table_mb.clone()),
+            TelemetryItem::Metric(engine_telemetry.storage.rocksdb_block_cache_mb.clone()),
+            TelemetryItem::Metric(engine_telemetry.storage.rocksdb_table_readers_mb.clone()),
+            TelemetryItem::MetricBuilder(engine_telemetry.storage.cell_cache_hits.clone()),
+            TelemetryItem::MetricBuilder(engine_telemetry.storage.cell_cache_misses.clone()),
+            TelemetryItem::Metric(engine_telemetry.storage.cell_cache_len.clone()),
+            TelemetryItem::MetricBuilder(engine_telemetry.storage.counter_cache_hits.clone()),
+            TelemetryItem::MetricBuilder(engine_telemetry.storage.counter_cache_misses.clone()),
+            TelemetryItem::Metric(engine_telemetry.storage.counter_cache_len.clone()),
             TelemetryItem::Metric(engine_telemetry.awaiters.clone()),
             TelemetryItem::Metric(engine_telemetry.catchain_clients.clone()),
             TelemetryItem::Metric(engine_telemetry.cells.clone()),
+            TelemetryItem::Metric(engine_telemetry.cells_mb.clone()),
+            TelemetryItem::Metric(engine_telemetry.arena_cells.clone()),
+            TelemetryItem::Metric(engine_telemetry.arena_bytes_mb.clone()),
+            TelemetryItem::Metric(engine_telemetry.jemalloc_allocated_mb.clone()),
+            TelemetryItem::Metric(engine_telemetry.jemalloc_resident_mb.clone()),
+            TelemetryItem::Metric(engine_telemetry.jemalloc_mapped_mb.clone()),
+            TelemetryItem::Metric(engine_telemetry.jemalloc_retained_mb.clone()),
             TelemetryItem::Metric(engine_telemetry.shard_states.clone()),
             TelemetryItem::Metric(engine_telemetry.top_blocks.clone()),
             TelemetryItem::Metric(engine_telemetry.validator_adnl_keys.clone()),
             TelemetryItem::Metric(engine_telemetry.validator_peers.clone()),
             TelemetryItem::Metric(engine_telemetry.validator_sets.clone()),
+            TelemetryItem::Metric(engine_telemetry.account_state_cache_mb.clone()),
+            TelemetryItem::Metric(engine_telemetry.storage_dicts_cache_cells.clone()),
         ];
         (metrics, engine_telemetry)
     }
@@ -1666,7 +1778,7 @@ impl Engine {
             limit,
             30,
             "download_next_block_worker",
-            Some((50, 11, 1000)),
+            Some((25, 11, 500)),
         )
         .await?
         .download()
@@ -1872,6 +1984,7 @@ impl Engine {
         last_keyblock: &Arc<BlockHandle>,
         mc_state: &ShardStateStuff,
     ) -> Result<()> {
+        let _tc = time_checker!(|| format!("check_gc_for_archives {}", last_keyblock.id()), 100);
         let mut gc_max_date = UnixTime::now();
         match &engine.archives_life_time_hours {
             None => return Ok(()),
@@ -1892,11 +2005,17 @@ impl Engine {
         let mut visited_pss_blocks = 0;
         let mut keyblock = last_keyblock.clone();
         let prev_blocks = &mc_state.shard_state_extra()?.prev_blocks;
+        let _walk_tc =
+            time_checker!(|| format!("check_gc_for_archives walk {}", last_keyblock.id()), 50);
         loop {
             match prev_blocks.get_prev_key_block(keyblock.id().seq_no() - 1)? {
                 None => return Ok(()),
                 Some(prev_keyblock) => {
                     let prev_keyblock = BlockIdExt::from_ext_blk(prev_keyblock);
+                    let _lh_tc = time_checker!(
+                        || format!("check_gc_for_archives load_handle {prev_keyblock}"),
+                        30
+                    );
                     let prev_keyblock =
                         engine.load_block_handle(&prev_keyblock)?.ok_or_else(|| {
                             error!(
@@ -1904,6 +2023,7 @@ impl Engine {
                                 prev_keyblock
                             )
                         })?;
+                    drop(_lh_tc);
                     if engine.is_persistent_state(
                         keyblock.gen_utime(),
                         prev_keyblock.gen_utime(),
@@ -2009,7 +2129,7 @@ impl Engine {
             return;
         }
         let mut cache = self.storage_dicts_cache.lock();
-        if cache.1.push(dict.repr_hash(), StorageDictInfo { dict, size }).is_none() {
+        if cache.1.push(dict.repr_hash().clone(), StorageDictInfo { dict, size }).is_none() {
             cache.0 += size;
         }
         while cache.0 > Self::STORAGE_DICTS_CACHE_SIZE {
@@ -2106,16 +2226,15 @@ async fn boot(
         load_zero_state(engine, zerostate_path).await?;
     }
 
-    let result = match engine.load_last_applied_mc_block_id() {
-        Ok(Some(id)) => crate::boot::warm_boot(engine.clone(), id, hardfork_path).await,
-        Ok(None) => Err(error!("No last applied MC block, warm boot is not possible")),
-        Err(x) => Err(x),
-    };
-
-    let (last_applied_mc_block, cold) = match result {
-        Ok(block_id) => (block_id.clone(), false),
-        Err(err) => {
-            log::warn!("Before cold boot: {err}");
+    let (last_applied_mc_block, cold) = match engine.load_last_applied_mc_block_id() {
+        Ok(Some(id)) => {
+            let id =
+                crate::boot::warm_boot(engine.clone(), id.clone(), hardfork_path).await.map_err(
+                    |e| error!("Warm boot failed: {e}. Need to clear the DB and re-sync node"),
+                )?;
+            (id, false)
+        }
+        _ => {
             engine.acquire_stop(Engine::MASK_SERVICE_BOOT);
             let result = boot::cold_boot(engine.clone(), pss_downloading_threads).await;
             engine.release_stop(Engine::MASK_SERVICE_BOOT);
@@ -2221,6 +2340,8 @@ pub async fn run(
     let result = async move {
         #[cfg(feature = "telemetry")]
         telemetry_logger(engine.clone());
+        #[cfg(all(target_os = "linux", feature = "telemetry"))]
+        proc_status_logger();
 
         // control server
         if let Some(config) = control_server_config {
@@ -2264,7 +2385,7 @@ pub async fn run(
         overlays_router.update_custom_overlays(Some(&custom_overlays_config)).await?;
         engine
             .overlays_router
-            .set(overlays_router)
+            .set(overlays_router.clone())
             .map_err(|_| error!("Overlays router already set"))?;
 
         // Boot
@@ -2328,6 +2449,8 @@ pub async fn run(
         // top shard blocks
         resend_top_shard_blocks_worker(engine.clone());
 
+        overlays_router.special_update_fastsync_overlays().await?;
+
         // blocks download clients
         engine.set_sync_status(Engine::SYNC_STATUS_SYNC_BLOCKS);
         Engine::check_finish_sync(Arc::clone(&engine));
@@ -2353,9 +2476,56 @@ pub async fn run(
     }
 }
 
+#[cfg(target_os = "linux")]
+fn proc_status_logger() {
+    tokio::spawn(async move {
+        let parse_kb = |line: &str| -> u64 {
+            line.split_whitespace().nth(1).and_then(|n| n.parse().ok()).unwrap_or(0)
+        };
+        loop {
+            tokio::time::sleep(Duration::from_secs(Engine::TIMEOUT_TELEMETRY_SEC)).await;
+            let Ok(content) = std::fs::read_to_string("/proc/self/status") else { continue };
+            let mut vm_rss = 0u64;
+            let mut anon = 0u64;
+            let mut file = 0u64;
+            let mut vm_size = 0u64;
+            for line in content.lines() {
+                if line.starts_with("VmRSS:") {
+                    vm_rss = parse_kb(line);
+                } else if line.starts_with("RssAnon:") {
+                    anon = parse_kb(line);
+                } else if line.starts_with("RssFile:") {
+                    file = parse_kb(line);
+                } else if line.starts_with("VmSize:") {
+                    vm_size = parse_kb(line);
+                }
+            }
+            log::info!(
+                "proc: VmRSS={} MB RssAnon={} MB RssFile={} MB VmSize={} MB",
+                vm_rss / 1024,
+                anon / 1024,
+                file / 1024,
+                vm_size / 1024,
+            );
+        }
+    });
+}
+
 #[cfg(feature = "telemetry")]
 fn telemetry_logger(engine: Arc<Engine>) {
     tokio::spawn(async move {
+        #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
+        {
+            let dirty: isize =
+                unsafe { tikv_jemalloc_ctl::raw::read(b"opt.dirty_decay_ms\0") }.unwrap_or(-1);
+            let muzzy: isize =
+                unsafe { tikv_jemalloc_ctl::raw::read(b"opt.muzzy_decay_ms\0") }.unwrap_or(-1);
+            let bg: bool = unsafe { tikv_jemalloc_ctl::raw::read(b"opt.background_thread\0") }
+                .unwrap_or(false);
+            log::info!(
+                "jemalloc opts: dirty_decay_ms={dirty} muzzy_decay_ms={muzzy} background_thread={bg}"
+            );
+        }
         let mut elapsed = 0;
         let millis = 500;
         loop {
@@ -2380,19 +2550,37 @@ fn telemetry_logger(engine: Arc<Engine>) {
                 .update(engine.engine_allocated.storage.packages.load(Ordering::Relaxed));
             engine
                 .engine_telemetry
-                .storage
-                .stored_cells
-                .update(engine.engine_allocated.storage.storage_cells.load(Ordering::Relaxed));
-            engine
-                .engine_telemetry
                 .awaiters
                 .update(engine.engine_allocated.awaiters.load(Ordering::Relaxed));
             engine
                 .engine_telemetry
                 .catchain_clients
                 .update(engine.engine_allocated.catchain_clients.load(Ordering::Relaxed));
-            engine.engine_telemetry.storage.stored_cells.update(StoredCell::cell_count());
             engine.engine_telemetry.cells.update(Cell::cell_count());
+            engine.engine_telemetry.cells_mb.update(Cell::cell_bytes() / (1024 * 1024));
+            engine.engine_telemetry.arena_cells.update(Cell::arena_cell_count());
+            engine
+                .engine_telemetry
+                .arena_bytes_mb
+                .update(Cell::arena_bytes_total() / (1024 * 1024));
+            #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
+            {
+                // jemalloc stats are snapshot-based; advance epoch before reading.
+                let _ = tikv_jemalloc_ctl::epoch::advance();
+                let mb = |b: usize| (b / (1024 * 1024)) as u64;
+                if let Ok(v) = tikv_jemalloc_ctl::stats::allocated::read() {
+                    engine.engine_telemetry.jemalloc_allocated_mb.update(mb(v));
+                }
+                if let Ok(v) = tikv_jemalloc_ctl::stats::resident::read() {
+                    engine.engine_telemetry.jemalloc_resident_mb.update(mb(v));
+                }
+                if let Ok(v) = tikv_jemalloc_ctl::stats::mapped::read() {
+                    engine.engine_telemetry.jemalloc_mapped_mb.update(mb(v));
+                }
+                if let Ok(v) = tikv_jemalloc_ctl::stats::retained::read() {
+                    engine.engine_telemetry.jemalloc_retained_mb.update(mb(v));
+                }
+            }
             engine
                 .engine_telemetry
                 .shard_states
@@ -2413,6 +2601,14 @@ fn telemetry_logger(engine: Arc<Engine>) {
                 .engine_telemetry
                 .validator_sets
                 .update(engine.engine_allocated.validator_sets.load(Ordering::Relaxed));
+            engine.engine_telemetry.account_state_cache_mb.update(
+                engine.engine_allocated.account_state_cache_bytes.load(Ordering::Relaxed)
+                    / (1024 * 1024),
+            );
+            engine
+                .engine_telemetry
+                .storage_dicts_cache_cells
+                .update(engine.storage_dicts_cache.lock().0);
 
             // check timeout
 
@@ -2426,30 +2622,23 @@ fn telemetry_logger(engine: Arc<Engine>) {
             // print telemetry
 
             {
-                let hits = engine
+                let usage = engine.db().rocksdb_memory_usage();
+                engine
                     .engine_telemetry
                     .storage
-                    .cell_cache_hits
-                    .metric()
-                    .total_amount()
-                    .unwrap_or(0);
-                let misses = engine
+                    .rocksdb_mem_table_mb
+                    .update(usage.mem_tables / (1024 * 1024));
+                engine
                     .engine_telemetry
                     .storage
-                    .cell_cache_misses
-                    .metric()
-                    .total_amount()
-                    .unwrap_or(0);
-                let total = hits + misses;
-                let hit_rate = if total > 0 { hits * 100 / total } else { 0 };
-                log::info!(
-                    target: "telemetry",
-                    "Cell cache hit_rate: {}%",
-                    hit_rate
-                );
+                    .rocksdb_block_cache_mb
+                    .update(usage.block_cache / (1024 * 1024));
+                engine
+                    .engine_telemetry
+                    .storage
+                    .rocksdb_table_readers_mb
+                    .update(usage.table_readers / (1024 * 1024));
             }
-
-            engine.telemetry_printer.try_print();
 
             let period = crate::full_node::telemetry::TPS_PERIOD_1;
             let tps_1 = engine.tps_counter.calc_tps(period).unwrap_or_else(|e| {
@@ -2496,6 +2685,15 @@ fn telemetry_logger(engine: Arc<Engine>) {
             if let Err(e) = engine.log_workers_stats() {
                 log::warn!("Can't log workers stats: {}", e);
             }
+            {
+                let st = &engine.engine_telemetry.storage;
+                log::info!(
+                    target: "telemetry",
+                    "Cell cache hit_rate: {}%, Counter cache hit_rate: {}%",
+                    st.cell_cache_hit_rate(), st.counter_cache_hit_rate()
+                );
+            }
+            engine.telemetry_printer.try_print();
         }
     });
 }
@@ -2730,6 +2928,150 @@ pub fn init_prometheus_recorder(
         "Number of accounts parsed per block"
     );
     metrics::describe_histogram!("ton_node_block_size_bytes", "Block size in bytes");
+
+    // -- simplex (republished from per-session MetricsHandle by
+    //    `simplex::prometheus_publisher`; see MONITORING-PROM-1).
+    //
+    // All series carry the `shard` label by default; sessions configured with
+    // `PrometheusLabels::ShardAndSessionId` also carry `session_id` (first
+    // 8 hex chars of the simplex session id, matching the `sid8` prefix used
+    // in log dumps and consensus_session_dump.py reports).
+    //
+    // Counters (monotonically non-decreasing).
+    metrics::describe_counter!(
+        "ton_node_simplex_votes_in_total",
+        "Total simplex votes received (notarize+finalize+skip)"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_votes_in_notarize",
+        "Simplex notarize votes received"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_votes_in_finalize",
+        "Simplex finalize votes received"
+    );
+    metrics::describe_counter!("ton_node_simplex_votes_in_skip", "Simplex skip votes received");
+    metrics::describe_counter!(
+        "ton_node_simplex_votes_out_total",
+        "Total simplex votes sent (notarize+finalize+skip)"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_votes_out_notarize",
+        "Simplex notarize votes sent"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_votes_out_finalize",
+        "Simplex finalize votes sent"
+    );
+    metrics::describe_counter!("ton_node_simplex_votes_out_skip", "Simplex skip votes sent");
+    metrics::describe_counter!(
+        "ton_node_simplex_certs_in",
+        "Simplex certificates received from the network (skip+notarize+finalize aggregate)"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_certs_relayed",
+        "Simplex certificates relayed to peers (skip+notarize+finalize aggregate)"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_collation_starts",
+        "Number of simplex collation invocations started"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_collates_total",
+        "Total simplex collations (success+failure)"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_collates_success",
+        "Successful simplex collations"
+    );
+    metrics::describe_counter!("ton_node_simplex_collates_failure", "Failed simplex collations");
+    metrics::describe_counter!(
+        "ton_node_simplex_self_collates_total",
+        "Total self-collation attempts (success+failure+ignore)"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_self_collates_success",
+        "Self-collation attempts accepted via finalized callback emission"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_self_collates_failure",
+        "Self-collation attempts that failed before finalized callback emission"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_validates_total",
+        "Total simplex validations (success+failure)"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_validates_success",
+        "Successful simplex validations"
+    );
+    metrics::describe_counter!("ton_node_simplex_validates_failure", "Failed simplex validations");
+    metrics::describe_counter!(
+        "ton_node_simplex_candidate_received_broadcast",
+        "Simplex block candidates received via broadcast"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_candidate_received_query",
+        "Simplex block candidates received via requestCandidate query"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_candidate_requests",
+        "Simplex outgoing requestCandidate queries"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_health_warnings",
+        "Total SIMPLEX_HEALTH anomaly warnings emitted"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_standstill_triggers",
+        "Number of standstill triggers fired"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_errors",
+        "Total simplex errors recorded by SessionProcessor"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_misbehavior",
+        "Total simplex misbehavior events detected"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_receiver_in_bytes",
+        "Total bytes received by the simplex receiver overlay"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_receiver_out_bytes",
+        "Total bytes sent by the simplex receiver overlay"
+    );
+
+    // Gauges (latest active value).
+    metrics::describe_gauge!(
+        "ton_node_simplex_active_weight",
+        "Current active validator weight in the session"
+    );
+    metrics::describe_gauge!(
+        "ton_node_simplex_total_weight",
+        "Total validator weight in the session"
+    );
+    metrics::describe_gauge!(
+        "ton_node_simplex_last_finalized_slot",
+        "Last finalized slot index in the session"
+    );
+    metrics::describe_gauge!(
+        "ton_node_simplex_first_non_finalized_slot",
+        "First non-finalized slot index in the session"
+    );
+    metrics::describe_gauge!(
+        "ton_node_simplex_first_non_progressed_slot",
+        "First non-progressed slot index (C++ pool.cpp `now_` parity)"
+    );
+    metrics::describe_gauge!(
+        "ton_node_simplex_main_loop_load",
+        "Fraction of simplex main loop iterations that detected overload"
+    );
+    metrics::describe_gauge!(
+        "ton_node_simplex_active_nodes_percent",
+        "Percentage of validator weight currently active in the session"
+    );
 
     handle
 }

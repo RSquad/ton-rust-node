@@ -33,8 +33,8 @@ impl Signer for VaultSigner {
 
         let pub_key = keypair
             .public_key()
-            .await?
-            .ok_or_else(|| anyhow::anyhow!(VaultError::empty_public_key("Empty public key")))?;
+            .ok_or_else(|| anyhow::anyhow!(VaultError::empty_public_key("Empty public key")))?
+            .to_vec();
 
         Ok(pub_key)
     }

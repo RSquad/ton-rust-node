@@ -7,6 +7,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use clap::Parser;
+use secrets_vault::vault_block::get_key_option_factory;
 use std::{
     net::{IpAddr, SocketAddr},
     ops::Deref,
@@ -22,7 +23,7 @@ use ton_api::{
     },
     Constructor, IntoBoxed, Signing,
 };
-use ton_block::{base64_decode, base64_encode, error, fail, Ed25519KeyOption, KeyOption, Result};
+use ton_block::{base64_decode, base64_encode, error, fail, KeyOption, Result};
 
 #[derive(clap::Parser)]
 #[command(name = "crypto", about = "TON cryptographic utilities")]
@@ -89,15 +90,16 @@ fn now() -> i32 {
 }
 
 fn gen_key() -> Result<serde_json::Value> {
-    let (json, key) = Ed25519KeyOption::generate_with_json()?;
-    let pvt_key = json.get_pvt_key()?;
+    let key = get_key_option_factory().generate()?;
+    let pvt_key = key.pvt_key()?;
+    let pvt_key_data: &[u8] = &pvt_key.lock()?;
 
     let mut secret_tl = Vec::with_capacity(36);
     secret_tl.extend_from_slice(&PkEd25519::constructor_const().to_le_bytes());
-    secret_tl.extend_from_slice(&pvt_key);
+    secret_tl.extend_from_slice(pvt_key_data);
 
     Ok(serde_json::json!({
-        "secret": base64_encode(&pvt_key),
+        "secret": base64_encode(pvt_key_data),
         "pubkey": base64_encode(key.pub_key()?),
         "adnlId": base64_encode(key.id().data()),
         "secretTl": base64_encode(&secret_tl),
@@ -112,7 +114,7 @@ fn gen_dht(addr: &str, key_b64: &str) -> Result<serde_json::Value> {
     };
     let port = addr.port() as i32;
 
-    let key = Ed25519KeyOption::from_private_key(&decode_key_32(key_b64)?)?;
+    let key = get_key_option_factory().from_private_key(&decode_key_32(key_b64)?)?;
     let version = now();
 
     let node = Node {
@@ -155,9 +157,9 @@ fn gen_dht(addr: &str, key_b64: &str) -> Result<serde_json::Value> {
 
 fn get_adnl_id(public: Option<&str>, secret: Option<&str>) -> Result<serde_json::Value> {
     let key: Arc<dyn KeyOption> = if let Some(public) = public {
-        Ed25519KeyOption::from_public_key(&decode_key_32(public)?)
+        get_key_option_factory().from_public_key(&decode_key_32(public)?)
     } else if let Some(secret) = secret {
-        Ed25519KeyOption::from_private_key(&decode_key_32(secret)?)?
+        get_key_option_factory().from_private_key(&decode_key_32(secret)?)?
     } else {
         fail!("either --public or --secret is required")
     };
@@ -194,7 +196,7 @@ fn main() {
 mod tests {
     use super::*;
     use ton_api::{ton::dht::node::Node as TlNode, Serializer};
-    use ton_block::sha256_digest_slices;
+    use ton_block::{sha256_digest_slices, ED25519_KEY_TYPE};
 
     #[test]
     fn gen_key_output_has_all_fields() {
@@ -234,7 +236,7 @@ mod tests {
     fn gen_key_adnl_id_is_sha256_of_type_and_pubkey() {
         let v = gen_key().unwrap();
         let pub_key = base64_decode(v["pubkey"].as_str().unwrap()).unwrap();
-        let expected = sha256_digest_slices(&[&Ed25519KeyOption::KEY_TYPE.to_le_bytes(), &pub_key]);
+        let expected = sha256_digest_slices(&[&ED25519_KEY_TYPE.to_le_bytes(), &pub_key]);
         let adnl_id = base64_decode(v["adnlId"].as_str().unwrap()).unwrap();
         assert_eq!(adnl_id, expected.as_slice());
     }
@@ -244,7 +246,8 @@ mod tests {
         let v = gen_key().unwrap();
         let secret = v["secret"].as_str().unwrap();
         let expected_pubkey = v["pubkey"].as_str().unwrap();
-        let key = Ed25519KeyOption::from_private_key(&decode_key_32(secret).unwrap()).unwrap();
+        let key =
+            get_key_option_factory().from_private_key(&decode_key_32(secret).unwrap()).unwrap();
         assert_eq!(base64_encode(key.pub_key().unwrap()), expected_pubkey);
     }
 
@@ -295,7 +298,8 @@ mod tests {
 
         // Reconstruct the signed node from JSON and verify signature
         let pub_key_b64 = dht["id"]["key"].as_str().unwrap();
-        let pub_key = Ed25519KeyOption::from_public_key(&decode_key_32(pub_key_b64).unwrap());
+        let pub_key =
+            get_key_option_factory().from_public_key(&decode_key_32(pub_key_b64).unwrap());
 
         let sig = base64_decode(dht["signature"].as_str().unwrap()).unwrap();
         let version = dht["version"].as_i64().unwrap() as i32;

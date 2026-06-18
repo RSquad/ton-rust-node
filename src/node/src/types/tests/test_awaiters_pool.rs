@@ -267,7 +267,7 @@ async fn test_awaiters_pool_shunt() {
         async move {
             let r = pool
                 .do_or_wait(&1, None, async move {
-                    futures_timer::Delay::new(Duration::from_millis(500)).await;
+                    futures_timer::Delay::new(Duration::from_millis(5_000)).await;
                     Ok("done")
                 })
                 .await

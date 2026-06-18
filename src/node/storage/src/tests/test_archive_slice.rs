@@ -237,3 +237,59 @@ async fn test_lookup_proof_by_seqno() -> Result<()> {
     })
     .await
 }
+
+/// Regression for the truncate bug: re-importing into a package that already exists
+/// (e.g. partially written by the node) must REFRESH the persisted entry size to the
+/// new file size. Otherwise the stale (smaller) size would later truncate the full
+/// .pack on reopen and drop the freshly imported tail.
+#[tokio::test]
+async fn test_import_package_entries_refreshes_existing_size() -> Result<()> {
+    use crate::archives::package_entry_meta_db::PackageEntryInfo;
+
+    let name = "test_import_refresh_size";
+    let db_root = Path::new(DB_PATH).join(name);
+    let _ = std::fs::remove_dir_all(&db_root);
+    let db = RocksDb::new(DB_PATH, name, None, AccessType::ReadWrite)?;
+    let archive_id = 0u32;
+    let slice = ArchiveSlice::new_for_import(
+        db.clone(),
+        Arc::new(db_root),
+        archive_id,
+        PackageType::Blocks,
+        0,
+        #[cfg(feature = "telemetry")]
+        Arc::new(StorageTelemetry::default()),
+        Arc::new(StorageAlloc::default()),
+    )
+    .await?;
+    let shard = ShardIdent::masterchain();
+    let entry = PackageEntryInfo { seqno: archive_id, shard: shard.clone() };
+
+    // import_package_entries() expects the .pack file to already be on disk (placed by
+    // import_package() before the call). Create a dummy one (header-sized is enough —
+    // read-only open only checks the file length).
+    let pack_dir = slice.db_root_path().join(ARCHIVE_PATH);
+    std::fs::create_dir_all(&pack_dir)?;
+    std::fs::write(pack_dir.join("archive.00000.pack"), vec![0u8; 64])?;
+
+    // First import creates the package with size1.
+    let size1 = 1000u64;
+    slice.import_package_entries(archive_id, &shard, size1, &[]).await?;
+    let pi = slice.get_package_by_entry(&entry).await.expect("package must be created");
+    let meta1 = slice.entry_db.get_value(&pi.index().into())?;
+    assert_eq!(meta1.entry_size(), size1, "size after first import");
+
+    // Second import on the EXISTING package must refresh the persisted size to size2.
+    let size2 = 5000u64;
+    slice.import_package_entries(archive_id, &shard, size2, &[]).await?;
+    let meta2 = slice.entry_db.get_value(&pi.index().into())?;
+    assert_eq!(
+        meta2.entry_size(),
+        size2,
+        "persisted size must be refreshed on existing package (truncate-bug regression)",
+    );
+
+    drop(slice);
+    destroy_db(db, name).await;
+    Ok(())
+}

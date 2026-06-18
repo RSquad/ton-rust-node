@@ -1122,7 +1122,9 @@ impl ShardStateUnsplit {
             if let Some(new_code) = new_code {
                 smc.set_code(new_code);
             }
-            smc.update_storage_stat(config.size_limits_config()?.acc_state_cells_for_storage_dict)?;
+            smc.calc_storage_stat_dict(
+                config.size_limits_config()?.acc_state_cells_for_storage_dict,
+            )?;
             Ok(())
         })
     }

@@ -18,16 +18,19 @@ use num::{bigint::Sign, BigInt, One, Zero};
 #[cfg(feature = "mirrornet")]
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::{
+    any::type_name,
     cmp,
-    convert::TryInto,
-    fmt::{self, LowerHex, UpperHex},
+    convert::{TryFrom, TryInto},
+    fmt::{self, Display, LowerHex, UpperHex},
+    io::Read,
     marker::PhantomData,
     ops::{Deref, DerefMut},
     str::{self, FromStr},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Clone, Default, PartialEq, Eq, Hash, Ord, PartialOrd)]
+#[repr(transparent)]
 pub struct UInt256([u8; 32]);
 
 impl UInt256 {
@@ -269,7 +272,7 @@ pub trait ByteOrderRead {
     fn read_u256(&mut self) -> std::io::Result<[u8; 32]>;
 }
 
-impl<T: std::io::Read> ByteOrderRead for T {
+impl<T: Read> ByteOrderRead for T {
     fn read_be_uint(&mut self, bytes: usize) -> std::io::Result<u64> {
         read_uint(self, bytes, false)
     }
@@ -319,7 +322,7 @@ impl<T: std::io::Read> ByteOrderRead for T {
     }
 }
 
-fn read_uint<T: std::io::Read>(src: &mut T, bytes: usize, le: bool) -> std::io::Result<u64> {
+fn read_uint<T: Read>(src: &mut T, bytes: usize, le: bool) -> std::io::Result<u64> {
     match bytes {
         1 => {
             let mut buf = [0];
@@ -548,6 +551,14 @@ macro_rules! define_VarIntegerN {
                 self.0 = Self::read_from_cell(cell)?;
                 Ok(())
             }
+            fn skip(slice: &mut SliceData) -> Result<()> {
+                let len = slice.get_next_int(Self::get_len_len())? as usize;
+                if len >= $N {
+                    fail!("deserialization of {} error {} >= {}", stringify!($varname), len, $N)
+                }
+                slice.move_by(len * 8)?;
+                Ok(())
+            }
         }
 
         impl fmt::Display for $varname {
@@ -640,7 +651,16 @@ macro_rules! define_VarIntegerN {
                 let bytes = slice.get_next_int(bits as usize)? as usize;
                 let max = std::mem::size_of::<$tt>();
                 let mut buffer = [0; std::mem::size_of::<$tt>()];
-                slice.get_next_bytes_to_slice(&mut buffer[max - bytes..])?;
+                if bytes > 0 {
+                    let first = slice.get_next_byte()?;
+                    if first == 0 {
+                        fail!("non-canonical {} encoding: leading zero byte", stringify!($varname))
+                    }
+                    buffer[max - bytes] = first;
+                    if bytes > 1 {
+                        slice.get_next_bytes_to_slice(&mut buffer[max - bytes + 1..])?;
+                    }
+                }
                 self.0 = <$tt>::from_be_bytes(buffer);
                 Ok(())
             }
@@ -1014,6 +1034,10 @@ macro_rules! define_NumberN_up32bit {
                 self.0 = cell.get_next_int($N)? as u32;
                 Ok(())
             }
+            fn skip(slice: &mut SliceData) -> Result<()> {
+                slice.move_by($N)?;
+                Ok(())
+            }
         }
 
         impl fmt::Display for $varname {
@@ -1094,42 +1118,42 @@ impl From<u32> for Number32 {
     }
 }
 
-impl std::convert::TryFrom<u32> for Number5 {
+impl TryFrom<u32> for Number5 {
     type Error = Error;
     fn try_from(value: u32) -> Result<Self> {
         Self::new(value)
     }
 }
 
-impl std::convert::TryFrom<u32> for Number8 {
+impl TryFrom<u32> for Number8 {
     type Error = Error;
     fn try_from(value: u32) -> Result<Self> {
         Self::new(value)
     }
 }
 
-impl std::convert::TryFrom<u32> for Number9 {
+impl TryFrom<u32> for Number9 {
     type Error = Error;
     fn try_from(value: u32) -> Result<Self> {
         Self::new(value)
     }
 }
 
-impl std::convert::TryFrom<u32> for Number12 {
+impl TryFrom<u32> for Number12 {
     type Error = Error;
     fn try_from(value: u32) -> Result<Self> {
         Self::new(value)
     }
 }
 
-impl std::convert::TryFrom<u32> for Number13 {
+impl TryFrom<u32> for Number13 {
     type Error = Error;
     fn try_from(value: u32) -> Result<Self> {
         Self::new(value)
     }
 }
 
-impl std::convert::TryFrom<u32> for Number16 {
+impl TryFrom<u32> for Number16 {
     type Error = Error;
     fn try_from(value: u32) -> Result<Self> {
         Self::new(value)
@@ -1457,8 +1481,9 @@ impl<X: Deserializable + Serializable> Deserializable for InRefValue<X> {
 }
 
 impl<X: Deserializable + Serializable> Serializable for InRefValue<X> {
-    fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
-        self.0.serialize()?.write_to(cell)
+    fn write_to(&self, builder: &mut BuilderData) -> Result<()> {
+        builder.checked_append_reference(self.0.serialize()?)?;
+        Ok(())
     }
 }
 
@@ -1527,6 +1552,62 @@ impl UnixTime {
     }
 }
 
+pub struct TimeChecker<F, D>
+where
+    F: Fn() -> D,
+    D: Display,
+{
+    operation: F,
+    target: &'static str,
+    threshold: Duration,
+    start: Instant,
+}
+
+impl<F, D> TimeChecker<F, D>
+where
+    F: Fn() -> D,
+    D: Display,
+{
+    pub fn new(target: &'static str, operation: F, threshold_ms: u64) -> Self {
+        let start = Instant::now();
+        log::trace!(target: target, "{} - started", operation());
+        Self { operation, target, threshold: Duration::from_millis(threshold_ms), start }
+    }
+}
+
+impl<F, D> Drop for TimeChecker<F, D>
+where
+    F: Fn() -> D,
+    D: Display,
+{
+    fn drop(&mut self) {
+        let time = self.start.elapsed();
+        if time < self.threshold {
+            log::trace!(
+                target: self.target,
+                "{} - finished, TIME: {}",
+                (self.operation)(),
+                time.as_millis()
+            );
+        } else {
+            log::warn!(
+                target: self.target,
+                "{} - finished too slow, TIME: {}ms, expected: {}ms",
+                (self.operation)(),
+                time.as_millis(),
+                self.threshold.as_millis()
+            );
+        }
+    }
+}
+
+#[macro_export]
+macro_rules! time_checker {
+    ($op:expr, $threshold:expr) => {
+        $crate::TimeChecker::new(module_path!(), $op, $threshold)
+    };
+}
+
 #[derive(Debug, Default, Clone, Eq)]
 pub struct ChildCell<T: Serializable + Deserializable> {
     cell: Option<Cell>,
@@ -1550,7 +1631,7 @@ impl<T: Serializable + Deserializable> ChildCell<T> {
         match self.cell.clone() {
             Some(cell) => {
                 if cell.cell_type() == CellType::PrunedBranch {
-                    fail!(BlockError::PrunedCellAccess(std::any::type_name::<T>().into()))
+                    fail!(BlockError::PrunedCellAccess(type_name::<T>().into()))
                 }
                 T::construct_from_cell(cell)
             }
@@ -1571,8 +1652,8 @@ impl<T: Serializable + Deserializable> ChildCell<T> {
 
     pub fn hash(&self) -> UInt256 {
         match self.cell.as_ref() {
-            Some(cell) => cell.repr_hash(),
-            None => T::default().serialize().unwrap_or_default().repr_hash(),
+            Some(cell) => cell.repr_hash().clone(),
+            None => T::default().serialize().unwrap_or_default().repr_hash().clone(),
         }
     }
 
@@ -1597,11 +1678,11 @@ impl<T: Default + Serializable + Deserializable> PartialEq for ChildCell<T> {
 }
 
 impl<T: Serializable + Deserializable> Serializable for ChildCell<T> {
-    fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
+    fn write_to(&self, builder: &mut BuilderData) -> Result<()> {
         if let Some(child_cell) = &self.cell {
-            child_cell.write_to(cell)?;
+            builder.checked_append_reference(child_cell.clone())?;
         } else {
-            T::default().serialize()?.write_to(cell)?;
+            builder.checked_append_reference(T::default().serialize()?)?;
         }
         Ok(())
     }

@@ -9,14 +9,14 @@
 use crate::{
     engine_traits::EngineOperations,
     network::{
-        check_block_candidate_data, decompress_and_check_candidate_data, decompress_block_broadcast,
+        check_block_candidate_data, decompress_and_check_candidate_data,
+        decompress_and_check_candidate_data_v2, decompress_block_broadcast,
+        decompress_block_broadcast_v2, node_network::NodeNetwork,
     },
 };
 use adnl::{
     common::{hash, spawn_cancelable, TaggedByteSlice},
-    node::{AdnlNode, AdnlSendMethod},
-    AddressSearchContext, BroadcastRecvInfo, DhtNode, DhtSearchPolicy, OverlayNode, OverlayParams,
-    OverlayShortId,
+    BroadcastRecvInfo, NetworkStack, OverlayNode, OverlayParams, OverlayShortId,
 };
 use std::{
     collections::HashMap,
@@ -24,7 +24,6 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Duration,
 };
 use ton_api::{
     deserialize_typed,
@@ -45,9 +44,9 @@ pub struct CustomOverlayClient {
     shards: Vec<ShardIdent>,
     // Don't send external messages to public overlays
     skip_public_msg_send: bool,
-    overlay_node: Arc<OverlayNode>,
-    adnl_node: Arc<AdnlNode>,
-    dht_node: Arc<DhtNode>,
+    // Per-overlay opt-in for QUIC two-step broadcasts, from TL config.
+    use_quic: bool,
+    stack: Arc<NetworkStack>,
     engine: Arc<dyn EngineOperations>,
     cancellation_token: tokio_util::sync::CancellationToken,
     // Inactive overlay doesn't have key and not added at protocol level (OverlayNode).
@@ -61,11 +60,10 @@ impl CustomOverlayClient {
     pub fn new(
         config: &CustomOverlay,
         cancellation_token: tokio_util::sync::CancellationToken,
-        adnl_node: Arc<AdnlNode>,
-        overlay_node: Arc<OverlayNode>,
-        dht_node: Arc<DhtNode>,
+        stack: Arc<NetworkStack>,
         engine: Arc<dyn EngineOperations>,
     ) -> Result<Arc<Self>> {
+        let quic_available = stack.quic.is_some();
         let mut nodes = HashMap::new();
         for node in &config.nodes {
             let id = KeyId::from_data(node.adnl_id.as_slice().to_owned());
@@ -78,15 +76,22 @@ impl CustomOverlayClient {
         for shard_id in &config.sender_shards {
             shards.push(ShardIdent::try_from(shard_id)?);
         }
+        let use_quic: bool = (&config.use_quic).into();
+        if use_quic && !quic_available {
+            log::warn!(
+                "Custom overlay \"{}\" {id_short} requests use_quic \
+                but QUIC stack is not available; falling back to RLDP two-step broadcasts",
+                config.name
+            );
+        }
         let result = Arc::new(Self {
             id: id_short,
             config: config.clone(),
             nodes,
             shards,
             skip_public_msg_send: (&config.skip_public_msg_send).into(),
-            overlay_node,
-            adnl_node,
-            dht_node,
+            use_quic,
+            stack,
             engine,
             cancellation_token,
             is_active: AtomicBool::new(false),
@@ -116,7 +121,7 @@ impl CustomOverlayClient {
             let mut key = None;
             for node in &self.config.nodes {
                 let id = KeyId::from_data(node.adnl_id.as_slice().to_owned());
-                if let Ok(k) = self.adnl_node.key_by_id(&id) {
+                if let Ok(k) = self.stack.adnl.key_by_id(&id) {
                     key = Some(k);
                     self.is_msg_sender
                         .store(matches!(node.msg_sender, Bool::BoolTrue), Ordering::Relaxed);
@@ -130,7 +135,9 @@ impl CustomOverlayClient {
             };
             let params =
                 OverlayParams { flags: 0, hops: None, overlay_id: &self.id, runtime: None };
-            if let Err(e) = self.overlay_node.add_private_overlay(params, &key, &peers, false) {
+            if let Err(e) =
+                self.stack.overlay.add_private_overlay(params, &key, &peers, self.use_quic, None)
+            {
                 attempt += 1;
                 if attempt >= 10 {
                     fail!("Error while adding custom overlay \"{}\": {}", self.config.name, e);
@@ -139,7 +146,14 @@ impl CustomOverlayClient {
             }
             self.is_active.store(true, Ordering::Relaxed);
             self.clone().listen_broadcasts();
-            self.clone().resolve_peers_worker(key.id().clone());
+            NodeNetwork::spawn_overlay_peer_resolver(
+                key.id().clone(),
+                self.nodes.keys().cloned().collect(),
+                self.stack.dht.clone(),
+                self.stack.overlay.clone(),
+                self.cancellation_token.child_token(),
+                format!("custom overlay {}", self.id),
+            );
             log::info!("Custom overlay \"{}\" with id {} activated", self.config.name, self.id);
             return Ok(true);
         }
@@ -153,7 +167,7 @@ impl CustomOverlayClient {
     pub fn stop(&self) {
         log::debug!("Stopping custom overlay \"{}\"", self.config.name);
         self.cancellation_token.cancel();
-        if let Err(e) = self.overlay_node.delete_private_overlay(&self.id) {
+        if let Err(e) = self.stack.overlay.delete_private_overlay(&self.id) {
             log::error!("Error while deleting custom overlay \"{}\": {}", self.config.name, e);
         }
     }
@@ -195,7 +209,7 @@ impl CustomOverlayClient {
                 if self.engine.check_stop() {
                     break;
                 }
-                match self.overlay_node.wait_for_broadcast(&self.id).await {
+                match self.stack.overlay.wait_for_broadcast(&self.id).await {
                     Err(e) => log::error!(
                         "Error while wait_broadcast in custom overlay \"{}\" {}: {}",
                         self.config.name,
@@ -219,11 +233,11 @@ impl CustomOverlayClient {
                         );
                         if let Err(e) = self.process_broadcast(&info).await {
                             log::warn!(
-                                "Error while processing broadcast from {} in custom overlay \"{}\" {}: {}",
+                                "Error while processing broadcast from {} \
+                                in custom overlay \"{}\" {}: {e}",
                                 info.recv_from,
                                 self.config.name,
-                                self.id,
-                                e
+                                self.id
                             );
                         }
                     }
@@ -249,7 +263,7 @@ impl CustomOverlayClient {
             Broadcast::TonNode_ExternalMessageBroadcast(broadcast) => {
                 self.check_send_message_permission(src)?;
                 self.engine.process_ext_msg_broadcast(broadcast, src.clone()).await
-            },
+            }
             Broadcast::TonNode_IhrMessageBroadcast(_broadcast) => log::warn!(
                 "IhrMessageBroadcast from {src} is not allowed in custom overlay \"{}\" {}",
                 self.config.name,
@@ -261,15 +275,26 @@ impl CustomOverlayClient {
             }
             Broadcast::TonNode_BlockBroadcastCompressed(broadcast) => {
                 self.check_send_block_permission(src)?;
-                let bb = decompress_block_broadcast(broadcast)
-                    .map_err(|e| error!("Error decompressing block broadcast: {e} in custom overlay \"{}\" {} from {src}", self.config.name, self.id))?;
+                let bb = decompress_block_broadcast(broadcast).map_err(|e| {
+                    error!(
+                        "Error decompressing block broadcast: \
+                        {e} in custom overlay \"{}\" {} from {src}",
+                        self.config.name, self.id
+                    )
+                })?;
                 self.engine.clone().process_block_broadcast(bb, src.clone())
             }
-            Broadcast::TonNode_BlockBroadcastCompressedV2(_broadcast) => log::warn!(
-                "BlockBroadcastCompressedV2 from {src} is not supported in custom overlay \"{}\" {}",
-                self.config.name,
-                self.id
-            ),
+            Broadcast::TonNode_BlockBroadcastCompressedV2(broadcast) => {
+                self.check_send_block_permission(src)?;
+                let bb = decompress_block_broadcast_v2(broadcast).map_err(|e| {
+                    error!(
+                        "Error decompressing block broadcast V2: \
+                        {e} in custom overlay \"{}\" {} from {src}",
+                        self.config.name, self.id
+                    )
+                })?;
+                self.engine.clone().process_block_broadcast_v2(bb, src.clone())
+            }
             Broadcast::TonNode_NewBlockCandidateBroadcast(broadcast) => {
                 self.check_send_block_permission(src)?;
                 check_block_candidate_data(&broadcast)?;
@@ -292,11 +317,17 @@ impl CustomOverlayClient {
                     data,
                 )?;
             }
-            Broadcast::TonNode_NewBlockCandidateBroadcastCompressedV2(_broadcast) => log::warn!(
-                "NewBlockCandidateBroadcastCompressedV2 from {src} is not supported in custom overlay \"{}\" {}",
-                self.config.name,
-                self.id
-            ),
+            Broadcast::TonNode_NewBlockCandidateBroadcastCompressedV2(broadcast) => {
+                self.check_send_block_permission(src)?;
+                let data = decompress_and_check_candidate_data_v2(&broadcast)?;
+                self.engine.cache_block_candidate(
+                    &broadcast.id,
+                    broadcast.catchain_seqno as u32,
+                    broadcast.validator_set_hash as u32,
+                    broadcast.collator_signature.try_into().unwrap_or_default(),
+                    data,
+                )?;
+            }
             Broadcast::TonNode_OutMsgQueueProofBroadcast(_) => log::debug!(
                 "OutMsgQueueProofBroadcast from {src} is not supported \
                     in custom overlay \"{}\" {}",
@@ -339,48 +370,49 @@ impl CustomOverlayClient {
         }
     }
 
-    pub async fn send_broadcast(
-        &self,
-        data: &TaggedByteSlice<'_>,
-        flags: u32,
-        method: AdnlSendMethod,
-    ) -> Result<()> {
-        if self.is_active.load(Ordering::Relaxed) {
-            match self
-                .overlay_node
-                .broadcast(&self.id, data, None, flags | OverlayNode::FLAG_BCAST_ANY_SENDER, method)
-                .await
-            {
-                Ok(info) => {
-                    #[cfg(feature = "telemetry")]
-                    log::debug!(
-                        "sent broadcast {:08x} in \"{}\" {} to {} nodes",
-                        data.tag,
-                        self.config.name,
-                        self.id,
-                        info.send_to
-                    );
-                    #[cfg(not(feature = "telemetry"))]
-                    log::debug!(
-                        "sent broadcast in \"{}\" {} to {} nodes",
-                        self.config.name,
-                        self.id,
-                        info.send_to
-                    );
-                    Ok(())
-                }
-                Err(e) => {
-                    log::warn!(
-                        "Error sending broadcast in \"{}\" {}: {}",
-                        self.config.name,
-                        self.id,
-                        e
-                    );
-                    Err(e)
-                }
+    pub async fn send_broadcast(&self, data: &TaggedByteSlice<'_>, flags: u32) -> Result<()> {
+        if !self.is_active.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        match self
+            .stack
+            .overlay
+            .broadcast_twostep(
+                &self.id,
+                data,
+                None,
+                flags | OverlayNode::FLAG_BCAST_ANY_SENDER,
+                Vec::new(),
+            )
+            .await
+        {
+            Ok(info) => {
+                #[cfg(feature = "telemetry")]
+                log::debug!(
+                    "sent twostep broadcast {:08x} in \"{}\" {} to {} nodes",
+                    data.tag,
+                    self.config.name,
+                    self.id,
+                    info.send_to
+                );
+                #[cfg(not(feature = "telemetry"))]
+                log::debug!(
+                    "sent twostep broadcast in \"{}\" {} to {} nodes",
+                    self.config.name,
+                    self.id,
+                    info.send_to
+                );
+                Ok(())
             }
-        } else {
-            Ok(())
+            Err(e) => {
+                log::warn!(
+                    "Error sending twostep broadcast in \"{}\" {}: {}",
+                    self.config.name,
+                    self.id,
+                    e
+                );
+                Err(e)
+            }
         }
     }
 
@@ -398,66 +430,5 @@ impl CustomOverlayClient {
         let overlay_key = OverlayKey { name: hash(id_full)?.into() };
         let id_short = OverlayShortId::from_data(hash(overlay_key)?);
         Ok(id_short)
-    }
-
-    fn resolve_peers_worker(self: Arc<Self>, local_key: Arc<KeyId>) {
-        spawn_cancelable(self.cancellation_token.child_token(), async move {
-            let mut peers = self.nodes.keys().cloned().collect();
-            loop {
-                match self.resolve_peers_round(&local_key, peers).await {
-                    Ok(unresolved) => {
-                        peers = unresolved;
-                    }
-                    Err(e) => {
-                        log::warn!("{}: UNEXPECTED ERROR while resolve peers: {}", self.id, e);
-                        break;
-                    }
-                }
-                if peers.is_empty() {
-                    log::info!("{} resolve_peers: finished.", self.id);
-                    break;
-                } else {
-                    log::debug!("resolve_peers: {} peers still unresolved.", peers.len());
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        });
-    }
-
-    async fn resolve_peers_round(
-        &self,
-        local_key: &Arc<KeyId>,
-        peers: Vec<Arc<KeyId>>,
-    ) -> Result<Vec<Arc<KeyId>>> {
-        let mut unresolved = Vec::new();
-        for peer in peers {
-            match self
-                .dht_node
-                .find_address(&mut AddressSearchContext::with_params(
-                    &peer,
-                    DhtSearchPolicy::default(),
-                )?)
-                .await
-            {
-                Ok(Some((adnl_addr, quic_addr, key))) => {
-                    log::debug!(
-                        "{}: peer {}: found ip: {adnl_addr:?}, key: {key:x?}",
-                        self.id,
-                        peer
-                    );
-                    self.overlay_node
-                        .add_private_peers(&local_key, vec![(adnl_addr, quic_addr, key)])?;
-                }
-                Ok(None) => {
-                    log::warn!("{}: find address for {} failed", self.id, &peer);
-                    unresolved.push(peer);
-                }
-                Err(e) => {
-                    log::warn!("{}: find address for {} failed: {e:?}", self.id, &peer);
-                    unresolved.push(peer);
-                }
-            }
-        }
-        Ok(unresolved)
     }
 }

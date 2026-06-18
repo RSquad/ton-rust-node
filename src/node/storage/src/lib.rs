@@ -28,40 +28,7 @@ pub mod types;
 
 #[cfg(feature = "telemetry")]
 use adnl::telemetry::{Metric, MetricBuilder};
-use std::{
-    sync::{atomic::AtomicU64, Arc},
-    time::{Duration, Instant},
-};
-
-pub struct TimeChecker {
-    operation: String,
-    threshold: Duration,
-    start: Instant,
-}
-
-impl TimeChecker {
-    pub fn new(operation: String, threshold_ms: u64) -> Self {
-        let start = std::time::Instant::now();
-        log::trace!("{} - started", operation);
-        Self { operation, threshold: Duration::from_millis(threshold_ms), start }
-    }
-}
-
-impl Drop for TimeChecker {
-    fn drop(&mut self) {
-        let time = self.start.elapsed();
-        if time < self.threshold {
-            log::trace!("{} - finished, TIME: {}", self.operation, time.as_millis());
-        } else {
-            log::warn!(
-                "{} - finished too slow, TIME: {}ms, expected: {}ms",
-                self.operation,
-                time.as_millis(),
-                self.threshold.as_millis()
-            );
-        }
-    }
-}
+use std::sync::{atomic::AtomicU64, Arc};
 
 #[cfg(feature = "telemetry")]
 pub struct StorageTelemetry {
@@ -69,15 +36,12 @@ pub struct StorageTelemetry {
     pub handles: Arc<Metric>,
     pub packages: Arc<Metric>,
 
-    pub stored_cells: Arc<Metric>,
     pub storing_cells: Arc<Metric>,
+    pub storing_cells_bytes: Arc<Metric>,
     pub shardstates_queue: Arc<Metric>,
-    pub cached_cells_counters: Arc<Metric>,
 
     pub loaded_cells_from_db: Arc<MetricBuilder>,
     pub load_cell_from_db_time_nanos: Arc<Metric>,
-    pub load_cell_from_cache_time_nanos: Arc<Metric>,
-    pub store_cell_to_cache_time_nanos: Arc<Metric>,
     pub stored_new_cells: Arc<MetricBuilder>,
     pub deleted_cells: Arc<MetricBuilder>,
 
@@ -101,6 +65,13 @@ pub struct StorageTelemetry {
     pub cell_cache_hits: Arc<MetricBuilder>,
     pub cell_cache_misses: Arc<MetricBuilder>,
     pub cell_cache_len: Arc<Metric>,
+
+    pub counter_cache_hits: Arc<MetricBuilder>,
+    pub counter_cache_misses: Arc<MetricBuilder>,
+    pub counter_cache_len: Arc<Metric>,
+    pub rocksdb_mem_table_mb: Arc<Metric>,
+    pub rocksdb_block_cache_mb: Arc<Metric>,
+    pub rocksdb_table_readers_mb: Arc<Metric>,
 }
 #[cfg(feature = "telemetry")]
 impl Default for StorageTelemetry {
@@ -109,17 +80,14 @@ impl Default for StorageTelemetry {
             file_entries: Metric::without_totals("", 1),
             handles: Metric::without_totals("", 1),
             packages: Metric::without_totals("", 1),
-            stored_cells: Metric::without_totals("", 1),
             storing_cells: Metric::without_totals("", 1),
+            storing_cells_bytes: Metric::without_totals("", 1),
             shardstates_queue: Metric::without_totals("", 1),
-            cached_cells_counters: Metric::without_totals("", 1),
             loaded_cells_from_db: MetricBuilder::with_metric_and_period(
                 Metric::with_total_amount("", 1),
                 1000000000,
             ),
             load_cell_from_db_time_nanos: Metric::with_total_average("", 1),
-            load_cell_from_cache_time_nanos: Metric::with_total_average("", 1),
-            store_cell_to_cache_time_nanos: Metric::with_total_average("", 1),
             stored_new_cells: MetricBuilder::with_metric_and_period(
                 Metric::with_total_amount("", 1),
                 1000000000,
@@ -156,7 +124,56 @@ impl Default for StorageTelemetry {
                 1000000000,
             ),
             cell_cache_len: Metric::without_totals("", 1),
+            counter_cache_hits: MetricBuilder::with_metric_and_period(
+                Metric::with_total_amount("", 1),
+                1000000000,
+            ),
+            counter_cache_misses: MetricBuilder::with_metric_and_period(
+                Metric::with_total_amount("", 1),
+                1000000000,
+            ),
+            counter_cache_len: Metric::without_totals("", 1),
+            rocksdb_mem_table_mb: Metric::without_totals("", 1),
+            rocksdb_block_cache_mb: Metric::without_totals("", 1),
+            rocksdb_table_readers_mb: Metric::without_totals("", 1),
         }
+    }
+}
+
+#[cfg(feature = "telemetry")]
+impl StorageTelemetry {
+    fn hit_rate(hits: &Arc<MetricBuilder>, misses: &Arc<MetricBuilder>) -> u64 {
+        let h = hits.metric().total_amount().unwrap_or(0);
+        let m = misses.metric().total_amount().unwrap_or(0);
+        let total = h + m;
+        if total > 0 {
+            h * 100 / total
+        } else {
+            0
+        }
+    }
+
+    pub fn cell_cache_hit_rate(&self) -> u64 {
+        Self::hit_rate(&self.cell_cache_hits, &self.cell_cache_misses)
+    }
+
+    pub fn counter_cache_hit_rate(&self) -> u64 {
+        Self::hit_rate(&self.counter_cache_hits, &self.counter_cache_misses)
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+pub struct RocksDbMemoryUsage {
+    pub mem_tables: u64,
+    pub block_cache: u64,
+    pub table_readers: u64,
+}
+
+impl std::ops::AddAssign for RocksDbMemoryUsage {
+    fn add_assign(&mut self, rhs: Self) {
+        self.mem_tables += rhs.mem_tables;
+        self.block_cache += rhs.block_cache;
+        self.table_readers += rhs.table_readers;
     }
 }
 
@@ -165,7 +182,6 @@ pub struct StorageAlloc {
     pub file_entries: Arc<AtomicU64>,
     pub handles: Arc<AtomicU64>,
     pub packages: Arc<AtomicU64>,
-    pub storage_cells: Arc<AtomicU64>,
 }
 
 pub(crate) const TARGET: &str = "storage";

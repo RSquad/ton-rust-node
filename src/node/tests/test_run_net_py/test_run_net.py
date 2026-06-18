@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import time
@@ -31,6 +32,17 @@ cpp_src_path: Path
 rust_src_path: Path
 cpp_log_level: int
 cpp_build_command: str
+
+# Validator permanent key lifetime used by `addpermkey` in this harness.
+# `addpermkey {key} {start} {expire}` takes Unix timestamps. A hard-coded
+# constant in the past silently produces an already-expired key — fine
+# today only because enforcement is lenient, fragile if it tightens. Derive
+# the expiry from wall-clock time so the harness stays valid over time.
+VALIDATOR_KEY_LIFETIME_SECONDS = 365 * 24 * 3600
+
+
+def validator_key_expire_at() -> int:
+    return int(time.time()) + VALIDATOR_KEY_LIFETIME_SECONDS
 
 
 def load_config() -> bool:
@@ -170,6 +182,11 @@ def run_command(
     check: bool = True,
     capture_output: bool = True,
 ):
+    if cwd:
+       print(f"$ (in {cwd}) {shlex.join(cmd)}")
+    else:
+       print(f"$ {shlex.join(cmd)}")
+
     try:
         result = subprocess.run(
             cmd,
@@ -298,14 +315,26 @@ def prepare_default_config(
 
 
 def run_rust_node(
-    params: list[str], node_index: int, start_new_session: bool = False
+    params: list[str], node_index: int, start_new_session: bool = False,
+    with_vault: bool = True,
 ) -> subprocess.Popen:
     stdout_path = logs_path / f"stdout_{node_index}.log"
     stderr_path = logs_path / f"stderr_{node_index}.log"
     working_dir = build_node_work_path(node_index)
     node_bin_path = bins_path / (node_proc_name + "_" + rust_proc_suffix)
+    cmd = [str(node_bin_path)] + params
+    print(shlex.join(cmd))
     if start_new_session:
         print(f"Starting node {node_index}...")
+
+    node_env = os.environ.copy()
+    if with_vault:
+        per_node_url = node_env.get(f"VAULT_URL_NODE_{node_index}")
+        if per_node_url:
+            node_env["VAULT_URL"] = per_node_url
+    else:
+        node_env.pop("VAULT_URL", None)
+
     with stdout_path.open("w") as out_log, stderr_path.open("w") as err_log:
         proc = subprocess.Popen(
             [str(node_bin_path)] + params,
@@ -313,6 +342,7 @@ def run_rust_node(
             stdout=out_log,
             stderr=err_log,
             start_new_session=start_new_session,
+            env=node_env,
         )
     return proc
 
@@ -394,7 +424,7 @@ def generate_validator_key(node_index: int, console_config_path: str | Path) -> 
 
 def import_validator_key(node_index: int, console_config_path: str | Path, key: str):
     print(f"Adding validator key for node {node_index}...", end="")
-    params = ["-c", f"addpermkey {key} {str(int(time.time()))} 1610000000"]
+    params = ["-c", f"addpermkey {key} {int(time.time())} {validator_key_expire_at()}"]
     run_console(params, node_index, console_config_path)
     print(" done")
 
@@ -435,7 +465,7 @@ def prepare_node(
     console_public = {"type_id": 1209251014, "pub_key": console_key_json["pubkey"]}
     params = ["--configs", ".", "--ckey", json.dumps(console_public)]
     print(f"Starting node {node_index} to generate configs...")
-    node_proc = run_rust_node(params, node_index)
+    node_proc = run_rust_node(params, node_index, with_vault=False)
     try:
         node_work_path = build_node_work_path(node_index)
 
@@ -709,6 +739,7 @@ def build_zerostate(
     simplex_mc: bool = False,
     simplex_config: dict = None,
     use_quic: bool = False,
+    enable_observers: bool = False,
 ) -> str:
     print("Building zerostate...", end="")
     zerostate = json.loads(zerostate_blank)
@@ -757,6 +788,9 @@ def build_zerostate(
         }
         if use_quic:
             simplex_entry["use_quic"] = 1
+        # Route block-candidate broadcasts through the dedicated block-sync overlay
+        if enable_observers:
+            simplex_entry["enable_observers"] = 1
         # MC simplex config (enabled when --simplex-mc is specified)
         if simplex_mc:
             p30["mc"] = dict(simplex_entry)
@@ -764,7 +798,8 @@ def build_zerostate(
         p30["shard"] = dict(simplex_entry)
         zerostate["master"]["config"]["p30"] = p30
         quic_str = ", quic=true" if use_quic else ""
-        print(f" [simplex enabled: mc={simplex_mc}{quic_str}]", end="")
+        obs_str = ", enable_observers=true" if enable_observers else ""
+        print(f" [simplex enabled: mc={simplex_mc}{quic_str}{obs_str}]", end="")
 
     zs_json_path = common_config_path / "zerostate.json"
     with zs_json_path.open("w") as fout:
@@ -834,6 +869,24 @@ def build_global_config(zerostate_info: str):
 
     print(" done")
 
+def add_control_client_key_to_nodes(pub_key_b64: str):
+    """Add a shared control client public key to every node's control_server.clients.list."""
+    global run_fullnode, nodes_count
+    print("Adding shared control client public key to all nodes...", end="")
+    for n in range(0 if run_fullnode else 1, nodes_count + 1):
+        node_cfg_path = build_node_work_path(n) / "config.json"
+        if not node_cfg_path.exists():
+            print(f"\n  Warning: config.json not found for node {n}, skipping", end="")
+            continue
+        with open(node_cfg_path) as f:
+            cfg = json.load(f)
+        clients_list = cfg.get("control_server", {}).get("clients", {}).get("list", [])
+        clients_list.append({"type_id": 1209251014, "pub_key": pub_key_b64})
+        cfg.setdefault("control_server", {}).setdefault("clients", {})["list"] = clients_list
+        with open(node_cfg_path, "w") as f:
+            json.dump(cfg, f, indent=2)
+    print(" done")
+
 
 def build_nodectl_config(root_path):
     global run_fullnode, nodes_count, common_config_path
@@ -898,11 +951,24 @@ def main():
         help="Enable QUIC overlay transport in ConfigParam 30 (use_quic flag). Implies --simplex.",
     )
     parser.add_argument(
+        "--enable-observers",
+        action="store_true",
+        help="Set ConfigParam 30 simplex_config_v2.enable_observers=1 (implies --simplex). "
+             "Routes block-candidate broadcasts through the dedicated block-sync overlay.",
+    )
+    parser.add_argument(
         "--quic_custom_port",
         action="store_true",
         help="Use QUIC port offset 2000 (instead of 1000) to verify DHT announces. "
              "Nodes bind QUIC on adnl_port+2000 but the auto-derive fallback is adnl_port+1000, "
              "so QUIC connections only work if advertised addresses are used. Implies --quic.",
+    )
+    parser.add_argument(
+        "--control-client-public-key",
+        type=str,
+        default=None,
+        metavar="BASE64",
+        help="Base64 public key to add to every node's control_server.clients.list",
     )
     args = parser.parse_args()
 
@@ -914,6 +980,9 @@ def main():
         args.simplex = True
     # --simplex-mc implies --simplex
     if args.simplex_mc:
+        args.simplex = True
+    # --enable-observers implies --simplex (BlockSync)
+    if args.enable_observers:
         args.simplex = True
     if args.start is None:
         args.start = False
@@ -939,8 +1008,8 @@ def main():
 
     if build:
         build_rust([])  # always build rust because we need tools etc.
-        #if cpp_nodes_count > 0:
-        #    build_cpp()
+        if cpp_nodes_count > 0:
+            build_cpp()
 
     test_root_path = Path(__file__).parent
 
@@ -962,6 +1031,9 @@ def main():
             )
             if n != 0:
                 validator_pub_keys.append(vk)
+
+        if args.control_client_public_key:
+            add_control_client_key_to_nodes(args.control_client_public_key)
 
         build_nodectl_config(test_root_path)
 
@@ -997,6 +1069,7 @@ def main():
             simplex_mc=args.simplex_mc,
             simplex_config=simplex_config,
             use_quic=args.quic,
+            enable_observers=args.enable_observers,
         )
 
         # Build global config

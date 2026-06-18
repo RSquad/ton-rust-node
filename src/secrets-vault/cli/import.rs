@@ -9,10 +9,15 @@
 use crate::utils::open_vault;
 use colored::Colorize;
 use secrets_vault::{
-    crypto::factory::{AutoCryptoFactory, CryptoFactory},
+    crypto::factory::{CryptoFactory, DefaultCryptoFactory},
     errors::error::VaultError,
-    memory::protected_memory::ProtectedMemory,
-    types::{algorithm::Algorithm, metadata::Metadata, secret::Secret, store_mode::StoreMode},
+    memory::protected_memory::{ProtectedMemory, ProtectedMemoryInner},
+    types::{
+        algorithm::Algorithm,
+        metadata::Metadata,
+        secret::{SecretDataType, SecretInMemoryFactory},
+        store_mode::StoreMode,
+    },
 };
 
 pub async fn execute(
@@ -34,13 +39,18 @@ pub async fn execute(
 
     let secret = match algorithm {
         Algorithm::None => {
-            let crypto = AutoCryptoFactory {}.new_crypto()?;
-            Secret::from_raw_data(data, metadata, crypto).await?
+            let crypto = DefaultCryptoFactory {}.new_crypto()?;
+            SecretInMemoryFactory::new_raw(data, metadata, crypto)?
         }
         Algorithm::Ed25519 => {
-            let crypto = AutoCryptoFactory {}.new_crypto()?;
-            let data = from_private_key(data).await?;
-            Secret::from_protected_data(data, metadata, crypto).await?
+            let crypto = DefaultCryptoFactory {}.new_crypto()?;
+            let data = from_private_key(data)?;
+            SecretInMemoryFactory::from_protected_data(
+                data,
+                SecretDataType::Ed25519PvtKey,
+                metadata,
+                crypto,
+            )?
         }
         Algorithm::Aes256Gcm => {
             todo!()
@@ -48,7 +58,7 @@ pub async fn execute(
         _ => anyhow::bail!(VaultError::unsupported_algorithm(algorithm)),
     };
 
-    vault.put(&secret, store_mode).await?;
+    vault.store(&secret, store_mode).await?;
     vault.flush().await?;
 
     println!(
@@ -60,7 +70,7 @@ pub async fn execute(
     Ok(())
 }
 
-async fn from_private_key(key: &[u8]) -> anyhow::Result<ProtectedMemory> {
+fn from_private_key(key: &[u8]) -> anyhow::Result<ProtectedMemory> {
     // Verify key length
     if key.len() != ed25519_dalek::SECRET_KEY_LENGTH {
         anyhow::bail!(VaultError::invalid_private_key(format!(
@@ -77,7 +87,8 @@ async fn from_private_key(key: &[u8]) -> anyhow::Result<ProtectedMemory> {
     })?;
 
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret_key);
-    let signing_key_p = ProtectedMemory::from_slice(signing_key.as_bytes()).await?;
+    let signing_key_p: ProtectedMemory =
+        ProtectedMemoryInner::from_slice(signing_key.as_bytes())?.into();
 
     Ok(signing_key_p)
 }

@@ -13,7 +13,7 @@
 use super::*;
 use crate::{
     read_single_root_boc, write_read_and_assert, Ed25519KeyOption, Serializable, ValidatorDescr,
-    VarUInteger32,
+    VarUInteger32, ZeroizingBytes,
 };
 use rand::Rng;
 
@@ -198,7 +198,7 @@ fn test_config_param_31() {
 fn get_validator_set() -> ValidatorSet {
     let mut list = vec![];
     for n in 0..2 {
-        let keypair = Ed25519KeyOption::generate().unwrap();
+        let keypair = Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap();
         let key = SigPubKey::from_bytes(keypair.pub_key().unwrap()).unwrap();
         let vd = ValidatorDescr::with_params(key, n, None);
         list.push(vd);
@@ -639,14 +639,14 @@ fn test_config_params() {
 fn get_config_param_39() -> ConfigParam39 {
     let mut cp = ConfigParam39::default();
 
-    let keypair = Ed25519KeyOption::generate().unwrap();
+    let keypair = Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap();
     let spk = SigPubKey::from_bytes(keypair.pub_key().unwrap()).unwrap();
     let cs = CryptoSignature::with_r_s(&[1; 32], &[2; 32]);
     let vtk = ValidatorTempKey::with_params(UInt256::from([3; 32]), spk, 100500, 1562663724);
     let vstk = ValidatorSignedTempKey::with_key_and_signature(vtk, cs);
     cp.insert(&UInt256::from([1; 32]), &vstk).unwrap();
 
-    let keypair = Ed25519KeyOption::generate().unwrap();
+    let keypair = Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap();
     let spk = SigPubKey::from_bytes(keypair.pub_key().unwrap()).unwrap();
     let cs = CryptoSignature::with_r_s(&[6; 32], &[7; 32]);
     let vtk = ValidatorTempKey::with_params(UInt256::from([8; 32]), spk, 500100, 1562664724);
@@ -799,7 +799,7 @@ fn get_config_param7() -> ConfigParam7 {
 fn get_config_param9() -> ConfigParam9 {
     let mut mp = MandatoryParams::default();
     for _ in 1..100 {
-        mp.set(&rand::random::<u32>(), &()).unwrap();
+        mp.set(&rand::random::<u32>(), &EmptyValue).unwrap();
     }
     ConfigParam9 { mandatory_params: mp }
 }
@@ -807,7 +807,7 @@ fn get_config_param9() -> ConfigParam9 {
 fn get_config_param10() -> ConfigParam10 {
     let mut cp = MandatoryParams::default();
     for _ in 1..100 {
-        cp.set(&rand::random::<u32>(), &()).unwrap();
+        cp.set(&rand::random::<u32>(), &EmptyValue).unwrap();
     }
     ConfigParam10 { critical_params: cp }
 }
@@ -913,8 +913,8 @@ fn test_calc_storage_fees_max() {
     };
     let max_int64 = i64::MAX as u64;
     assert_eq!(max_int64, 0x7FFF_FFFF_FFFF_FFFF);
-    let fee = sp.calc_storage_fee(max_int64, max_int64, max_int64, true);
-    assert_eq!(fee, "650335181531487160332425701902778368008".parse().unwrap());
+    let fee = sp.calc_storage_fee_part(max_int64, max_int64, max_int64, true);
+    assert_eq!(fee, "42620366456847542539545850799900483125749000".parse().unwrap());
 }
 
 #[test]
@@ -1050,6 +1050,8 @@ fn test_simplex_config_v2_round_trip() {
             first_block_timeout_ms: 1000,
             max_leader_window_desync: 250,
             candidate_resolve_rate_limit: 10,
+            min_block_interval_ms: 333,
+            no_empty_blocks_on_error_timeout_ms: 22_000,
             ..Default::default()
         },
         ..Default::default()
@@ -1143,6 +1145,49 @@ fn test_new_consensus_config_all_with_v2() {
     let parsed = NewConsensusConfigAll::construct_from_cell(cell).unwrap();
     assert_eq!(parsed.mc.unwrap(), config);
     assert_eq!(parsed.shard.unwrap(), config);
+}
+
+#[test]
+fn test_simplex_config_enable_observers_round_trip() {
+    let config = SimplexConfig {
+        enable_observers: true,
+        use_quic: true,
+        slots_per_leader_window: 4,
+        ..Default::default()
+    };
+    let cell = config.write_to_new_cell().unwrap().into_cell().unwrap();
+    let config2 = SimplexConfig::construct_from_cell(cell).unwrap();
+    assert_eq!(config, config2);
+    assert!(config2.enable_observers);
+    assert!(config2.use_quic);
+}
+
+/// Verifies the v2 flag-byte wire layout:
+/// MSB->LSB = 6 zero flag bits, enable_observers (bit 1), use_quic (bit 0).
+#[test]
+fn test_simplex_config_v2_flag_byte_layout() {
+    fn flag_byte(enable_observers: bool, use_quic: bool) -> u8 {
+        let cfg = SimplexConfig { enable_observers, use_quic, ..Default::default() };
+        let cell = cfg.write_to_new_cell().unwrap().into_cell().unwrap();
+        let mut s = SliceData::load_cell(cell).unwrap();
+        let tag = s.get_next_byte().unwrap();
+        assert_eq!(tag, 0x22);
+        s.get_next_byte().unwrap()
+    }
+    assert_eq!(flag_byte(false, false), 0x00);
+    assert_eq!(flag_byte(false, true), 0x01);
+    assert_eq!(flag_byte(true, false), 0x02);
+    assert_eq!(flag_byte(true, true), 0x03);
+}
+
+/// v1 (`simplex_config#21`) had no enable_observers; we keep lenient decode
+/// to preserve archive replay
+#[test]
+fn test_deserialize_v1_cell_enable_observers_is_false() {
+    let cell = build_v1_cell(true, 300, 4, 1000, 100);
+    let config = SimplexConfig::construct_from_cell(cell).unwrap();
+    assert!(!config.enable_observers);
+    assert!(config.use_quic);
 }
 
 #[test]

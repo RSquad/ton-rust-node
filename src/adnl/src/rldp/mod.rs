@@ -24,11 +24,14 @@ use rand::Rng;
 #[cfg(feature = "debug")]
 use std::sync::atomic::AtomicPtr;
 #[cfg(any(feature = "debug", feature = "telemetry"))]
+use std::sync::atomic::AtomicU32;
+#[cfg(any(feature = "debug", feature = "telemetry"))]
 use std::time::Instant;
 use std::{
     cmp::min,
+    collections::HashSet,
     sync::{
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicI32, AtomicU64, Ordering},
         Arc,
     },
     time::Duration,
@@ -92,7 +95,10 @@ pub struct Constraints {
 }
 
 impl Constraints {
+    const DEFAULT_INBOUND_TRANSFER_SIZE: usize = 2 << 10; // 2 KB
     const MAX_PARTS_IN_TRANSIT: usize = 20;
+    const MAX_TOTAL_TRANSFER_SIZE: usize = 16 << 20; // 16 MB
+    const RLDP_ANSWER_TL_OVERHEAD: usize = 64; // RldpAnswer { query_id, data } serialize overhead
     const SLICE: usize = 2000000;
     const SYMBOL: usize = 768;
 
@@ -165,8 +171,8 @@ impl RldpStats {
 
 declare_counted!(
     struct RldpPeer {
-        outbounds: AtomicU32,
-        queue: lockfree::queue::Queue<Arc<tokio::sync::Barrier>>,
+        extended_inbound_cap_count: AtomicI32,
+        outbound_semaphore: Arc<tokio::sync::Semaphore>,
         stats: StatsV2,
     }
 );
@@ -211,6 +217,7 @@ impl RldpNode {
     const SPINNER_V1_SEND_MS: u64 = 10;
     const TIMEOUT_MAX_MS: u64 = 10000;
     const TIMEOUT_MIN_MS: u64 = 500;
+    const TIMEOUT_OUTBOUND_HARD_MS: u64 = 30000;
     const TIMEOUT_WARN_MS: u64 = 5000;
     #[cfg(feature = "telemetry")]
     const TIMEOUT_TELEMETRY_SEC: u64 = 10;
@@ -258,6 +265,22 @@ impl RldpNode {
             loss_fn,
         };
         Ok(Arc::new(ret))
+    }
+
+    /// +1/-1 the extended-inbound-cap counter for all given peers
+    /// Duplicates and local ADNL keys are filtered out.
+    pub fn change_inbound_cap_for_peers(&self, peers: &[Arc<KeyId>], delta: i32) -> Result<()> {
+        let resolved: Vec<Arc<RldpPeer>> = peers
+            .iter()
+            .filter(|p| self.adnl.key_by_id(p).is_err())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .map(|p| self.get_peer(p))
+            .collect::<Result<Vec<_>>>()?;
+        for p in &resolved {
+            p.extended_inbound_cap_count.fetch_add(delta, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// Send message
@@ -553,9 +576,10 @@ impl RldpNode {
                 break peer.val().clone();
             }
             add_counted_object_to_map(&self.peers, id.clone(), || {
+                let permits = Self::MAX_OUTBOUNDS_PER_PEER as usize;
                 let ret = RldpPeer {
-                    outbounds: AtomicU32::new(0),
-                    queue: lockfree::queue::Queue::new(),
+                    extended_inbound_cap_count: AtomicI32::new(0),
+                    outbound_semaphore: Arc::new(tokio::sync::Semaphore::new(permits)),
                     stats: StatsV2::new(StatsConfigV2::default(), self.min_timeout_ms)?,
                     counter: self.allocated.peers.clone().into(),
                 };
@@ -636,6 +660,7 @@ impl RldpNode {
                 *transfer_id,
                 self.allocated.recv_transfers.clone(),
                 v2,
+                Some(self.peer_inbound_cap(peers.other())),
                 #[cfg(feature = "debug")]
                 self.timestamp.clone(),
             ),
@@ -672,8 +697,9 @@ impl RldpNode {
             .unwrap_or_else(|e| {
                 log::warn!(
                     target: TARGET,
-                    "ERROR: Incoming {rldp}: {e}, transfer {}",
-                    base64_encode(&context.transfer_id)
+                    "ERROR: Incoming {rldp}: {e}, transfer {} from {}",
+                    base64_encode(&context.transfer_id),
+                    context.peers.other()
                 );
                 None
             });
@@ -881,18 +907,14 @@ impl RldpNode {
         if let Some(roundtrip) = roundtrip {
             peer.stats.set_roundtrip(roundtrip)?
         }
-        let outbounds = peer.outbounds.fetch_add(1, Ordering::Relaxed);
+        let _permit = peer.outbound_semaphore.clone().acquire_owned().await?;
         #[cfg(feature = "telemetry")]
         log::trace!(
             target: TARGET,
-            "RLDP STAT send: peer {} outbounds queued: {outbounds}",
-            peers.other()
+            "RLDP STAT send: peer {} outbound permit acquired (available {})",
+            peers.other(),
+            peer.outbound_semaphore.available_permits(),
         );
-        if outbounds >= Self::MAX_OUTBOUNDS_PER_PEER {
-            let ping = Arc::new(tokio::sync::Barrier::new(2));
-            peer.queue.push(ping.clone());
-            ping.wait().await;
-        }
         #[cfg(feature = "telemetry")]
         let all = RldpStats::inc(&self.stats.transfers_sent_all);
         #[cfg(feature = "telemetry")]
@@ -918,10 +940,13 @@ impl RldpNode {
                 *x ^= 0xFF
             }
             let (queue_sender, queue_reader) = tokio::sync::mpsc::unbounded_channel();
+            let expected_total_size = max_answer_size
+                .map(|s| (s as usize).saturating_add(Constraints::RLDP_ANSWER_TL_OVERHEAD));
             let recv_transfer = RecvTransfer::new(
                 recv_transfer_id,
                 self.allocated.recv_transfers.clone(),
                 v2,
+                expected_total_size,
                 #[cfg(feature = "debug")]
                 self.timestamp.clone(),
             );
@@ -967,8 +992,42 @@ impl RldpNode {
         };
         #[cfg(feature = "debug")]
         self.check_time("Outbound begin");
-        let res =
-            self.outbound_loop(send_context, recv_context, &send_transfer_id, v2, &peer).await;
+        let outbound_started_at = std::time::Instant::now();
+        log::debug!(
+            target: TARGET,
+            "outbound start: transfer {} to {}, query={}, total_to_send={total_to_send}",
+            base64_encode(&send_transfer_id),
+            peers.other(),
+            query_id.is_some(),
+        );
+        let res = match tokio::time::timeout(
+            Duration::from_millis(Self::TIMEOUT_OUTBOUND_HARD_MS),
+            self.outbound_loop(send_context, recv_context, &send_transfer_id, v2, &peer),
+        )
+        .await
+        {
+            Ok(res) => res,
+            Err(_) => {
+                log::warn!(
+                    target: TARGET,
+                    "outbound HARD TIMEOUT after {} ms: transfer {} to {}, query={}, \
+                     total_to_send={total_to_send}",
+                    Self::TIMEOUT_OUTBOUND_HARD_MS,
+                    base64_encode(&send_transfer_id),
+                    peers.other(),
+                    query_id.is_some(),
+                );
+                Err(error!("outbound hard timeout after {} ms", Self::TIMEOUT_OUTBOUND_HARD_MS))
+            }
+        };
+        log::debug!(
+            target: TARGET,
+            "outbound end: transfer {} to {}, elapsed {} ms, ok={}",
+            base64_encode(&send_transfer_id),
+            peers.other(),
+            outbound_started_at.elapsed().as_millis(),
+            res.is_ok(),
+        );
         if res.is_err() {
             self.transfers.insert(send_transfer_id, RldpTransfer::Done);
         }
@@ -991,22 +1050,7 @@ impl RldpNode {
         let now = RldpStats::dec(&self.stats.transfers_sent_now);
         #[cfg(feature = "telemetry")]
         log::trace!(target: TARGET, "RLDP STAT send: transfers total {all}, actual {now}");
-        let outbounds = peer.outbounds.fetch_sub(1, Ordering::Relaxed);
-        #[cfg(feature = "telemetry")]
-        log::trace!(
-            target: TARGET,
-            "RLDP STAT send: peer {} outbounds queued: {outbounds}",
-            peers.other()
-        );
-        if outbounds > Self::MAX_OUTBOUNDS_PER_PEER {
-            loop {
-                if let Some(pong) = peer.queue.pop() {
-                    pong.wait().await;
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        }
+        // _permit drops here, releasing the outbound slot.
         let answer = res?;
         if let Some(answer) = answer {
             let Some(query_id) = query_id else {
@@ -1092,6 +1136,7 @@ impl RldpNode {
         };
         let start_ms = peer.stats.v1.timestamp_ms();
         let mut last_warn_ms = start_ms;
+        let mut last_diag_ms = start_ms;
         let mut updates = recv_state.updates();
         loop {
             match tokio::time::timeout(Duration::from_millis(Self::SPINNER_MS), pong.recv()).await {
@@ -1112,6 +1157,20 @@ impl RldpNode {
                     target: TARGET,
                     "Recv updates {updates} -> {new_updates} in {transfer_str}"
                 );
+                let timestamp_ms = peer.stats.v1.timestamp_ms();
+                let elapsed_ms = timestamp_ms - start_ms;
+                let timeout = peer.stats.v1.timeout();
+                if (timeout > 0)
+                    && (elapsed_ms / timeout > 10)
+                    && (timestamp_ms - last_diag_ms > Self::TIMEOUT_WARN_MS)
+                {
+                    log::warn!(
+                        target: TARGET,
+                        "RLDP query recv {transfer_str} masked timeout: \
+                         elapsed {elapsed_ms} ms > 10*{timeout} ms, updates {new_updates}"
+                    );
+                    last_diag_ms = timestamp_ms;
+                }
                 peer.stats.v1.update(self.min_timeout_ms);
                 updates = new_updates;
             } else if peer.stats.v1.try_timeout(start_ms) {
@@ -1133,6 +1192,15 @@ impl RldpNode {
         Ok(None)
     }
 
+    fn peer_inbound_cap(&self, peer: &Arc<KeyId>) -> usize {
+        if let Some(p) = self.peers.get(peer) {
+            if p.val().extended_inbound_cap_count.load(Ordering::Relaxed) > 0 {
+                return Constraints::MAX_TOTAL_TRANSFER_SIZE;
+            }
+        }
+        Constraints::DEFAULT_INBOUND_TRANSFER_SIZE
+    }
+
     #[cfg(feature = "telemetry")]
     fn print_stats(&self) {}
 
@@ -1140,25 +1208,62 @@ impl RldpNode {
         let transfer_str = Self::transfer_string(&context.transfer_id, &context.peers, "from");
         let rldp = if v2 { "RLDPv2" } else { "RLDPv1" };
         let spin = Duration::from_millis(Self::ACK_DELAY_MS);
+        let start = std::time::Instant::now();
+        let mut last_diag = start;
+        let mut packets_received: u32 = 0;
+        let mut confirmations_sent: u32 = 0;
         loop {
+            if (start.elapsed() > Duration::from_millis(Self::TIMEOUT_MAX_MS))
+                && (last_diag.elapsed() > Duration::from_millis(Self::TIMEOUT_WARN_MS))
+            {
+                let received = context.recv_transfer.data.len();
+                let total = context.recv_transfer.total_size.unwrap_or(0);
+                log::warn!(
+                    target: TARGET,
+                    "{rldp} receive_loop {transfer_str} running {} ms, {received}/{total} bytes, \
+                    packets_received={packets_received}, confirmations_sent={confirmations_sent}",
+                    start.elapsed().as_millis()
+                );
+                last_diag = std::time::Instant::now();
+            }
             let job = match tokio::time::timeout(spin, context.queue_reader.recv()).await {
                 Ok(Some(job)) => job,
                 Ok(None) => break,
                 Err(_) => {
                     if v2 {
-                        if let Err(e) = context.send_confirmations().await {
-                            log::warn!(target: TARGET, "{rldp} confirmation error: {e}")
+                        match context.send_confirmations().await {
+                            Ok(sent) => {
+                                confirmations_sent = confirmations_sent.saturating_add(sent)
+                            }
+                            Err(e) => log::warn!(target: TARGET, "{rldp} confirmation error: {e}"),
                         }
                     }
                     continue;
                 }
             };
+            packets_received = packets_received.saturating_add(1);
+            let (chunk_v2, chunk_part, chunk_seqno, chunk_data_len) = match &job {
+                Chunk::V1(RldpMessagePart(c)) => (false, c.part, c.seqno, c.data.len()),
+                Chunk::V2(Rldp2MessagePart(c)) => (true, c.part, c.seqno, c.data.len()),
+            };
+            log::debug!(
+                target: TARGET,
+                "{rldp} packet {transfer_str} part={chunk_part} seqno={chunk_seqno} \
+                data_len={chunk_data_len} v2={chunk_v2} \
+                (#{packets_received} in transfer)"
+            );
             #[cfg(feature = "debug")]
             if context.loss_fn.map_or(false, |loss_fn| loss_fn(&job)) {
                 continue;
             }
             match context.recv_transfer.process_chunk(job) {
-                Err(e) => log::warn!(target: TARGET, "{rldp} error: {e}"),
+                Err(e) => {
+                    log::warn!(
+                        target: TARGET,
+                        "{rldp} error in {transfer_str}: {e}, dropping transfer"
+                    );
+                    break;
+                }
                 Ok(reply) => {
                     if let Some(reply) = reply {
                         if let Err(e) = context.adnl.send_custom(&reply, &context.peers).await {
@@ -1206,6 +1311,7 @@ impl RldpNode {
         };
         let start_ms = peer.stats.v1.timestamp_ms();
         let mut last_warn_ms = start_ms;
+        let mut last_diag_ms = start_ms;
         #[cfg(feature = "debug")]
         let mut last_seqno = 0;
         #[cfg(any(feature = "debug", feature = "telemetry"))]
@@ -1291,6 +1397,20 @@ impl RldpNode {
                         &transfer_str,
                         "RLDPv1 send",
                     );
+                    let timestamp_ms = peer.stats.v1.timestamp_ms();
+                    let elapsed_ms = timestamp_ms - start_ms;
+                    let timeout = peer.stats.v1.timeout();
+                    if (timeout > 0)
+                        && (elapsed_ms / timeout > 10)
+                        && (timestamp_ms - last_diag_ms > Self::TIMEOUT_WARN_MS)
+                    {
+                        log::warn!(
+                            target: TARGET,
+                            "RLDPv1 send {transfer_str} masked timeout: \
+                             elapsed {elapsed_ms} ms > 10*{timeout} ms, recv_seqno {new_recv_seqno}"
+                        );
+                        last_diag_ms = timestamp_ms;
+                    }
                     peer.stats.v1.update(min_timeout_ms);
                     recv_seqno = new_recv_seqno;
                 } else if peer.stats.v1.try_timeout(start_ms) {
@@ -1325,7 +1445,11 @@ impl RldpNode {
         let bbr_part_states = transfer_state.clone();
         let bbr_peer = peer.clone();
         let bbr_progress = progress.clone();
-        let bbr_task = tokio::spawn(async move {
+        // JoinSet aborts every owned task on drop, so cancellation of `outbound_loop`
+        // (e.g. via the hard timeout wrapper) cleanly terminates these spawns instead
+        // of leaking them as detached background tasks.
+        let mut bbr_handles: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
+        bbr_handles.spawn(async move {
             bbr_peer.stats.bbr_step()?;
             loop {
                 let mut in_progress = 0;
@@ -1353,7 +1477,7 @@ impl RldpNode {
             Ok(())
         });
         let start_ms = peer.stats.v1.timestamp_ms();
-        let mut send_tasks = Vec::new();
+        let mut send_tasks: tokio::task::JoinSet<Result<bool>> = tokio::task::JoinSet::new();
         let ok = loop {
             while send_tasks.len() < Constraints::MAX_PARTS_IN_TRANSIT {
                 if part_transfers.is_empty() {
@@ -1374,14 +1498,13 @@ impl RldpNode {
                     total_packets: total_packets.clone(),
                     transfer_str: transfer_str.clone(),
                 };
-                let send_task: tokio::task::JoinHandle<Result<bool>> = tokio::spawn(async move {
+                send_tasks.spawn(async move {
                     let ret =
                         Self::send_one_part_v2(&mut transfer, &context, start_ms, min_timeout_ms)
                             .await;
                     transfer.on_drop(&context.peer);
                     ret
                 });
-                send_tasks.push(send_task);
             }
             if send_tasks.is_empty() {
                 #[cfg(feature = "debug")]
@@ -1395,14 +1518,13 @@ impl RldpNode {
                 );
                 break Ok(true);
             }
-            match futures::future::select_all(send_tasks).await {
-                (Err(e), _, _) => break Err(e.into()),
-                (Ok(Err(e)), _, _) => break Err(e),
-                (Ok(Ok(ok)), _, wait_tasks) => {
+            match send_tasks.join_next().await {
+                None => break Ok(true),
+                Some(Err(e)) => break Err(e.into()),
+                Some(Ok(Err(e))) => break Err(e),
+                Some(Ok(Ok(ok))) => {
                     if !ok {
                         break Ok(false);
-                    } else {
-                        send_tasks = wait_tasks;
                     }
                 }
             }
@@ -1414,10 +1536,11 @@ impl RldpNode {
             total_packets.load(Ordering::Relaxed),
             if ok { "ok" } else { "timeout" }
         );
-        match bbr_task.await {
-            Err(e) => Err(e.into()),
-            Ok(Err(e)) => Err(e),
-            Ok(Ok(_)) => Ok(ok),
+        match bbr_handles.join_next().await {
+            None => Ok(ok),
+            Some(Err(e)) => Err(e.into()),
+            Some(Ok(Err(e))) => Err(e),
+            Some(Ok(Ok(_))) => Ok(ok),
         }
     }
 
@@ -1448,10 +1571,32 @@ impl RldpNode {
         let mut updates = 0;
         let mut new_received = 0;
         let mut last_warn_ms = context.peer.stats.v1.timestamp_ms();
+        let mut last_diag_ms = last_warn_ms;
         transfer.start()?;
         let ok = loop {
             if let Some(ok) = transfer.state().is_finished() {
                 break ok;
+            }
+            // Heartbeat: fires regardless of which iteration branch we take below,
+            // so silent-peer transfers (where `new_received == 0` always) still emit
+            // evidence that the loop is iterating past the elapsed-timeout horizon.
+            {
+                let timestamp_ms = context.peer.stats.v1.timestamp_ms();
+                let elapsed_ms = timestamp_ms - start_ms;
+                let timeout = context.peer.stats.v1.timeout();
+                if (timeout > 0)
+                    && (elapsed_ms / timeout > 10)
+                    && (timestamp_ms - last_diag_ms > Self::TIMEOUT_WARN_MS)
+                {
+                    log::warn!(
+                        target: TARGET,
+                        "RLDPv2 send_one_part_v2 {} part {part} stuck: \
+                         elapsed {elapsed_ms} ms > 10*{timeout} ms, \
+                         updates {updates}, new_received {new_received}",
+                        context.transfer_str
+                    );
+                    last_diag_ms = timestamp_ms;
+                }
             }
             if new_received > 0 {
                 log::trace!(

@@ -10,8 +10,8 @@
  */
 use super::consensus::{
     get_elapsed_time, AsyncRequestPtr, BlockHash, BlockPayloadPtr, BlockSourceInfo,
-    CollationParentHint, CommittedBlockProofCallback, ConsensusReplayListener, PublicKey,
-    PublicKeyHash, SessionId, SessionListener, SessionStats, ValidatorBlockCandidateCallback,
+    CandidateObservedFlags, CollationParentHint, ConsensusReplayListener, PublicKey, PublicKeyHash,
+    SessionId, SessionListener, SessionStats, ValidatorBlockCandidateCallback,
     ValidatorBlockCandidateDecisionCallback,
 };
 use crate::validator::validator_group::{ValidatorGroup, ValidatorGroupStatus};
@@ -31,8 +31,21 @@ pub struct OnBlockCommitted {
     approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
 }
 
+pub struct OnBlockFinalized {
+    pub block_id: BlockIdExt,
+    pub source_info: BlockSourceInfo,
+    pub root_hash: BlockHash,
+    pub file_hash: BlockHash,
+    pub data: BlockPayloadPtr,
+    pub signatures: BlockSignaturesVariant,
+    pub approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
+}
+
 #[allow(clippy::enum_variant_names)]
 pub enum ValidationAction {
+    OnAppliedTop {
+        applied_top: BlockIdExt,
+    },
     OnGenerateSlot {
         source_info: BlockSourceInfo,
         request: AsyncRequestPtr,
@@ -46,6 +59,12 @@ pub enum ValidationAction {
         collated_data: BlockPayloadPtr,
         callback: ValidatorBlockCandidateDecisionCallback,
     },
+    OnCandidateObserved {
+        block_id: BlockIdExt,
+        data: BlockPayloadPtr,
+        collated_data: BlockPayloadPtr,
+        flags: CandidateObservedFlags,
+    },
     OnBlockCommitted(OnBlockCommitted),
     OnBlockSkipped {
         round: u32,
@@ -57,10 +76,7 @@ pub enum ValidationAction {
         collated_data_hash: BlockHash,
         callback: ValidatorBlockCandidateCallback,
     },
-    OnGetCommittedCandidate {
-        block_id: BlockIdExt,
-        callback: CommittedBlockProofCallback,
-    },
+    OnBlockFinalized(OnBlockFinalized),
 }
 
 impl fmt::Display for OnBlockCommitted {
@@ -72,6 +88,9 @@ impl fmt::Display for OnBlockCommitted {
 impl fmt::Display for ValidationAction {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
+            ValidationAction::OnAppliedTop { ref applied_top } => {
+                write!(f, "OnAppliedTop block_id={}", applied_top)
+            }
             ValidationAction::OnGenerateSlot { ref source_info, ref request, .. } => {
                 write!(
                     f,
@@ -85,6 +104,14 @@ impl fmt::Display for ValidationAction {
                 write!(f, "OnCandidate round: {}", source_info.priority.round)
             }
 
+            ValidationAction::OnCandidateObserved { ref block_id, ref flags, .. } => {
+                write!(
+                    f,
+                    "OnCandidateObserved block_id={} parent_ready={} local_collated={}",
+                    block_id, flags.parent_ready, flags.local_collated,
+                )
+            }
+
             ValidationAction::OnBlockCommitted(ref committed) => {
                 write!(f, "OnBlockCommitted round: {}", committed.source_info.priority.round)
             }
@@ -95,8 +122,12 @@ impl fmt::Display for ValidationAction {
 
             ValidationAction::OnGetApprovedCandidate { .. } => write!(f, "OnGetApprovedCandidate"),
 
-            ValidationAction::OnGetCommittedCandidate { ref block_id, .. } => {
-                write!(f, "OnGetCommittedCandidate block_id={}", block_id)
+            ValidationAction::OnBlockFinalized(ref finalized) => {
+                write!(
+                    f,
+                    "OnBlockFinalized block_id={} round={}",
+                    finalized.block_id, finalized.source_info.priority.round
+                )
             }
         }
     }
@@ -119,6 +150,10 @@ impl ValidatorSessionListener {
                 error,
                 self.info_round(round));
         }
+    }
+
+    pub(crate) fn queue_sender(&self) -> tokio::sync::mpsc::UnboundedSender<ValidationAction> {
+        self.queue.clone()
     }
 
     pub fn create(
@@ -146,6 +181,29 @@ impl SessionListener for ValidatorSessionListener {
         self.do_send_general(
             Some(round),
             ValidationAction::OnCandidate { source_info, root_hash, data, collated_data, callback },
+        );
+    }
+
+    fn on_candidate_observed(
+        &self,
+        block_id: BlockIdExt,
+        data: BlockPayloadPtr,
+        collated_data: BlockPayloadPtr,
+        flags: CandidateObservedFlags,
+    ) {
+        log::debug!(
+            target: "simplex_resolver",
+            "ValidatorSessionListener::on_candidate_observed session_id={:x} shard={} block_id={} parent_ready={} local_collated={} body_present={}",
+            self.session_id,
+            self.shard,
+            block_id,
+            flags.parent_ready,
+            flags.local_collated,
+            flags.body_present,
+        );
+        self.do_send_general(
+            None,
+            ValidationAction::OnCandidateObserved { block_id, data, collated_data, flags },
         );
     }
 
@@ -229,16 +287,33 @@ impl SessionListener for ValidatorSessionListener {
         );
     }
 
-    /// Download committed block proof from full-node
-    fn get_committed_candidate(&self, block_id: BlockIdExt, callback: CommittedBlockProofCallback) {
+    fn on_block_finalized(
+        &self,
+        block_id: BlockIdExt,
+        source_info: BlockSourceInfo,
+        root_hash: BlockHash,
+        file_hash: BlockHash,
+        data: BlockPayloadPtr,
+        signatures: BlockSignaturesVariant,
+        approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
+    ) {
+        let round = source_info.priority.round;
         log::info!(
             target: "validator",
-            "SessionListener::get_committed_candidate block_id={} (session_id={:x}, shard={})",
-            block_id, self.session_id, self.shard
+            "SessionListener::on_block_finalized: block_id={}, round={} (session_id={:x}, shard={})",
+            block_id, round, self.session_id, self.shard
         );
         self.do_send_general(
-            None,
-            ValidationAction::OnGetCommittedCandidate { block_id, callback },
+            Some(round),
+            ValidationAction::OnBlockFinalized(OnBlockFinalized {
+                block_id,
+                source_info,
+                root_hash,
+                file_hash,
+                data,
+                signatures,
+                approve_signatures,
+            }),
         );
     }
 }
@@ -264,6 +339,8 @@ async fn process_validation_action(action: ValidationAction, g: Arc<ValidatorGro
         "({}): Processing action: {}, {}", next_block_descr, action_str, g.info().await
     );
     match action {
+        ValidationAction::OnAppliedTop { applied_top } => g.on_applied_top(applied_top).await,
+
         ValidationAction::OnGenerateSlot { source_info, request, parent, callback } => {
             let round = source_info.priority.round;
             let priority = source_info.priority.priority;
@@ -313,6 +390,20 @@ async fn process_validation_action(action: ValidationAction, g: Arc<ValidatorGro
             }
 
             g.on_candidate(source_info, root_hash, data, collated_data, callback).await
+        }
+
+        ValidationAction::OnCandidateObserved { block_id, data, collated_data, flags } => {
+            log::trace!(
+                target: "simplex_resolver",
+                "({}): OnCandidateObserved block_id={} parent_ready={} local_collated={} body_present={}",
+                next_block_descr,
+                block_id,
+                flags.parent_ready,
+                flags.local_collated,
+                flags.body_present,
+            );
+
+            g.on_candidate_observed(block_id, data, collated_data, flags).await
         }
 
         ValidationAction::OnBlockCommitted(OnBlockCommitted {
@@ -366,8 +457,38 @@ async fn process_validation_action(action: ValidationAction, g: Arc<ValidatorGro
                 .await
         }
 
-        ValidationAction::OnGetCommittedCandidate { block_id, callback } => {
-            g.on_get_committed_candidate(block_id, callback).await
+        ValidationAction::OnBlockFinalized(OnBlockFinalized {
+            block_id,
+            source_info,
+            root_hash,
+            file_hash,
+            data,
+            signatures,
+            approve_signatures,
+        }) => {
+            let round = source_info.priority.round;
+            let source = source_info.source;
+
+            log::trace!(
+                target: "validator",
+                "({}): OnBlockFinalized: block_id={}, round={}, source={}",
+                next_block_descr,
+                block_id,
+                round,
+                source.id(),
+            );
+
+            g.on_block_finalized(
+                block_id,
+                round,
+                source,
+                root_hash,
+                file_hash,
+                data,
+                signatures,
+                approve_signatures,
+            )
+            .await
         }
     }
 }
@@ -469,3 +590,7 @@ pub async fn process_validation_queue(
         g.info().await
     );
 }
+
+#[cfg(test)]
+#[path = "tests/test_validator_session_listener.rs"]
+mod tests;

@@ -31,6 +31,13 @@ use ton_block::{
     P256_SIGNATURE_LENGTH,
 };
 
+const TVM_VERSION_14: u32 = 14;
+const ED25519_IDENTITY_PUBLIC_KEY: [u8; ED25519_PUBLIC_KEY_LENGTH] = {
+    let mut key = [0; ED25519_PUBLIC_KEY_LENGTH];
+    key[0] = 1;
+    key
+};
+
 fn hash_to_uint(bits: impl AsRef<[u8]>) -> IntegerData {
     IntegerData::from_unsigned_bytes_be(bits)
 }
@@ -107,8 +114,10 @@ fn check_signature(engine: &mut Engine, name: &'static str, hash: bool) -> Statu
         if engine.cmd.var(2).as_slice()?.remaining_bits() % 8 != 0 {
             fail!(ExceptionCode::CellUnderflow)
         }
-        engine.cmd.var(2).as_slice()?.get_bytestring(0)
+        engine.cmd.var(2).as_slice()?.get_bytestring(0).into_vec()
     };
+    let is_identity_pub_key = engine.block_version() >= TVM_VERSION_14
+        && pub_key.as_slice() == ED25519_IDENTITY_PUBLIC_KEY;
     let Ok(pub_key) = Ed25519PublicKey::from_bytes(pub_key.as_slice().try_into()?) else {
         engine.cc.stack.push(boolean!(false));
         return Ok(());
@@ -119,9 +128,14 @@ fn check_signature(engine: &mut Engine, name: &'static str, hash: bool) -> Statu
         return Ok(());
     };
     engine.checked_signatures_count = engine.checked_signatures_count.saturating_add(1);
-    engine.try_use_gas(Gas::check_signature_price(engine.checked_signatures_count))?;
+    if engine.checked_signatures_count > Gas::check_signature_threshold() {
+        engine.try_use_gas(Gas::check_signature_price())?;
+    } else {
+        engine.use_free_gas(Gas::check_signature_price());
+    }
     let result = engine.modifiers.chksig_always_succeed
-        || pub_key.verify(&data, &signature[..ED25519_SIGNATURE_LENGTH].try_into()?);
+        || (!is_identity_pub_key
+            && pub_key.verify(&data, &signature[..ED25519_SIGNATURE_LENGTH].try_into()?));
     engine.cc.stack.push(boolean!(result));
     Ok(())
 }
@@ -156,7 +170,7 @@ fn check_p256_signature(engine: &mut Engine, name: &'static str, hash: bool) -> 
                 "Slice does not consist of an integer number of bytes"
             )
         }
-        engine.cmd.var(2).as_slice()?.get_bytestring(0)
+        engine.cmd.var(2).as_slice()?.get_bytestring(0).into_vec()
     };
     if signature.remaining_bits() < P256_SIGNATURE_LENGTH * 8 {
         fail!(ExceptionCode::CellUnderflow, "P256 signature must contain at least 512 data bits")
@@ -231,7 +245,10 @@ pub(super) fn execute_ec_recover(engine: &mut Engine) -> Status {
     let hash = engine.cmd.var(3).as_integer()?;
     let mut signature = r.as_u256()?;
     signature.extend_from_slice(&s.as_u256()?);
-    let recovery_id = v.as_integer_value(0..=255)?;
+    let mut recovery_id: u8 = v.as_integer_value(0..=255)?;
+    if engine.block_version() >= TVM_VERSION_14 && matches!(recovery_id, 27 | 28) {
+        recovery_id -= 27;
+    }
     let hash = hash.as_u256()?;
     engine.try_use_gas(Gas::ec_recover_price())?;
     let result = ton_block::secp256k1_recover_public_key(
@@ -395,11 +412,21 @@ pub(super) fn execute_ristretto_255_mul<T: OperationBehavior>(engine: &mut Engin
     engine.cmd.var(1).as_integer()?;
     engine.try_use_gas(Gas::ristretto_255_mul_gas_price())?;
 
-    let (_y, n) =
-        engine.cmd.var(0).as_integer()?.div::<Quiet>(&RISTRETTO_255_L, Round::FloorToZero)?;
+    let (_y, n) = engine
+        .cmd
+        .var(0)
+        .as_integer()?
+        .div::<Quiet>(&RISTRETTO_255_L, Round::FloorToNegativeInfinity)?;
+    if engine.block_version() < TVM_VERSION_14 && n.is_zero() {
+        engine.cc.stack.push(StackItem::integer(IntegerData::zero()));
+        if T::quiet() {
+            engine.cc.stack.push(boolean!(true));
+        }
+        return Ok(());
+    }
     let x = engine.cmd.var(1).as_integer()?;
     if let Ok(x) = x.as_u256() {
-        if let Ok(n) = n.as_vec(256, true, false) {
+        if let Ok(n) = n.as_vec(256, false, false) {
             if let Some(r) =
                 ton_block::ristretto_255_mul(x.as_slice().try_into()?, n.as_slice().try_into()?)
             {
@@ -430,9 +457,12 @@ pub(super) fn execute_ristretto_255_mulbase<T: OperationBehavior>(engine: &mut E
     engine.cmd.var(0).as_integer()?;
     engine.try_use_gas(Gas::ristretto_255_mulbase_gas_price())?;
 
-    let (_, n) =
-        engine.cmd.var(0).as_integer()?.div::<Quiet>(&RISTRETTO_255_L, Round::FloorToZero)?;
-    if let Ok(n) = n.as_vec(256, true, false) {
+    let (_, n) = engine
+        .cmd
+        .var(0)
+        .as_integer()?
+        .div::<Quiet>(&RISTRETTO_255_L, Round::FloorToNegativeInfinity)?;
+    if let Ok(n) = n.as_vec(256, false, false) {
         let r = ton_block::ristretto_255_mulbase(n.as_slice().try_into()?);
         let r = IntegerData::from_unsigned_bytes_be(r);
         engine.cc.stack.push(StackItem::integer(r));

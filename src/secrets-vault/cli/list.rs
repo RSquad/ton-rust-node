@@ -6,11 +6,11 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::utils::{open_vault, print_secret, print_secret_header};
+use crate::utils::{open_vault, print_secret, print_secret_full, print_secret_header};
 use colored::Colorize;
 use secrets_vault::errors::error::VaultError;
 
-pub async fn execute() -> anyhow::Result<()> {
+pub async fn execute(full: bool, show_private: bool) -> anyhow::Result<()> {
     let vault = open_vault().await?;
     let records = vault.list_metadata().await?;
 
@@ -21,15 +21,21 @@ pub async fn execute() -> anyhow::Result<()> {
 
     println!("\n{} {} ({})\n", "✓".green().bold(), "Records:".green(), records.len());
 
-    print_secret_header();
+    if !full {
+        print_secret_header();
+    }
 
     for meta in &records {
         let secret_id = meta
             .secret_id
             .as_ref()
             .ok_or_else(|| VaultError::empty_secret_id("Failed to list secrets"))?;
-        let secret = vault.get(secret_id).await?;
-        print_secret(&secret).await?;
+        let secret = vault.load(secret_id).await?;
+        if full {
+            print_secret_full(&secret, show_private)?;
+        } else {
+            print_secret(&secret)?;
+        }
     }
 
     println!();

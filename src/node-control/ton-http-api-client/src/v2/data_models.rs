@@ -43,10 +43,12 @@ pub struct RunGetMethodRes {
     pub block_id: Option<BlockIdExt>,
 }
 
-#[derive(Clone, Default, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AccountState {
     Active,
+    /// TON HTTP APIs typically return `"uninit"`; some stacks use `"uninitialized"`.
+    #[serde(rename = "uninit", alias = "uninitialized")]
     #[default]
     Uninitialized,
     Frozen,
@@ -122,7 +124,7 @@ pub struct TransactionId {
 
 #[derive(serde::Deserialize, serde::Serialize)]
 pub struct BlockIdExt {
-    #[serde(rename = "@type")]
+    #[serde(rename = "@type", skip_serializing)]
     pub r#type: String,
     pub workchain: i32,
 
@@ -196,6 +198,18 @@ impl Display for WalletType {
     }
 }
 
+/// Subset of the `getMasterchainInfo` response — only the `last` block id is captured.
+#[derive(serde::Deserialize, serde::Serialize)]
+pub struct GetMasterchainInfoRes {
+    pub last: BlockIdExt,
+}
+
+/// Subset of the `getBlockHeader` response — only `gen_utime` is captured.
+#[derive(serde::Deserialize, serde::Serialize)]
+pub struct GetBlockHeaderRes {
+    pub gen_utime: u32,
+}
+
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
 pub struct GetWalletInformationRes {
     #[serde(rename = "@type")]
@@ -208,4 +222,52 @@ pub struct GetWalletInformationRes {
     pub wallet_type: Option<WalletType>,
     pub seqno: Option<u32>,
     pub wallet_id: Option<u64>,
+}
+
+#[cfg(test)]
+mod account_state_tests {
+    use super::AccountState;
+
+    #[test]
+    fn deserializes_uninit_from_ton_http_api() {
+        let v: AccountState = serde_json::from_value(serde_json::json!("uninit")).unwrap();
+        assert_eq!(v, AccountState::Uninitialized);
+    }
+
+    #[test]
+    fn deserializes_uninitialized_alias() {
+        let v: AccountState = serde_json::from_value(serde_json::json!("uninitialized")).unwrap();
+        assert_eq!(v, AccountState::Uninitialized);
+    }
+
+    #[test]
+    fn serializes_uninitialized_as_uninit() {
+        let s = serde_json::to_string(&AccountState::Uninitialized).unwrap();
+        assert_eq!(s, "\"uninit\"");
+    }
+}
+
+#[cfg(test)]
+mod block_id_ext_tests {
+    use super::BlockIdExt;
+
+    #[test]
+    fn serialize_omits_at_type_but_keeps_block_id_fields() {
+        let block = BlockIdExt {
+            r#type: "ton.blockIdExt".to_string(),
+            workchain: -1,
+            shard: i64::MIN,
+            seqno: 100,
+            root_hash: vec![0u8; 32],
+            file_hash: vec![1u8; 32],
+        };
+        let v = serde_json::to_value(&block).expect("serialize BlockIdExt");
+        let obj = v.as_object().expect("object");
+        assert!(!obj.contains_key("@type"), "@type must not be serialized: {v}");
+        assert_eq!(obj.get("workchain"), Some(&serde_json::json!(-1)));
+        assert_eq!(obj.get("shard"), Some(&serde_json::json!(i64::MIN.to_string())));
+        assert_eq!(obj.get("seqno"), Some(&serde_json::json!(100)));
+        assert!(obj.contains_key("root_hash"));
+        assert!(obj.contains_key("file_hash"));
+    }
 }

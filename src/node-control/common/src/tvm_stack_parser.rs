@@ -66,10 +66,25 @@ impl TvmStackParser {
         Ok(cell)
     }
 
+    /// Optional cell entry.
+    ///
+    /// Handles all empty-cell shapes the rust node's JSON-RPC may produce for TVM stack
+    /// entries — including TONCore `get_pool_data` dicts (`nominators`, `withdraw_requests`):
+    /// `null` (`Unsupported`) and an empty `tvm.list { elements: [] }` both decode to `None`.
+    /// A non-empty dict arrives as a cell, optionally wrapped in a single-element list.
     pub fn cell_opt(&self, index: usize) -> anyhow::Result<Option<Cell>> {
         let entry = self.entry(index)?;
         if let StackEntry::Tvm_StackEntryUnsupported = entry {
             return Ok(None);
+        }
+        if let Some(list) = entry.list() {
+            let elements = list.elements();
+            if elements.is_empty() {
+                return Ok(None);
+            }
+            return Self::new(elements.to_vec())
+                .cell_opt(0)
+                .with_context(|| format!("parse cell inside list at index={index}"));
         }
         let boc = entry
             .cell()
@@ -633,6 +648,54 @@ mod tests {
         let result = parser.cell(0);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("stack entry is not a cell"));
+    }
+
+    #[test]
+    fn test_cell_opt_unsupported_is_none() {
+        let stack = vec![create_unsupported_entry()];
+        let parser = TvmStackParser::new(stack);
+        assert!(parser.cell_opt(0).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_cell_opt_empty_list_is_none() {
+        let stack = vec![create_list_entry(vec![])];
+        let parser = TvmStackParser::new(stack);
+        assert!(parser.cell_opt(0).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_cell_opt_cell_directly() {
+        let cell = Cell::default();
+        let stack = vec![create_cell_entry(&cell)];
+        let parser = TvmStackParser::new(stack);
+        let parsed = parser.cell_opt(0).unwrap().expect("expected cell");
+        assert_eq!(parsed.repr_hash(), cell.repr_hash());
+    }
+
+    #[test]
+    fn test_cell_opt_list_wrapping_cell() {
+        let cell = Cell::default();
+        let stack = vec![create_list_entry(vec![create_cell_entry(&cell)])];
+        let parser = TvmStackParser::new(stack);
+        let parsed = parser.cell_opt(0).unwrap().expect("expected cell");
+        assert_eq!(parsed.repr_hash(), cell.repr_hash());
+    }
+
+    #[test]
+    fn test_cell_opt_rejects_number() {
+        let stack = vec![create_number_entry("0")];
+        let parser = TvmStackParser::new(stack);
+        let err = parser.cell_opt(0).unwrap_err().to_string();
+        assert!(err.contains("stack entry is not a cell"));
+    }
+
+    #[test]
+    fn test_cell_opt_rejects_tuple() {
+        let stack = vec![create_tuple_entry(vec![])];
+        let parser = TvmStackParser::new(stack);
+        let err = parser.cell_opt(0).unwrap_err().to_string();
+        assert!(err.contains("stack entry is not a cell"));
     }
 
     #[test]

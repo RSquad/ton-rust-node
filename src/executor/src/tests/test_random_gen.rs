@@ -150,7 +150,7 @@ fn test_rand_1() {
     let mut rng = rand::SeedableRng::seed_from_u64(234235253453);
 
     let ordinary_acc_id = SENDER_ACCOUNT.clone();
-    let special_acc_id = AccountId::from([0x66u8; 32]);
+    let special_acc_id = AccountId::from([0x33; 32]);
 
     let blockchain_config = BLOCKCHAIN_CONFIG.to_owned();
     assert!(blockchain_config.is_special_account(true, &special_acc_id).unwrap());
@@ -184,7 +184,8 @@ fn test_rand_1() {
             ),
             3 => {
                 state_init = Some(gen_state(&mut rng, acc_id, workchain_id));
-                let state_hash = state_init.clone().unwrap().serialize().unwrap().repr_hash();
+                let serialized = state_init.clone().unwrap().serialize().unwrap();
+                let state_hash = serialized.repr_hash();
                 let due = Coins::from(gen_int(&mut rng, 19));
                 Account::frozen(
                     MsgAddressInt::with_standart(None, workchain_id, acc_id.clone()).unwrap(),
@@ -192,7 +193,7 @@ fn test_rand_1() {
                     BLOCK_LT,
                     BLOCK_UT - std::cmp::min(gen_int(&mut rng, 11) as u32, BLOCK_UT),
                     if due.is_zero() { None } else { Some(due) },
-                    if gen_bool(&mut rng) { state_hash } else { UInt256::default() },
+                    if gen_bool(&mut rng) { state_hash.clone() } else { UInt256::default() },
                 )
             }
             _ => panic!("Incorrect value"),
@@ -356,7 +357,7 @@ fn test_rand_reverse_and_messages() {
     let mut rng = rand::SeedableRng::seed_from_u64(234235253453);
 
     let ordinary_acc_id = SENDER_ACCOUNT.clone();
-    let special_acc_id = AccountId::from([0x66u8; 32]);
+    let special_acc_id = AccountId::from([0x33; 32]);
 
     let blockchain_config = BLOCKCHAIN_CONFIG.to_owned();
     assert!(blockchain_config.is_special_account(true, &special_acc_id).unwrap());

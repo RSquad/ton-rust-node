@@ -29,9 +29,10 @@ pub use consensus_common::utils::{
     get_elapsed_time, parse_hex, parse_hex_as_bytes, parse_hex_as_int256, parse_hex_to_array,
     time_to_string, time_to_timestamp_string, Metric, MetricsDumper, MetricsHandle,
 };
+use secrets_vault::vault_block::get_key_option_factory;
 use std::convert::TryInto;
 use ton_api::{deserialize_typed, IntoBoxed};
-use ton_block::{Ed25519KeyOption, KeyId, Result, UInt256};
+use ton_block::{KeyId, Result, UInt256};
 
 /*
     to string conversions (catchain-specific)
@@ -76,7 +77,7 @@ pub fn parse_hex_as_public_key_raw(hex_asm: &str) -> PublicKey {
     let mut key_slice = [0u8; 32];
     parse_hex_to_array(hex_asm, &mut key_slice[..]);
     //TODO: errors processing for key creation
-    Ed25519KeyOption::from_public_key(&key_slice)
+    get_key_option_factory().from_public_key(&key_slice)
 }
 
 pub fn parse_hex_as_public_key_hash(hex_asm: &str) -> PublicKeyHash {
@@ -95,7 +96,7 @@ pub fn parse_hex_as_private_key(hex_asm: &str) -> PrivateKey {
     parse_hex_to_array(hex_asm, &mut key_slice[..]);
     //TODO: errors processing for key creation
     assert!(key_slice.len() == 32);
-    Ed25519KeyOption::from_private_key(key_slice.as_slice().try_into().unwrap()).unwrap()
+    get_key_option_factory().from_private_key(key_slice.as_slice().try_into().unwrap()).unwrap()
 }
 
 pub fn parse_hex_as_expanded_private_key(hex_asm: &str) -> PrivateKey {
@@ -104,7 +105,7 @@ pub fn parse_hex_as_expanded_private_key(hex_asm: &str) -> PrivateKey {
     parse_hex_to_array(hex_asm, &mut key_slice[..]);
     //TODO: errors processing for key creation
     assert!(key_slice.len() == 64);
-    Ed25519KeyOption::from_expanded_key(key_slice.as_slice().try_into().unwrap()).unwrap()
+    get_key_option_factory().from_expanded_key(key_slice.as_slice().try_into().unwrap()).unwrap()
 }
 
 pub fn get_hash(data: &::ton_api::ton::bytes) -> BlockHash {

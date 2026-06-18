@@ -12,6 +12,7 @@
 
 mod common;
 use super::*;
+use crate::RESULT_CODE_TOO_MANY_EXTRA;
 use common::*;
 use pretty_assertions::assert_eq;
 use ton_assembler::compile_code_to_cell;
@@ -152,7 +153,7 @@ fn test_currency_collection_activate_account() {
 
     let tr_lt = BLOCK_LT + 1;
 
-    let mut result_currencies = CurrencyCollection::with_coins(1_400_100_000);
+    let mut result_currencies = CurrencyCollection::with_coins(1_400_160_000);
     result_currencies.other.set(&11111111u32, &VarUInteger32::from(123000)).unwrap();
 
     let trans = execute_currencies(&msg, &mut acc, tr_lt, &result_currencies, 0).unwrap();
@@ -214,7 +215,7 @@ fn test_balance_instruction_with_currency() {
 
     let tr_lt = BLOCK_LT + 1;
 
-    let mut result_currencies = CurrencyCollection::with_coins(2367739615);
+    let mut result_currencies = CurrencyCollection::with_coins(2368004815);
     result_currencies.other.set(&11111111u32, &VarUInteger32::from(223000)).unwrap();
 
     let trans = execute_currencies(&msg, &mut acc, tr_lt, &result_currencies, 0).unwrap();
@@ -261,7 +262,7 @@ fn test_add_currency_collection_and_activate_account() {
 
     let tr_lt = BLOCK_LT + 1;
 
-    let mut result_currencies = CurrencyCollection::with_coins(2385594300);
+    let mut result_currencies = CurrencyCollection::with_coins(2385654300);
     result_currencies
         .other
         .set(&11111111u32, &VarUInteger32::from(begin_extra + new_extra))
@@ -306,7 +307,7 @@ fn add_currency_collection_to_active_account_with_bounce_flag(bounce: bool) {
 
     let tr_lt = BLOCK_LT + 1;
 
-    let mut result_currencies = CurrencyCollection::with_coins(2373277687);
+    let mut result_currencies = CurrencyCollection::with_coins(2373337687);
     result_currencies
         .other
         .set(&11111111u32, &VarUInteger32::from(begin_extra + new_extra))
@@ -537,8 +538,8 @@ fn test_bounce_with_currency_collection() {
     description.action = None;
     description.credit_first = false;
 
-    let msg_fee = 389660;
-    let fwd_fees = 779340;
+    let msg_fee = 155864;
+    let fwd_fees = 311736;
     description.bounce = Some(TrBouncePhase::Ok(TrBouncePhaseOk {
         msg_size: StorageUsed::with_values_checked(1, 69).unwrap(),
         msg_fees: Coins::from(msg_fee),
@@ -570,7 +571,7 @@ fn test_bounce_with_currency_collection() {
     message.set_body(SliceData::from_raw(vec![0xff; 4], 32));
     good_trans.add_out_message(&message).unwrap();
 
-    good_trans.set_total_fees(CurrencyCollection::with_coins(14895360));
+    good_trans.set_total_fees(CurrencyCollection::with_coins(14661564));
     good_trans.orig_status = AccountStatus::AccStateUninit;
     good_trans.set_end_status(AccountStatus::AccStateUninit);
 
@@ -624,7 +625,7 @@ fn test_currencies_with_sendmsg() {
 
     let msg = create_msg_currency(SENDER_ACCOUNT.clone(), &in_msg_currencies, false);
 
-    let mut currencies_result = CurrencyCollection::with_coins(1828709098);
+    let mut currencies_result = CurrencyCollection::with_coins(1829669698);
     currencies_result.other.set(&11111111u32, &VarUInteger32::from(80)).unwrap();
 
     let trans = execute_currencies(&msg, &mut acc, BLOCK_LT + 1, &currencies_result, 1).unwrap();
@@ -642,14 +643,14 @@ fn test_currencies_with_sendmsg() {
     vm_phase.success = true;
     vm_phase.gas_used = 601.into();
     vm_phase.gas_limit = 1000000.into();
-    vm_phase.gas_fees = 601000.into();
+    vm_phase.gas_fees = 240400.into();
     vm_phase.vm_steps = 5;
     description.compute_ph = TrComputePhase::Vm(vm_phase);
 
     let mut actions = OutActions::default();
     actions.push_back(OutAction::new_send(SENDMSG_PAY_FEE_SEPARATELY, out_msg.clone()));
     if let Some(int_header) = out_msg.int_header_mut() {
-        int_header.fwd_fee = 666672.into();
+        int_header.fwd_fee = 266669.into();
         int_header.created_lt = BLOCK_LT + 2;
         int_header.created_at = BLOCK_UT.into();
     }
@@ -660,8 +661,8 @@ fn test_currencies_with_sendmsg() {
     action_ph.tot_actions = 1;
     action_ph.spec_actions = 0;
     action_ph.msgs_created = 1;
-    action_ph.total_fwd_fees = Some(1000000.into());
-    action_ph.total_action_fees = Some(333328.into());
+    action_ph.total_fwd_fees = Some(400000.into());
+    action_ph.total_action_fees = Some(133331.into());
     action_ph.action_list_hash = actions.hash().unwrap();
     append_message(&mut action_ph.tot_msg_size, &out_msg).unwrap();
     description.action = Some(action_ph);
@@ -675,7 +676,7 @@ fn test_currencies_with_sendmsg() {
     let mut good_trans = Transaction::with_account_and_message(&acc, &msg, BLOCK_LT + 2).unwrap();
 
     good_trans.add_out_message(&out_msg).unwrap();
-    good_trans.set_total_fees(CurrencyCollection::with_coins(70624230));
+    good_trans.set_total_fees(CurrencyCollection::with_coins(70063633));
     good_trans.orig_status = AccountStatus::AccStateActive;
     good_trans.set_end_status(AccountStatus::AccStateActive);
     good_trans.set_logical_time(BLOCK_LT + 1);
@@ -750,10 +751,10 @@ fn execute_sendrawmsg_message(
 
 #[test]
 fn test_sendrawmsg_currency_messages() {
-    execute_sendrawmsg_message(0, 1_400_000_000, 140, 2_236_083_908, 120, 1);
-    execute_sendrawmsg_message(1, 1_400_000_000, 140, 2_235_083_908, 120, 1);
+    execute_sendrawmsg_message(0, 1_400_000_000, 140, 2_236_444_508, 120, 1);
+    execute_sendrawmsg_message(1, 1_400_000_000, 140, 2_236_044_508, 120, 1);
     execute_sendrawmsg_message(0, 0, 140, 1_936_684_908, 240, 0);
-    execute_sendrawmsg_message(0, 1_400_000_000, 0, 3_336_083_908, 100, 0);
+    execute_sendrawmsg_message(0, 1_400_000_000, 0, 3_336_444_508, 100, 0);
 
     execute_sendrawmsg_message(128, 1_400_000_000, 140, 0, 120, 1);
     let acc = execute_sendrawmsg_message(128 + 32, 1_400_000_000, 140, 0, 120, 1);
@@ -808,7 +809,7 @@ fn test_currencies_with_sendmsg_64_flag() {
 
     let msg = create_msg_currency(SENDER_ACCOUNT.clone(), &in_msg_currencies, false);
 
-    let mut currencies_result = CurrencyCollection::with_coins(828508651);
+    let mut currencies_result = CurrencyCollection::with_coins(829474051);
     currencies_result.other.set(&11111111u32, &VarUInteger32::from(10)).unwrap();
 
     let trans = execute_currencies(&msg, &mut acc, BLOCK_LT + 1, &currencies_result, 1).unwrap();
@@ -826,7 +827,7 @@ fn test_currencies_with_sendmsg_64_flag() {
     vm_phase.success = true;
     vm_phase.gas_used = 609.into();
     vm_phase.gas_limit = 1000000.into();
-    vm_phase.gas_fees = 609000.into();
+    vm_phase.gas_fees = 243600.into();
     vm_phase.vm_steps = 5;
     description.compute_ph = TrComputePhase::Vm(vm_phase);
 
@@ -837,7 +838,7 @@ fn test_currencies_with_sendmsg_64_flag() {
     ));
     if let Some(int_header) = out_msg.int_header_mut() {
         int_header.value.coins.add(&in_msg_currencies.coins).unwrap();
-        int_header.fwd_fee = 666672.into();
+        int_header.fwd_fee = 266669.into();
         int_header.created_lt = BLOCK_LT + 2;
         int_header.created_at = BLOCK_UT.into();
     }
@@ -848,8 +849,8 @@ fn test_currencies_with_sendmsg_64_flag() {
     action_ph.tot_actions = 1;
     action_ph.spec_actions = 0;
     action_ph.msgs_created = 1;
-    action_ph.total_fwd_fees = Some(1000000.into());
-    action_ph.total_action_fees = Some(333328.into());
+    action_ph.total_fwd_fees = Some(400000.into());
+    action_ph.total_action_fees = Some(133331.into());
     action_ph.action_list_hash = actions.hash().unwrap();
     append_message(&mut action_ph.tot_msg_size, &out_msg).unwrap();
     description.action = Some(action_ph);
@@ -863,7 +864,7 @@ fn test_currencies_with_sendmsg_64_flag() {
     let mut good_trans = Transaction::with_account_and_message(&acc, &msg, BLOCK_LT + 2).unwrap();
 
     good_trans.add_out_message(&out_msg).unwrap();
-    good_trans.set_total_fees(CurrencyCollection::with_coins(70824677));
+    good_trans.set_total_fees(CurrencyCollection::with_coins(70259280));
     good_trans.orig_status = AccountStatus::AccStateActive;
     good_trans.set_end_status(AccountStatus::AccStateActive);
     good_trans.set_logical_time(BLOCK_LT + 1);
@@ -871,6 +872,107 @@ fn test_currencies_with_sendmsg_64_flag() {
 
     good_trans.write_description(&description).unwrap();
     compare_transaction(&trans, &good_trans);
+}
+
+fn build_acc_for_all_balance_test(
+    out_msg_extras: &[(u32, u128)],
+    acc_extras: &[(u32, u128)],
+) -> Account {
+    let mut out_msg_currencies = CurrencyCollection::with_coins(1_000_000_000);
+    for (id, value) in out_msg_extras {
+        out_msg_currencies.other.set(id, &VarUInteger32::from(*value)).unwrap();
+    }
+    let mut out_msg = create_msg_currency(THIRD_ACCOUNT.clone(), &out_msg_currencies, false);
+    out_msg.set_src(MsgAddressIntOrNone::None);
+    let data = out_msg.serialize().unwrap();
+
+    let code = compile_code_to_cell(
+        "
+        ACCEPT
+        PUSHCTR C4
+        PUSHINT 128
+        SENDRAWMSG
+    ",
+    )
+    .unwrap();
+
+    let mut state_init = StateInit::default();
+    state_init.set_code(code);
+    state_init.set_data(data);
+
+    let mut begin_currencies = CurrencyCollection::with_coins(2_000_000_000);
+    for (id, value) in acc_extras {
+        begin_currencies.other.set(id, &VarUInteger32::from(*value)).unwrap();
+    }
+
+    Account::active(
+        MsgAddressInt::with_standart(None, 0, SENDER_ACCOUNT.clone()).unwrap(),
+        begin_currencies,
+        0,
+        10,
+        state_init,
+        DICT_HASH_MIN_CELLS,
+    )
+    .unwrap()
+}
+
+#[test]
+fn test_sendmsg_all_balance_strips_zero_extras() {
+    // out_msg.value.other has a zero-valued extra (ec2:0) along with ec1:50.
+    // After SENDMSG_ALL_BALANCE the outgoing message must keep only the non-zero extras.
+    let mut acc =
+        build_acc_for_all_balance_test(&[(11111111, 50), (22222222, 0)], &[(11111111, 100)]);
+    let in_msg = create_msg_currency(
+        SENDER_ACCOUNT.clone(),
+        &CurrencyCollection::with_coins(1_000_000_000),
+        false,
+    );
+
+    let trans = execute(&in_msg, &mut acc, BLOCK_LT + 1).unwrap();
+    let descr = get_tr_descr(&trans);
+    assert!(descr.action.as_ref().unwrap().success, "action phase must succeed");
+    assert_eq!(descr.action.as_ref().unwrap().msgs_created, 1);
+
+    let out_msg = trans.get_out_msg(0).unwrap().expect("outgoing message expected");
+    let value = out_msg.get_value().expect("internal outgoing message");
+    assert_eq!(value.other.len().unwrap(), 1, "zero extra must be stripped");
+    let kept = value.other.get(&11111111u32).unwrap().unwrap();
+    assert_eq!(kept, VarUInteger32::from(50u32));
+    assert!(value.other.get(&22222222u32).unwrap().is_none(), "zero extra must not survive");
+}
+
+#[test]
+fn test_sendmsg_all_balance_too_many_extras() {
+    // out_msg.value.other has 3 extras while default max_msg_extra_currencies = 2.
+    // SENDMSG_ALL_BALANCE must reject the action with RESULT_CODE_TOO_MANY_EXTRA.
+    let acc = build_acc_for_all_balance_test(
+        &[(11111111, 10), (22222222, 20), (33333333, 30)],
+        &[(11111111, 100), (22222222, 200), (33333333, 300)],
+    );
+    let in_msg = create_msg_currency(
+        SENDER_ACCOUNT.clone(),
+        &CurrencyCollection::with_coins(1_000_000_000),
+        false,
+    );
+
+    execute_acc_with_message(acc, &in_msg).expect_action_failed(RESULT_CODE_TOO_MANY_EXTRA);
+}
+
+#[test]
+fn test_sendmsg_all_balance_total_extras_count_includes_zeros() {
+    // out_msg.value.other has 2 zero-valued + 1 non-zero extra (3 total) while
+    // max_msg_extra_currencies = 2. Currencies count is checked before removing zeroes
+    let acc = build_acc_for_all_balance_test(
+        &[(11111111, 0), (22222222, 0), (33333333, 50)],
+        &[(33333333, 100)],
+    );
+    let in_msg = create_msg_currency(
+        SENDER_ACCOUNT.clone(),
+        &CurrencyCollection::with_coins(1_000_000_000),
+        false,
+    );
+
+    execute_acc_with_message(acc, &in_msg).expect_action_failed(RESULT_CODE_TOO_MANY_EXTRA);
 }
 
 #[test]

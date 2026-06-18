@@ -81,13 +81,26 @@ fn calc_storage_used_short(
     let mut calc =
         StorageUsageCalc::with_limits(limits.max_msg_cells as u64, limits.max_msg_bits as u64);
     let (body_to_ref, init_to_ref) = msg.recalc_serialization_params()?;
+    // When body/init was originally stored as a ref in
+    // the envelope (body_to_ref/init_to_ref == Some(true)), the body cell is
+    // a real ref and gas should be charged.
+    // When body/init was inline in the envelope — load only sub-refs with
+    // gas, root without.
     if let Some(body) = msg.body() {
-        let root = body.clone().into_builder()?;
-        calc.append_builder(&root, body_to_ref, engine)?;
+        let root = body.clone().into_cell()?;
+        if msg.body_to_ref() == Some(true) {
+            calc.append_cell(&root, body_to_ref, engine)?;
+        } else {
+            calc.append_cell_no_root_gas(&root, body_to_ref, engine)?;
+        }
     }
     if let Some(init) = msg.state_init() {
-        let root = init.write_to_new_cell()?;
-        calc.append_builder(&root, init_to_ref, engine)?;
+        let root = init.serialize()?;
+        if msg.init_to_ref() == Some(true) {
+            calc.append_cell(&root, init_to_ref, engine)?;
+        } else {
+            calc.append_cell_no_root_gas(&root, init_to_ref, engine)?;
+        }
     }
     let sstat = calc.storage_used()?;
     Ok(sstat)
@@ -107,7 +120,8 @@ pub(super) fn execute_send_msg(engine: &mut Engine) -> Status {
     let x = x as u8;
     let cell = engine.cmd.var(1).as_cell()?.clone();
     // println!("msg: {}", ton_block::base64_encode(ton_block::write_boc(&cell)?));
-    let mut msg = Message::construct_with_gas_consumer(cell.clone(), engine)?;
+    let mut slice = engine.load_cell(cell.clone())?;
+    let mut msg = Message::construct_from(&mut slice)?;
     let my_addr = engine.smci_param(8)?.as_slice()?;
     let my_addr = MsgAddressInt::construct_from(&mut my_addr.clone())?;
     let is_masterchain = my_addr.is_masterchain() | msg.is_dst_masterchain();
@@ -122,20 +136,27 @@ pub(super) fn execute_send_msg(engine: &mut Engine) -> Status {
         SizeLimitsConfig::default()
     };
 
+    let mut legacy_fwd_fee_lower_bound = None;
     if let Some(hdr) = msg.int_header_mut() {
         if x & SENDMSG_ALL_BALANCE != 0 {
             hdr.value.coins = engine.smci_extra_param(7, 0)?.as_coins()?.try_into()?
         } else if x & SENDMSG_REMAINING_MSG_BALANCE != 0 {
             hdr.value.coins += engine.smci_extra_param(11, 0)?.as_coins()?
         }
-        let fwd_full_fees = prices.lump_price.into();
-        let fwd_mine_fees = prices.mine_fee_checked(&fwd_full_fees)?;
-        hdr.fwd_fee = hdr.fwd_fee.max(fwd_full_fees - fwd_mine_fees);
+        if engine.block_version() < 14 {
+            legacy_fwd_fee_lower_bound = Some(hdr.fwd_fee.clone());
+            let fwd_full_fees = prices.lump_price.into();
+            let fwd_mine_fees = prices.mine_fee_checked(&fwd_full_fees)?;
+            hdr.fwd_fee = hdr.fwd_fee.max(fwd_full_fees - fwd_mine_fees);
+        }
     }
     // TODO: need to remove extra load when cpp is fixed
     engine.load_cell(cell.clone())?;
     let msg_storage = calc_storage_used_short(engine, &msg, &limits)?;
-    let fee = prices.calc_fwd_fee(msg_storage.bits(), msg_storage.cells());
+    let mut fee = prices.calc_fwd_fee(msg_storage.bits(), msg_storage.cells());
+    if let Some(fwd_fee) = legacy_fwd_fee_lower_bound {
+        fee = fee.max(fwd_fee.as_u128());
+    }
     engine.cc.stack.push(StackItem::int(fee));
     if send {
         let suffix = BuilderData::with_raw(vec![x], 8)?;

@@ -19,7 +19,7 @@ pub async fn execute() -> anyhow::Result<()> {
         #[cfg(feature = "file-storage-json")]
         {
             use secrets_vault::{
-                crypto::factory::{AutoCryptoFactory, CryptoFactory},
+                crypto::factory::{CryptoFactory, DefaultCryptoFactory},
                 storage::file_json::FileJsonStorage,
                 utils::hex::hex_val_to_pm,
             };
@@ -42,11 +42,15 @@ pub async fn execute() -> anyhow::Result<()> {
             let master_key_hex = parsed
                 .query_param("master_key")
                 .ok_or_else(|| anyhow::anyhow!("Missing master_key parameter in URL"))?;
-            let master_key_pm = hex_val_to_pm("master_key", master_key_hex).await?;
-            let master_key = KeyMaterial::new_symmetric_key(master_key_pm).await?;
-            let crypto = AutoCryptoFactory {}.new_crypto()?;
+            let master_key_pm = hex_val_to_pm("master_key", master_key_hex)?;
+            let master_key = KeyMaterial::new_symmetric_key(master_key_pm)?;
 
-            FileJsonStorage::migrate(&file_path, &master_key, crypto.as_ref()).await?;
+            FileJsonStorage::migrate(
+                &file_path,
+                &master_key,
+                DefaultCryptoFactory {}.new_crypto()?,
+            )
+            .await?;
         }
 
         #[cfg(not(feature = "file-storage-json"))]
@@ -56,7 +60,7 @@ pub async fn execute() -> anyhow::Result<()> {
     } else if parsed.storage_name == "hashicorp" {
         #[cfg(feature = "hashicorp-storage")]
         {
-            secrets_vault::storage::hashicorp::HashicorpStorage::migrate().await?;
+            // NOP
         }
 
         #[cfg(not(feature = "hashicorp-storage"))]

@@ -7,10 +7,11 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::{
-    define_HashmapE, error, fail, AccountStorage, BuilderData, Cell, Deserializable, HashmapType,
-    IBitstring, Result, Serializable, SliceData, StateInit, StorageUsed, UInt256,
+    define_HashmapE, dictionary::FixedBitsKey, error, fail, AccountStorage, BuilderData, Cell,
+    Deserializable, HashmapType, IBitstring, Result, Serializable, SliceData, StateInit,
+    StorageUsed, UInt256,
 };
-use std::{collections::BTreeMap, ops::Not};
+use smallvec::SmallVec;
 
 #[cfg(test)]
 #[path = "tests/test_storage_stat.rs"]
@@ -44,14 +45,40 @@ impl Deserializable for StorageStatCellInfo {
 }
 
 define_HashmapE!(StorageStatDict, 256, StorageStatCellInfo);
+pub type StorageRoots = SmallVec<[Cell; 3]>;
 
+/// Per-account storage statistics over the `code`/`data`/`library` subtrees of `StateInit`.
+/// Counts total cells/bits (excluding the `AccountStorage` root itself) and tracks per-cell
+/// refcount + merkle depth. The dictionary form is serializable, its repr_hash lands in
+/// `StorageInfo.storage_extra.dict_hash` and is used by other nodes to skip a full rebuild.
+///
+/// Two storage layers for the same data: `cache` is a fast in-memory AHashMap (L1, holds pending
+/// diffs and acts as a hot cache over the dict); `dict` is the slow but serializable HashmapE
+/// (L2, the committed state). Reads consult `cache` first, fall back to `dict`. Writes
+/// (`add_cell`/`remove_cell`) only touch `cache`; `calc_dict()` is the single point that flushes
+/// `cache` into `dict` via hashmap_multiset. After a flush `cache` is NOT cleared — the entries
+/// are kept (with `ref_count_diff = 0`) as a hot L1 over `dict` for subsequent operations.
+///
+/// Three meaningful initial states from constructors:
+/// - empty: `Default` / `empty()` / `new(_, used)` with `used.cells == 0` — everything zero.
+/// - seeded: `new(storage, used)` with non-empty used — totals trusted from `used`, but `dict`
+///   and `cache` are empty. Per-cell data must be rebuilt on first `calc_dict()` via
+///   `fill_cache_from_roots()` (O(N) walk), unless the dict is imported externally first.
+/// - stored: `try_from_dict(dict, ...)` — `dict` is populated from a known dict-cell, `cache`
+///   is empty. This is the cheap path; used by `Account::import_storage_stat_dict` when the
+///   engine-level LRU (`Engine::storage_dicts_cache`) has the dict for this `dict_hash`.
+///
+/// Invariants: `roots` mirrors `get_roots(storage.state_init())`; root changes go through
+/// `replace_roots`, which produces an incremental diff via `add_cell`/`remove_cell`. The
+/// `(dict empty && cache empty)` combination is treated as "seeded or freshly empty" and lets
+/// `replace_roots` reset roots/totals before rebuilding incrementally.
 #[derive(Default, Clone, PartialEq)]
 pub struct AccountStorageStat {
     dict: StorageStatDict,
-    roots: Vec<Cell>,
+    roots: StorageRoots,
     total_cells: u64,
     total_bits: u64,
-    cache: BTreeMap<UInt256, StorageStatCellInfo>,
+    cache: ahash::AHashMap<UInt256, StorageStatCellInfo>,
     dict_updated: bool,
 }
 
@@ -67,10 +94,33 @@ impl std::fmt::Debug for AccountStorageStat {
 }
 
 impl AccountStorageStat {
-    pub fn new() -> Self {
+    pub fn new(storage: &AccountStorage, used: &StorageUsed) -> Self {
+        if used.cells() == 0 {
+            return Self::empty();
+        }
+        let Ok(storage_cell) = storage.write_to_new_cell() else {
+            return Self::empty();
+        };
+        let storage_root_bits = storage_cell.length_in_bits() as u64;
+        let (Some(total_cells), Some(total_bits)) =
+            (used.cells().checked_sub(1), used.bits().checked_sub(storage_root_bits))
+        else {
+            return Self::empty();
+        };
         Self {
             dict: StorageStatDict::new(),
-            roots: Vec::new(),
+            roots: Self::get_roots(storage.state_init()),
+            total_cells,
+            total_bits,
+            cache: Default::default(),
+            dict_updated: false,
+        }
+    }
+
+    fn empty() -> Self {
+        Self {
+            dict: StorageStatDict::new(),
+            roots: StorageRoots::new(),
             total_cells: 0,
             total_bits: 0,
             cache: Default::default(),
@@ -101,24 +151,47 @@ impl AccountStorageStat {
         })
     }
 
-    pub fn dict_root(&mut self) -> Result<Option<&Cell>> {
-        if !self.dict_updated {
-            let values = self.cache.iter_mut().filter(|(_, data)| data.ref_count_diff != 0).map(
-                |(hash, data)| {
-                    data.ref_count_diff = 0;
-                    if data.ref_count == 0 {
-                        (SliceData::from(hash), None)
-                    } else {
-                        (SliceData::from(hash), data.write_to_bitstring().ok())
-                    }
-                },
-            );
+    fn fill_cache_from_roots(&mut self) -> Result<()> {
+        let saved_cells = std::mem::replace(&mut self.total_cells, 0);
+        let saved_bits = std::mem::replace(&mut self.total_bits, 0);
+        for root in self.roots.clone() {
+            self.add_cell(&root)?;
+        }
+        self.total_cells = saved_cells;
+        self.total_bits = saved_bits;
+        Ok(())
+    }
 
-            #[cfg(not(target_family = "wasm"))]
-            let now = std::time::Instant::now();
-            self.dict.0.hashmap_multiset(values)?;
-            #[cfg(not(target_family = "wasm"))]
-            log::debug!("TIME Storage stat dict update {:?}", now.elapsed());
+    pub fn calc_dict(&mut self) -> Result<Option<&Cell>> {
+        if !self.dict_updated {
+            // Need to fill cache if we only have initial data - no roots changed
+            if self.cache.is_empty() && self.dict.is_empty() && !self.roots.is_empty() {
+                self.fill_cache_from_roots()?;
+            }
+
+            fn map_entry<'a>(
+                (hash, data): (&'a UInt256, &mut StorageStatCellInfo),
+            ) -> (FixedBitsKey<'a>, Option<SliceData>) {
+                data.ref_count_diff = 0;
+                let key = FixedBitsKey::new(hash.as_slice());
+                if data.ref_count == 0 {
+                    (key, None)
+                } else {
+                    (key, data.write_to_bitstring().ok())
+                }
+            }
+
+            if self.dict.is_empty() {
+                // no filter when dict is filled from scratch - `collect` will use size hint for allocation
+                self.dict.0.hashmap_multiset(self.cache.iter_mut().map(map_entry))?;
+            } else {
+                self.dict.0.hashmap_multiset(
+                    self.cache
+                        .iter_mut()
+                        .filter(|(_, data)| data.ref_count_diff != 0)
+                        .map(map_entry),
+                )?;
+            }
 
             self.dict_updated = true;
         }
@@ -126,12 +199,8 @@ impl AccountStorageStat {
         Ok(self.dict.root())
     }
 
-    pub fn update(&mut self, storage: &AccountStorage) -> Result<StorageUsed> {
-        #[cfg(not(target_family = "wasm"))]
-        let now = std::time::Instant::now();
+    pub fn calc_stat(&mut self, storage: &AccountStorage) -> Result<StorageUsed> {
         self.replace_roots(Self::get_roots(storage.state_init()))?;
-        #[cfg(not(target_family = "wasm"))]
-        log::debug!("TIME Storage stat replace roots {:?}", now.elapsed());
 
         let cell = storage.serialize()?;
         StorageUsed::with_values_checked(
@@ -140,11 +209,11 @@ impl AccountStorageStat {
         )
     }
 
-    pub fn get_roots(storage: Option<&StateInit>) -> Vec<Cell> {
+    pub fn get_roots(storage: Option<&StateInit>) -> StorageRoots {
         match storage {
             Some(state_init) => {
                 // storage root and currency collection are not counted in stats
-                let mut roots = Vec::with_capacity(3);
+                let mut roots = StorageRoots::new();
                 if let Some(code) = state_init.code() {
                     roots.push(code.clone());
                 }
@@ -156,13 +225,23 @@ impl AccountStorageStat {
                 }
                 roots
             }
-            None => Vec::new(),
+            None => StorageRoots::new(),
         }
     }
 
-    fn replace_roots(&mut self, roots: Vec<Cell>) -> Result<()> {
+    fn replace_roots(&mut self, roots: StorageRoots) -> Result<()> {
         if roots == self.roots {
             return Ok(());
+        }
+
+        // Seeded/empty stat: no per-cell info to update incrementally, and a partial add can't
+        // dedup against the uncounted seeded cells (would double-count shared ones). Rebuild fully
+        // from the new roots. Invariant: with an empty dict a non-empty cache is therefore always
+        // complete, so removals resolve from it without a dict (dict-less accounts stay incremental).
+        if self.dict.is_empty() && self.cache.is_empty() {
+            self.roots.clear();
+            self.total_cells = 0;
+            self.total_bits = 0;
         }
 
         self.dict_updated = false;
@@ -181,7 +260,7 @@ impl AccountStorageStat {
     }
 
     fn add_cell(&mut self, cell: &Cell) -> Result<u8> {
-        let hash = cell.repr_hash();
+        let hash = cell.repr_hash().clone();
         let mut max_merkle_depth = 0;
         if let Some(data) = self.cache.get_mut(&hash) {
             data.ref_count += 1;
@@ -195,9 +274,7 @@ impl AccountStorageStat {
                 self.total_cells += 1;
                 self.total_bits += cell.bit_length() as u64;
             }
-        } else if let Some(Ok(Some(data))) =
-            self.dict.is_empty().not().then(|| self.dict.get(&hash))
-        {
+        } else if let Some(data) = self.dict.get(&hash)? {
             max_merkle_depth = data.max_merkle_depth;
             self.cache.insert(
                 hash,
@@ -224,7 +301,7 @@ impl AccountStorageStat {
     }
 
     fn remove_cell(&mut self, cell: &Cell) -> Result<()> {
-        let hash = cell.repr_hash();
+        let hash = cell.repr_hash().clone();
         let removed = if let Some(data) = self.cache.get_mut(&hash) {
             data.ref_count -= 1;
             data.ref_count_diff -= 1;
@@ -266,11 +343,11 @@ impl AccountStorageStat {
     pub fn max_merkle_depth(&self) -> Result<u8> {
         let mut result = 0;
         for root in &self.roots {
-            let depth = if let Some(data) = self.cache.get(&root.repr_hash()) {
+            let depth = if let Some(data) = self.cache.get(root.repr_hash()) {
                 data.max_merkle_depth
             } else {
                 self.dict
-                    .get(&root.repr_hash())?
+                    .get(root.repr_hash())?
                     .ok_or_else(|| {
                         error!("Root {} not found in storage stat dictionary", root.repr_hash())
                     })?
@@ -279,6 +356,10 @@ impl AccountStorageStat {
             result = result.max(depth);
         }
         Ok(result)
+    }
+
+    pub fn is_changed(&self) -> bool {
+        !self.cache.is_empty()
     }
 }
 

@@ -83,6 +83,7 @@ const CELL_OUTPUT_JSON: &str = r#"{
 }"#;
 
 const SIMPLE_STACK_JSON: &str = r#"[["num", 123], ["tvm.Cell", "te6cckEBAQEABgAACAAB4kAwYI+3"]]"#;
+const SAMPLE_TRANSACTION_BOC: &str = "te6cckECCgEAAjwAA698rzi1TiTv7uzX0F5ib+p1I8OSOBKJlSl/pz3EwVmgHMAAAADoSlysOqnsRVo8P/O+kGDrsbjrJa+rp2Mxq/Pu5PjkTWpbp2bwAAAA6EaMHDaRInLAADQIAQIDAgHgBAUAgnIRSaK4B/MGTv/y2QsBn6QkVAb4YKDW5V4FvbigQHTHkFgv1aAdtvLJI1N5KcSAvY7iOfoC1nqrtt6tw/dCykBMAgcMBgRACAkB34n/lecWqcSd/d2a+gvMTf1OpHhyRwJRMqUv9Oe4mCs0A5gFJ1lTlcS1/fpRrKAsTPXicV/PS9yiPoySCXe39jJuKzRSp00XytovwnvQaMbQCYisXQSAHOI/kEl6FR0sJ2IAEAAAAVNIkTtAAAAAKAwGAQHfBwBqQgBsnT5LwW+251RM0XADLzmTXSH/c5OgnJDB0EoDVagwFag34R1gAAAAAAAAAAAAAAAAAAAArUn/lecWqcSd/d2a+gvMTf1OpHhyRwJRMqUv9Oe4mCs0A5kANk6fJeC323OqJmi4AZecya6Q/7nJ0E5IYOglAarUGArUG/COsAAAAAAAHQlLlYjSJE5YQAClQXZQELB2AxOIAAAAAAAAAAAQgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAYcAAAAAAAAIAAAAAAANCgxyf9BPqeGgQHcSUpljidRCNY9Z5iPYOqJQbD/jA8EBQFYwzYJQq";
 
 const RETURN_TUPLE_JSON: &str = r#"{
   "stack": [
@@ -278,6 +279,60 @@ fn test_json_serde_shard_account() {
     "hash": "e+vumjCp4eC225NtPhUXGzN0JbNkJ81AKrEW7ozIHgA="
   }
 }"#
+    );
+}
+
+#[test]
+fn serialize_ext_transaction_includes_account_field() {
+    let tr_cell = read_single_root_boc(base64_decode(SAMPLE_TRANSACTION_BOC).unwrap()).unwrap();
+    let tr = Transaction::construct_from_cell(tr_cell.clone()).unwrap();
+    let address = "Ef_K84tU4k7-7s19BeYm_qdSPDkjgSiZUpf6c9xMFZoBzGbk";
+    let account = "0:f2bce2d53893bfbbb35f417989bfa9d48f0e48e04a2654a5fe9cf71305668073";
+
+    let json =
+        serialize_transaction(&tr, tr_cell, address, "ext.transaction", Some(account), false)
+            .expect("ext.transaction should serialize");
+
+    pretty_assertions::assert_eq!(json["@type"], serde_json::json!("ext.transaction"));
+    pretty_assertions::assert_eq!(json["account"], serde_json::json!(account));
+    pretty_assertions::assert_eq!(json["address"]["account_address"], serde_json::json!(address));
+    pretty_assertions::assert_eq!(json["in_msg"]["@type"], serde_json::json!("ext.message"));
+    pretty_assertions::assert_eq!(json["in_msg"]["source"], serde_json::json!(""));
+    pretty_assertions::assert_eq!(json["in_msg"]["destination"], serde_json::json!(address));
+    pretty_assertions::assert_eq!(json["out_msgs"][0]["@type"], serde_json::json!("ext.message"));
+    pretty_assertions::assert_eq!(json["out_msgs"][0]["source"], serde_json::json!(address));
+}
+
+#[test]
+fn serialize_raw_transaction_omits_account_field() {
+    let tr_cell = read_single_root_boc(base64_decode(SAMPLE_TRANSACTION_BOC).unwrap()).unwrap();
+    let tr = Transaction::construct_from_cell(tr_cell.clone()).unwrap();
+
+    let json = serialize_transaction(
+        &tr,
+        tr_cell,
+        "Ef_K84tU4k7-7s19BeYm_qdSPDkjgSiZUpf6c9xMFZoBzGbk",
+        "raw.transaction",
+        None,
+        false,
+    )
+    .expect("raw.transaction should serialize");
+
+    assert!(json.get("account").is_none(), "raw.transaction must not contain account");
+    pretty_assertions::assert_eq!(json["in_msg"]["@type"], serde_json::json!("raw.message"));
+    pretty_assertions::assert_eq!(
+        json["in_msg"]["source"],
+        serde_json::json!({
+            "@type": "accountAddress",
+            "account_address": "",
+        })
+    );
+    pretty_assertions::assert_eq!(
+        json["in_msg"]["destination"],
+        serde_json::json!({
+            "@type": "accountAddress",
+            "account_address": "Ef_K84tU4k7-7s19BeYm_qdSPDkjgSiZUpf6c9xMFZoBzGbk",
+        })
     );
 }
 

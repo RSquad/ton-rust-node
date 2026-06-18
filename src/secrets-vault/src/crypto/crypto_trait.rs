@@ -13,28 +13,22 @@ use crate::{
         prng::Prng,
     },
     errors::error::VaultError,
-    memory::protected_memory::ProtectedMemory,
+    memory::protected_memory::{ProtectedMemory, ProtectedMemoryInner},
     types::algorithm::Algorithm,
 };
 use std::marker::PhantomData;
 
-#[async_trait::async_trait]
 pub trait Crypto: Send + Sync {
-    async fn pub_key_from_pvt(&self, algo: Algorithm, pvt_key: &[u8]) -> anyhow::Result<Vec<u8>>;
-    async fn generate_rnd(
-        &self,
-        algo: Algorithm,
-        size: Option<usize>,
-    ) -> anyhow::Result<ProtectedMemory>;
+    fn pub_key_from_pvt(&self, algo: Algorithm, pvt_key: &[u8]) -> anyhow::Result<Vec<u8>>;
+    fn pub_key_from_exp(&self, algo: Algorithm, exp_key: &[u8]) -> anyhow::Result<Vec<u8>>;
+    fn exp_key_from_pvt(&self, algo: Algorithm, pvt_key: &[u8]) -> anyhow::Result<ProtectedMemory>;
 
-    async fn sign(
-        &self,
-        key: &KeyMaterial,
-        data: &[u8],
-        algo: Algorithm,
-    ) -> anyhow::Result<Vec<u8>>;
+    fn generate_rnd(&self, algo: Algorithm, size: Option<usize>)
+        -> anyhow::Result<ProtectedMemory>;
 
-    async fn verify(
+    fn sign(&self, key: &KeyMaterial, data: &[u8], algo: Algorithm) -> anyhow::Result<Vec<u8>>;
+
+    fn verify(
         &self,
         pub_key: &[u8],
         data: &[u8],
@@ -42,14 +36,14 @@ pub trait Crypto: Send + Sync {
         algo: Algorithm,
     ) -> anyhow::Result<()>;
 
-    async fn encrypt(
+    fn encrypt(
         &self,
         key: &KeyMaterial,
         plaintext: &[u8],
         algo: Algorithm,
     ) -> anyhow::Result<Vec<u8>>;
 
-    async fn decrypt(
+    fn decrypt(
         &self,
         key: &KeyMaterial,
         ciphertext: &[u8],
@@ -59,19 +53,25 @@ pub trait Crypto: Send + Sync {
 
 pub const ED25519_PRIVATE_KEY_LENGTH: usize = 32;
 pub const ED25519_PUBLIC_KEY_LENGTH: usize = 32;
+pub const ED25519_EXPANDED_KEY_LENGTH: usize = 64;
 pub const AES_GCM_KEY_LENGTH: usize = 32;
 
-#[async_trait::async_trait]
 pub trait Ed25519Backend: Send + Sync {
-    async fn sign_ed25519(key: &KeyMaterial, data: &[u8]) -> anyhow::Result<Vec<u8>>;
-    async fn verify_ed25519(
+    fn sign_ed25519(key: &KeyMaterial, data: &[u8]) -> anyhow::Result<Vec<u8>>;
+
+    fn verify_ed25519(
         pub_key: &[u8; ED25519_PUBLIC_KEY_LENGTH],
         data: &[u8],
         signature: &[u8],
     ) -> anyhow::Result<()>;
-    async fn pub_key_from_seed(
+
+    fn pub_key_from_pvt(pvt_key: &[u8; ED25519_PRIVATE_KEY_LENGTH]) -> anyhow::Result<Vec<u8>>;
+
+    fn pub_key_from_exp(exp_key: &[u8; ED25519_EXPANDED_KEY_LENGTH]) -> anyhow::Result<Vec<u8>>;
+
+    fn exp_key_from_pvt(
         pvt_key: &[u8; ED25519_PRIVATE_KEY_LENGTH],
-    ) -> anyhow::Result<Vec<u8>>;
+    ) -> anyhow::Result<ProtectedMemory>;
 }
 
 pub struct CryptoImpl<B: Ed25519Backend> {
@@ -85,18 +85,35 @@ impl<B: Ed25519Backend> CryptoImpl<B> {
     }
 }
 
-#[async_trait::async_trait]
 impl<B: Ed25519Backend + 'static> Crypto for CryptoImpl<B> {
-    async fn pub_key_from_pvt(&self, algo: Algorithm, pvt_key: &[u8]) -> anyhow::Result<Vec<u8>> {
+    fn pub_key_from_pvt(&self, algo: Algorithm, pvt_key: &[u8]) -> anyhow::Result<Vec<u8>> {
         match algo {
             Algorithm::None | Algorithm::Aes256Gcm => {
                 anyhow::bail!(VaultError::unsupported_algorithm(algo))
             }
-            Algorithm::Ed25519 => B::pub_key_from_seed(pvt_key.try_into()?).await,
+            Algorithm::Ed25519 => B::pub_key_from_pvt(pvt_key.try_into()?),
         }
     }
 
-    async fn generate_rnd(
+    fn pub_key_from_exp(&self, algo: Algorithm, exp_key: &[u8]) -> anyhow::Result<Vec<u8>> {
+        match algo {
+            Algorithm::None | Algorithm::Aes256Gcm => {
+                anyhow::bail!(VaultError::unsupported_algorithm(algo))
+            }
+            Algorithm::Ed25519 => B::pub_key_from_exp(exp_key.try_into()?),
+        }
+    }
+
+    fn exp_key_from_pvt(&self, algo: Algorithm, pvt_key: &[u8]) -> anyhow::Result<ProtectedMemory> {
+        match algo {
+            Algorithm::None | Algorithm::Aes256Gcm => {
+                anyhow::bail!(VaultError::unsupported_algorithm(algo))
+            }
+            Algorithm::Ed25519 => B::exp_key_from_pvt(pvt_key.try_into()?),
+        }
+    }
+
+    fn generate_rnd(
         &self,
         algorithm: Algorithm,
         size: Option<usize>,
@@ -107,7 +124,7 @@ impl<B: Ed25519Backend + 'static> Crypto for CryptoImpl<B> {
                     anyhow::anyhow!(VaultError::invalid_key_size("Size is not set"))
                 })?;
 
-                ProtectedMemory::generate_random(self.prng.as_ref(), size).await?
+                ProtectedMemoryInner::generate_random(self.prng.as_ref(), size)?.into()
             }
             Algorithm::Aes256Gcm => {
                 let size = size.unwrap_or(AES_GCM_KEY_LENGTH);
@@ -118,7 +135,8 @@ impl<B: Ed25519Backend + 'static> Crypto for CryptoImpl<B> {
                     )));
                 }
 
-                ProtectedMemory::generate_random(self.prng.as_ref(), AES_GCM_KEY_LENGTH).await?
+                ProtectedMemoryInner::generate_random(self.prng.as_ref(), AES_GCM_KEY_LENGTH)?
+                    .into()
             }
             Algorithm::Ed25519 => {
                 let size = size.unwrap_or(ED25519_PRIVATE_KEY_LENGTH);
@@ -129,29 +147,27 @@ impl<B: Ed25519Backend + 'static> Crypto for CryptoImpl<B> {
                     )));
                 }
 
-                ProtectedMemory::generate_random(self.prng.as_ref(), ED25519_PRIVATE_KEY_LENGTH)
-                    .await?
+                ProtectedMemoryInner::generate_random(
+                    self.prng.as_ref(),
+                    ED25519_PRIVATE_KEY_LENGTH,
+                )?
+                .into()
             }
         };
 
         Ok(key)
     }
 
-    async fn sign(
-        &self,
-        key: &KeyMaterial,
-        data: &[u8],
-        algo: Algorithm,
-    ) -> anyhow::Result<Vec<u8>> {
+    fn sign(&self, key: &KeyMaterial, data: &[u8], algo: Algorithm) -> anyhow::Result<Vec<u8>> {
         match algo {
             Algorithm::Aes256Gcm | Algorithm::None => {
                 anyhow::bail!(VaultError::unsupported_algorithm(algo))
             }
-            Algorithm::Ed25519 => B::sign_ed25519(key, data).await,
+            Algorithm::Ed25519 => B::sign_ed25519(key, data),
         }
     }
 
-    async fn verify(
+    fn verify(
         &self,
         pub_key: &[u8],
         data: &[u8],
@@ -162,11 +178,11 @@ impl<B: Ed25519Backend + 'static> Crypto for CryptoImpl<B> {
             Algorithm::Aes256Gcm | Algorithm::None => {
                 anyhow::bail!(VaultError::unsupported_algorithm(algo))
             }
-            Algorithm::Ed25519 => B::verify_ed25519(pub_key.try_into()?, data, signature).await,
+            Algorithm::Ed25519 => B::verify_ed25519(pub_key.try_into()?, data, signature),
         }
     }
 
-    async fn encrypt(
+    fn encrypt(
         &self,
         key: &KeyMaterial,
         plaintext: &[u8],
@@ -176,11 +192,11 @@ impl<B: Ed25519Backend + 'static> Crypto for CryptoImpl<B> {
             Algorithm::Ed25519 | Algorithm::None => {
                 anyhow::bail!(VaultError::unsupported_algorithm(algo))
             }
-            Algorithm::Aes256Gcm => aes_gcm_encrypt(key, plaintext, self.prng.as_ref()).await,
+            Algorithm::Aes256Gcm => aes_gcm_encrypt(key, plaintext, self.prng.as_ref()),
         }
     }
 
-    async fn decrypt(
+    fn decrypt(
         &self,
         key: &KeyMaterial,
         ciphertext: &[u8],
@@ -190,7 +206,7 @@ impl<B: Ed25519Backend + 'static> Crypto for CryptoImpl<B> {
             Algorithm::Ed25519 | Algorithm::None => {
                 anyhow::bail!(VaultError::unsupported_algorithm(algo))
             }
-            Algorithm::Aes256Gcm => aes_gcm_decrypt(key, ciphertext).await,
+            Algorithm::Aes256Gcm => aes_gcm_decrypt(key, ciphertext),
         }
     }
 }

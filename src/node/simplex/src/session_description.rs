@@ -279,6 +279,7 @@ impl SessionDescription {
 
     /// Check if the given validator index is this validator
     #[inline]
+    #[cfg(test)]
     pub fn is_self(&self, idx: ValidatorIndex) -> bool {
         idx == self.self_idx
     }
@@ -328,6 +329,7 @@ impl SessionDescription {
     }
 
     /// Is this the first slot in its leader window?
+    #[cfg(test)]
     pub fn is_first_in_window(&self, slot: SlotIndex) -> bool {
         slot.is_first_in_window(self.options.slots_per_leader_window)
     }
@@ -344,6 +346,7 @@ impl SessionDescription {
     }
 
     /// Is this node the leader for the given slot's window?
+    #[cfg(test)]
     pub fn is_self_leader(&self, slot: SlotIndex) -> bool {
         self.get_leader(slot) == self.self_idx
     }

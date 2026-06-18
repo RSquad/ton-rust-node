@@ -38,7 +38,7 @@ pub struct BlockProofStuff {
 impl BlockProofStuff {
     pub fn deserialize(block_id: &BlockIdExt, data: Vec<u8>, is_link: bool) -> Result<Self> {
         let data = Arc::new(data);
-        let root = BocReader::new().read_inmem(data.clone())?.withdraw_single_root()?;
+        let root = BocReader::new().read(&*data)?.withdraw_single_root()?;
         let proof = BlockProof::construct_from_cell(root.clone())?;
         if &proof.proof_for != block_id {
             fail!(NodeError::InvalidData(format!(
@@ -98,14 +98,14 @@ impl BlockProofStuff {
     pub fn virtualize_block(&self) -> Result<(Block, Cell)> {
         let merkle_proof = MerkleProof::construct_from_cell(self.proof.root.clone())?;
         let block_virt_root = merkle_proof.proof.clone().virtualize(1);
-        if *self.proof.proof_for.root_hash() != block_virt_root.repr_hash() {
+        if *self.proof.proof_for.root_hash() != *block_virt_root.repr_hash() {
             fail!(NodeError::InvalidData(format!(
                 "merkle proof has invalid virtual hash (found: {:x}, expected: {})",
                 block_virt_root.repr_hash(),
                 self.proof.proof_for
             )))
         }
-        if block_virt_root.repr_hash() != self.id().root_hash {
+        if *block_virt_root.repr_hash() != self.id().root_hash {
             fail!(NodeError::InvalidData(format!(
                 "proof for block {} contains a Merkle proof with incorrect root hash: \
                 expected {:x}, found: {:x} ",
@@ -366,7 +366,7 @@ impl BlockProofStuff {
         virt_block: &Block,
         virt_block_root: &Cell,
     ) -> Result<BlockInfo> {
-        if virt_block_root.repr_hash() != id.root_hash {
+        if *virt_block_root.repr_hash() != id.root_hash {
             fail!(NodeError::InvalidData(format!(
                 "proof for block {} contains a Merkle proof with incorrect root hash: \
                 expected {:x}, found: {:x} ",

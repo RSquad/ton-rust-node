@@ -11,7 +11,8 @@
 use super::*;
 use crate::{
     config_params::ConfigParamEnum, read_boc, write_read_and_assert, Block, BlockSignaturesSimplex,
-    BlockSignaturesVariant, Cell, ShardIdent, SliceData, TopBlockDescr, UInt256,
+    BlockSignaturesVariant, Cell, Ed25519KeyOption, ShardIdent, SliceData, TopBlockDescr, UInt256,
+    ZeroizingBytes,
 };
 use std::{fs::File, io::Read};
 
@@ -44,7 +45,7 @@ fn test_crypto_signature_pair_with() {
 
 #[test]
 fn test_crypto_sig_pub_keyr_with() {
-    let keypair = Ed25519KeyOption::generate().unwrap();
+    let keypair = Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap();
     let spk = SigPubKey::from_bytes(keypair.pub_key().unwrap()).unwrap();
     write_read_and_assert(spk);
 }

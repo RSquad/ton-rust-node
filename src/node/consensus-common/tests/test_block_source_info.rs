@@ -7,7 +7,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use consensus_common::{BlockCandidatePriority, BlockSourceInfo, PublicKey};
-use ton_block::Ed25519KeyOption;
+use ton_block::{Ed25519KeyOption, ZeroizingBytes};
 
 #[test]
 fn test_block_candidate_priority_equality() {
@@ -21,7 +21,8 @@ fn test_block_candidate_priority_equality() {
 
 #[test]
 fn test_block_source_info_creation() {
-    let private_key = Ed25519KeyOption::generate().expect("Failed to generate key");
+    let private_key =
+        Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate key");
     let public_key: PublicKey = private_key;
     let priority = BlockCandidatePriority { round: 5, first_block_round: 3, priority: 0 };
     let info = BlockSourceInfo { source: public_key.clone(), priority };
@@ -35,7 +36,8 @@ fn test_block_source_info_creation() {
 #[test]
 fn test_first_block_round_tracking() {
     // Test scenario: first_block_round progression
-    let private_key = Ed25519KeyOption::generate().expect("Failed to generate key");
+    let private_key =
+        Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate key");
     let public_key: PublicKey = private_key;
 
     // Round 0, first_block_round = 0 (initial state)

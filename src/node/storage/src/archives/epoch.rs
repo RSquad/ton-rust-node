@@ -244,6 +244,15 @@ impl EpochRouter {
         Ok(epoch)
     }
 
+    /// Returns summed approximate RocksDB memory usage across all epochs.
+    pub fn memory_usage(&self) -> crate::RocksDbMemoryUsage {
+        let mut total = crate::RocksDbMemoryUsage::default();
+        for guard in self.epochs.iter() {
+            total += guard.val().db().memory_usage();
+        }
+        total
+    }
+
     pub fn epoch_size(&self) -> u32 {
         self.epoch_size
     }

@@ -228,7 +228,7 @@ fn test_work_with_out_msg_desc() {
     });
 
     let msg = get_message_with_addrs(create_account_id(7), create_account_id(8));
-    let hash = msg.serialize().unwrap().repr_hash();
+    let hash = msg.serialize().unwrap().repr_hash().clone();
     msg_desc.insert_with_key(&hash, &out_msg_dequeue_short).unwrap();
     assert_eq!(msg_desc.len().unwrap(), 7);
 

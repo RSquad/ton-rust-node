@@ -131,8 +131,10 @@ pub enum InMsg {
 
 impl fmt::Display for InMsg {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let msg_hash = self.message_cell().unwrap_or_default().repr_hash();
-        let tr_hash = self.transaction_cell().unwrap_or_default().repr_hash();
+        let msg_cell = self.message_cell().unwrap_or_default();
+        let msg_hash = msg_cell.repr_hash();
+        let tr_cell = self.transaction_cell().unwrap_or_default();
+        let tr_hash = tr_cell.repr_hash();
         match self {
             InMsg::External(_x) => {
                 write!(f, "InMsg msg_import_ext$000 msg: {:x} tr: {:x}", msg_hash, tr_hash)
@@ -470,10 +472,15 @@ impl Augmentation<ImportFees> for InMsg {
 
                 fees.value_imported.coins = header.fwd_fee;
             }
-            InMsg::DeferredFinal(_) => {
-                fees.fees_collected = header.fwd_fee;
+            InMsg::DeferredFinal(x) => {
+                let env = x.read_envelope_message()?;
+                if env.fwd_fee_remaining() != x.fwd_fee() {
+                    fail!("fwd_fee_remaining not equal to fwd_fee")
+                }
+                fees.fees_collected = *env.fwd_fee_remaining();
 
-                fees.value_imported.coins = header.fwd_fee;
+                fees.value_imported = header.value.clone();
+                fees.value_imported.coins.add(env.fwd_fee_remaining())?;
             }
             InMsg::DeferredTransit(x) => {
                 let env = x.read_in_envelope_message()?;
@@ -615,11 +622,11 @@ impl InMsgIHR {
 }
 
 impl Serializable for InMsgIHR {
-    fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
-        self.msg.write_to(cell)?;
-        self.transaction.write_to(cell)?;
-        self.ihr_fee.write_to(cell)?;
-        self.proof_created.write_to(cell)?;
+    fn write_to(&self, builder: &mut BuilderData) -> Result<()> {
+        self.msg.write_to(builder)?;
+        self.transaction.write_to(builder)?;
+        self.ihr_fee.write_to(builder)?;
+        builder.checked_append_reference(self.proof_created.clone())?;
         Ok(())
     }
 }
@@ -629,7 +636,7 @@ impl Deserializable for InMsgIHR {
         self.msg.read_from(slice)?;
         self.transaction.read_from(slice)?;
         self.ihr_fee.read_from(slice)?;
-        self.proof_created.read_from(slice)?;
+        self.proof_created = slice.checked_drain_reference()?;
         Ok(())
     }
 }
@@ -855,11 +862,11 @@ impl InMsgDiscardedTransit {
 }
 
 impl Serializable for InMsgDiscardedTransit {
-    fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
-        self.in_msg.write_to(cell)?;
-        self.transaction_id.write_to(cell)?;
-        self.fwd_fee.write_to(cell)?;
-        self.proof_delivered.write_to(cell)?;
+    fn write_to(&self, builder: &mut BuilderData) -> Result<()> {
+        self.in_msg.write_to(builder)?;
+        self.transaction_id.write_to(builder)?;
+        self.fwd_fee.write_to(builder)?;
+        builder.checked_append_reference(self.proof_delivered.clone())?;
         Ok(())
     }
 }
@@ -869,7 +876,7 @@ impl Deserializable for InMsgDiscardedTransit {
         self.in_msg.read_from(slice)?;
         self.transaction_id.read_from(slice)?;
         self.fwd_fee.read_from(slice)?;
-        self.proof_delivered.read_from(slice)?;
+        self.proof_delivered = slice.checked_drain_reference()?;
         Ok(())
     }
 }
@@ -1005,7 +1012,7 @@ impl InMsgDescr {
 
     /// insert new or replace existing
     pub fn insert(&mut self, in_msg: &InMsg) -> Result<()> {
-        self.insert_with_key(in_msg.message_cell()?.repr_hash(), in_msg)
+        self.insert_with_key(in_msg.message_cell()?.repr_hash().clone(), in_msg)
     }
 
     /// insert or replace existion record

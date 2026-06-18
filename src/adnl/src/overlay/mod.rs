@@ -26,7 +26,7 @@ use num_traits::pow::Pow;
 use std::{
     borrow::Borrow,
     cmp::min,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     convert::TryInto,
     sync::{
         atomic::{AtomicU32, AtomicU64, Ordering},
@@ -35,8 +35,7 @@ use std::{
     time::{Duration, Instant},
 };
 use ton_api::{
-    deserialize_boxed, deserialize_boxed_bundle_with_suffix, deserialize_boxed_with_suffix,
-    serialize_boxed, serialize_boxed_append,
+    deserialize_boxed, deserialize_boxed_with_suffix, serialize_boxed, serialize_boxed_append,
     ton::{
         adnl::id::short::Short as AdnlShortId,
         catchain::{
@@ -169,6 +168,12 @@ impl<N1: Borrow<NodeV1>, N2: Borrow<NodeV2>> OverlayNodeInfo<N1, N2> {
 
 pub type OverlayShortId = KeyId;
 pub type PrivateOverlayShortId = KeyId;
+
+/// Broadcast auth hooks for a private overlay (C++ `OverlayPrivacyRules`).
+pub trait BroadcastCheck: Send + Sync {
+    fn on_send(&self, src: &Arc<KeyId>, payload_size: usize) -> Result<()>;
+    fn on_recv(&self, src: &Arc<KeyId>, extra: Option<&[u8]>) -> Result<()>;
+}
 
 /// Overlay utilities
 pub struct OverlayUtils;
@@ -352,20 +357,24 @@ struct SlaveInfo {
 
 enum OverlayType {
     Public,
-    // Overlay with fixed members set
+    // Overlay with fixed members set; optional broadcast auth via BroadcastCheck
     Private {
         key: Arc<dyn KeyOption>,
         use_quic: bool,
+        bcast_check: Option<Arc<dyn BroadcastCheck>>,
     },
     // Overlay with externally certified members
     CertifiedMembers {
-        key: Option<Arc<dyn KeyOption>>,
-        // KeyId -> (Slot -> SlaveInfo)
-        root_members: HashMap<Arc<KeyId>, lockfree::map::Map<u32, SlaveInfo>>,
-        max_slaves: usize,
         // Prefix to use in broadcasts instead of Overlay::message_prefix
         bcast_prefix: Vec<u8>,
         certificate: Option<MemberCertificate>,
+        key: Option<Arc<dyn KeyOption>>,
+        max_slaves: usize,
+        // Validator ADNL IDs, bypassing the certificate check
+        root_adnl_ids: HashSet<Arc<KeyId>>,
+        // Validator Signing KeyId -> (Slot -> SlaveInfo)
+        root_public_keys: HashMap<Arc<KeyId>, lockfree::map::Map<u32, SlaveInfo>>,
+        use_quic: bool,
     },
 }
 
@@ -375,6 +384,14 @@ impl OverlayType {
             OverlayType::CertifiedMembers { bcast_prefix, .. } => Some(bcast_prefix.clone()),
             OverlayType::Public | OverlayType::Private { .. } => None,
         }
+    }
+
+    fn quic_requested(&self) -> bool {
+        matches!(
+            self,
+            OverlayType::Private { use_quic: true, .. }
+                | OverlayType::CertifiedMembers { use_quic: true, .. }
+        )
     }
 
     fn calc_message_prefix(&self, overlay_id: &OverlayShortId) -> Result<Vec<u8>> {
@@ -485,6 +502,8 @@ declare_counted!(
         nodes: lockfree::map::Map<Arc<KeyId>, NodeObject>,
         overlay_id: Arc<OverlayShortId>,
         owned_broadcasts: lockfree::map::Map<BroadcastId, OwnedBroadcast>,
+        // Peers waiting for ADNL address resolution before being added to known_peers
+        pending_peers: lockfree::queue::Queue<Arc<KeyId>>,
         purge_broadcasts: lockfree::queue::Queue<BroadcastId>,
         purge_broadcasts_count: AtomicU32,
         queue_one_time_broadcasts: tokio::sync::mpsc::UnboundedSender<(BroadcastId, Instant)>,
@@ -577,10 +596,6 @@ impl Overlay {
         }
     }
 
-    pub(crate) fn calc_broadcast_twostep_neighbours(&self) -> u32 {
-        self.neighbours.count() as u32
-    }
-
     pub(crate) fn select_broadcast_neighbours(
         &self,
         count: u32,
@@ -593,14 +608,34 @@ impl Overlay {
         &self,
         skip: Option<&Arc<KeyId>>,
     ) -> Vec<Arc<KeyId>> {
+        let root_adnl_ids = match &self.overlay_type {
+            OverlayType::CertifiedMembers { root_adnl_ids, .. } => Some(root_adnl_ids),
+            // Private overlays: iterate all known_peers
+            OverlayType::Private { .. } => None,
+            OverlayType::Public => {
+                let mut neighbours = Vec::new();
+                let (mut iter, mut neighbour) = self.neighbours.first();
+                while let Some(node) = neighbour {
+                    let skipped = skip.map_or(false, |skip| &node == skip);
+                    if !skipped {
+                        neighbours.push(node);
+                    }
+                    neighbour = self.neighbours.next(&mut iter);
+                }
+                return neighbours;
+            }
+        };
         let mut neighbours = Vec::new();
-        let (mut iter, mut neighbour) = self.neighbours.first();
+        let mut iter = None;
+        let mut neighbour = self.known_peers.next(&mut iter);
         while let Some(node) = neighbour {
-            let skipped = if let Some(skip) = &skip { &node == *skip } else { false };
-            if !skipped {
+            let skipped = skip.map_or(false, |skip| &node == skip);
+            // Skip CertifiedMembers: only send twostep to root members (validators).
+            let root = root_adnl_ids.map_or(true, |roots| roots.contains(&node));
+            if !skipped && root {
                 neighbours.push(node);
             }
-            neighbour = self.neighbours.next(&mut iter);
+            neighbour = self.known_peers.next(&mut iter);
         }
         neighbours
     }
@@ -612,6 +647,25 @@ impl Overlay {
         Ok(buf)
     }
 
+    fn calc_broadcast_twostep_neighbours(&self) -> u32 {
+        let root_adnl_ids = match &self.overlay_type {
+            OverlayType::CertifiedMembers { root_adnl_ids, .. } => Some(root_adnl_ids),
+            // Private overlays: count all known_peers
+            OverlayType::Private { .. } => None,
+            OverlayType::Public => return self.neighbours.count(),
+        };
+        let mut count = 0u32;
+        let mut iter = None;
+        let mut neighbour = self.known_peers.next(&mut iter);
+        while let Some(node) = neighbour {
+            if root_adnl_ids.map_or(true, |root_adnl_ids| root_adnl_ids.contains(&node)) {
+                count += 1;
+            }
+            neighbour = self.known_peers.next(&mut iter);
+        }
+        count
+    }
+
     fn check_peer(&self, peer: &Arc<KeyId>, certificate: Option<&MemberCertificate>) -> Result<()> {
         match &self.overlay_type {
             OverlayType::Public => Ok(()),
@@ -621,8 +675,8 @@ impl Overlay {
                 }
                 Ok(())
             }
-            OverlayType::CertifiedMembers { root_members, .. } => {
-                if root_members.contains_key(peer) {
+            OverlayType::CertifiedMembers { root_adnl_ids, .. } => {
+                if root_adnl_ids.contains(peer) {
                     return Ok(());
                 }
                 // Bcasts are sent without a certificate, hoping the target already knows
@@ -683,7 +737,7 @@ impl Overlay {
         let mut addrs = Vec::new();
         for neighbour in neighbours.iter() {
             #[cfg(feature = "telemetry")]
-            if let Err(e) = self.update_stats(neighbour, data.tag, true).await {
+            if let Err(e) = self.update_stats(neighbour, data.tag, true) {
                 log::warn!(
                     target: TARGET,
                     "Cannot update statistics in overlay {} for {neighbour} during broadcast: {e}",
@@ -705,15 +759,10 @@ impl Overlay {
                 BroadcastSendMethod::QuicOrRldp => {
                     if let Some(quic) = self.quic.as_ref() {
                         quic.message(data.object.to_vec(), Some(&self.adnl), peers).await.err()
+                    } else if let Some(rldp) = self.rldp.as_ref() {
+                        rldp.message(data, peers, true, None).await.err()
                     } else {
-                        let Some(_rldp) = self.rldp.as_ref() else {
-                            fail!(
-                                "Neither QUIC nor RLDP sender is set in overlay {}",
-                                self.overlay_id
-                            );
-                        };
-                        //rldp.message(data, peers, true, None).await.err()
-                        None
+                        fail!("Neither QUIC nor RLDP sender is set in overlay {}", self.overlay_id);
                     }
                 }
                 BroadcastSendMethod::Safe => {
@@ -828,7 +877,7 @@ impl Overlay {
         match &self.overlay_type {
             OverlayType::Private { key, .. } => Some(key),
             OverlayType::CertifiedMembers { key, .. } => key.as_ref(),
-            _ => None,
+            OverlayType::Public => None,
         }
     }
 
@@ -854,7 +903,9 @@ impl Overlay {
         let elapsed_sec = self.adnl.elapsed_sec();
         if pong.is_some() {
             self.known_peers.amnesty(peer, elapsed_sec);
-        } else {
+        } else if !self.overlay_type.is_private() {
+            // FixedMemberList C++ equivalent: don't penalize on missed pong.
+            // Consensus overlay must always target the full validator set.
             self.known_peers.penalty(peer, elapsed_sec)?;
         }
         Ok(())
@@ -901,7 +952,7 @@ impl Overlay {
         let src = self.overlay_key().unwrap_or(default_key).id();
         let peers = AdnlPeers::with_keys(src.clone(), dst.clone());
         #[cfg(feature = "telemetry")]
-        self.update_stats(dst, tag, true).await?;
+        self.update_stats(dst, tag, true)?;
         Ok(peers)
     }
 
@@ -998,6 +1049,15 @@ impl Overlay {
             .map_err(|e| error!("Error putting one time broadcast into monitoring queue: {e}"))
     }
 
+    fn try_add_peer(&self, our_key: &Arc<KeyId>, peer: &Arc<KeyId>) -> Result<bool> {
+        if self.adnl.have_peer(our_key, peer)? {
+            self.known_peers.add(peer)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     fn update_neighbours(&self, n: u32) -> Result<()> {
         if self.overlay_type.is_private() {
             let n = min(self.known_peers.all().count(), n);
@@ -1020,14 +1080,13 @@ impl Overlay {
 
     fn validate_certificate(&self, peer: &Arc<KeyId>, cert: &MemberCertificate) -> Result<()> {
         let utime = UnixTime::now() as u32;
-
-        let (max_slaves, root_members) =
-            if let OverlayType::CertifiedMembers { max_slaves, root_members, .. } =
+        let (max_slaves, root_public_keys) =
+            if let OverlayType::CertifiedMembers { max_slaves, root_public_keys, .. } =
                 &self.overlay_type
             {
-                (*max_slaves, root_members)
+                (*max_slaves, root_public_keys)
             } else {
-                fail!("Overlay type is not certificated members")
+                fail!("Overlay type is not certified members")
             };
 
         // 1) Expire check
@@ -1043,7 +1102,7 @@ impl Overlay {
 
         // 3) Issuer
         let issuer: Arc<dyn KeyOption> = (&cert.issued_by).try_into()?;
-        let Some(slaves_info) = root_members.get(issuer.id()) else {
+        let Some(slaves_info) = root_public_keys.get(issuer.id()) else {
             fail!("Certificate is issued by unknown member: {}", cert.issued_by);
         };
 
@@ -1230,18 +1289,7 @@ impl Overlay {
     }
 
     #[cfg(feature = "telemetry")]
-    async fn update_stats(&self, dst: &Arc<KeyId>, tag: u32, is_send: bool) -> Result<()> {
-        const PRINT_BIT: u64 = 1 << 63;
-        let elapsed = self.start.elapsed().as_secs();
-        let printed = loop {
-            let printed = self.print.fetch_max(elapsed, Ordering::Relaxed);
-            if (printed & PRINT_BIT) != 0 {
-                // In print now, wait
-                tokio::task::yield_now().await;
-            } else {
-                break printed;
-            }
-        };
+    fn update_stats(&self, dst: &Arc<KeyId>, tag: u32, is_send: bool) -> Result<()> {
         let stats = if is_send { &self.stats_per_peer_send } else { &self.stats_per_peer_recv };
         let stats = if let Some(stats) = stats.get(dst) {
             stats
@@ -1282,24 +1330,24 @@ impl Overlay {
         } else {
             self.messages_recv.fetch_add(1, Ordering::Relaxed);
         }
-        drop(stats);
-        if printed == elapsed {
-            // Exceeded assigned time
-            let next = elapsed + 5;
+        Ok(())
+    }
+
+    #[cfg(feature = "telemetry")]
+    fn try_print_stats(&self) {
+        let elapsed = self.start.elapsed().as_secs();
+        let printed = self.print.load(Ordering::Relaxed);
+        if elapsed > printed {
             if self
                 .print
-                .compare_exchange(printed, next | PRINT_BIT, Ordering::Relaxed, Ordering::Relaxed)
+                .compare_exchange(printed, elapsed + 5, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {
-                // Print only once
-                let ret = self.print_stats();
-                self.print
-                    .compare_exchange(next | PRINT_BIT, next, Ordering::Relaxed, Ordering::Relaxed)
-                    .ok();
-                ret?;
+                if let Err(e) = self.print_stats() {
+                    log::warn!(target: TARGET, "Error printing overlay stats: {e}");
+                }
             }
         }
-        Ok(())
     }
 }
 
@@ -1351,8 +1399,10 @@ impl OverlayNode {
     const MIN_BYTES_FEC_TWO_STEPS_BROADCAST: usize = 513;
     const MIN_NODES_FEC_TWO_STEPS_BROADCAST: u32 = 4;
     const PEER_BLOCK_LATENCY_SEC: u32 = 10;
-    const TIMEOUT_GC_MS: u64 = 1000; // Milliseconds
-    const TIMEOUT_PEERS_MS: u64 = 60000; // Milliseconds
+    const TIMEOUT_BROADCAST_GC_MS: u64 = 1000;
+    const TIMEOUT_NEIGHBOURS_MS: u64 = 60000;
+    const TIMEOUT_PENDING_PEERS_MS: u64 = 200;
+    const TIMEOUT_PING_MS: u64 = 1000;
 
     /// Constructor
     pub fn with_params(
@@ -1434,36 +1484,14 @@ impl OverlayNode {
         overlay_key: &Arc<dyn KeyOption>,
         peers: &[Arc<KeyId>],
         use_quic: bool,
+        bcast_check: Option<Arc<dyn BroadcastCheck>>,
     ) -> Result<bool> {
-        let overlay_type = OverlayType::Private { key: overlay_key.clone(), use_quic };
+        let overlay_type = OverlayType::Private { key: overlay_key.clone(), use_quic, bcast_check };
         self.add_typed_private_overlay(overlay_type, params, peers)
     }
 
-    /// Add semiprivate overlay
-    pub fn add_semiprivate_overlay(
-        &self,
-        params: OverlayParams,
-        overlay_key: Option<&Arc<dyn KeyOption>>,
-        root_members: &[Arc<KeyId>],
-        certificate: Option<MemberCertificate>,
-        max_slaves: usize,
-    ) -> Result<bool> {
-        let mut root_members_full = HashMap::with_capacity(root_members.len());
-        for member in root_members {
-            root_members_full.insert(member.clone(), lockfree::map::Map::new());
-        }
-        let overlay_type = OverlayType::CertifiedMembers {
-            root_members: root_members_full,
-            max_slaves,
-            bcast_prefix: OverlayUtils::calc_message_prefix(params.overlay_id)?,
-            certificate,
-            key: overlay_key.cloned(),
-        };
-        self.add_typed_private_overlay(overlay_type, params, root_members)
-    }
-
-    /// Add private overlay peers
-    pub fn add_private_peers(
+    /// Add private peers to ADNL layer
+    pub fn add_private_peers_to_adnl(
         &self,
         local_adnl_key: &Arc<KeyId>,
         peers: Vec<(IpAddress, Option<IpAddress>, Arc<dyn KeyOption>)>,
@@ -1562,18 +1590,32 @@ impl OverlayNode {
         Ok(Some(ret))
     }
 
-    fn calc_src_key_for_broadcast<'a>(
-        &'a self,
-        overlay: &'a Overlay,
-        src_key: Option<&'a Arc<dyn KeyOption>>,
-    ) -> &'a Arc<dyn KeyOption> {
-        if let Some(source) = src_key {
-            source
-        } else if let Some(key) = overlay.overlay_key() {
-            key
-        } else {
-            &self.node_key
+    /// Add semiprivate overlay
+    pub fn add_semiprivate_overlay(
+        &self,
+        params: OverlayParams,
+        overlay_key: Option<&Arc<dyn KeyOption>>,
+        root_adnl_ids: &[Arc<KeyId>],
+        root_public_keys: &[Arc<KeyId>], // Can be empty if overlay created by non-validator
+        certificate: Option<MemberCertificate>,
+        max_slaves: usize,
+        use_quic: bool,
+    ) -> Result<bool> {
+        let root_adnl_set: HashSet<Arc<KeyId>> = root_adnl_ids.iter().cloned().collect();
+        let mut root_public_keys_map = HashMap::with_capacity(root_public_keys.len());
+        for pk in root_public_keys {
+            root_public_keys_map.insert(pk.clone(), lockfree::map::Map::new());
         }
+        let overlay_type = OverlayType::CertifiedMembers {
+            bcast_prefix: OverlayUtils::calc_message_prefix(params.overlay_id)?,
+            certificate,
+            key: overlay_key.cloned(),
+            max_slaves,
+            root_adnl_ids: root_adnl_set,
+            root_public_keys: root_public_keys_map,
+            use_quic,
+        };
+        self.add_typed_private_overlay(overlay_type, params, root_adnl_ids)
     }
 
     /// Broadcast message
@@ -1594,6 +1636,10 @@ impl OverlayNode {
             src_key: self.calc_src_key_for_broadcast(&overlay, src_key),
             src_adnl_key_id: overlay.overlay_key().unwrap_or(&self.node_key).id(),
         };
+        // Outgoing broadcast auth (C++ `OverlayPrivacyRules`, all paths).
+        if let OverlayType::Private { bcast_check: Some(check), .. } = &overlay.overlay_type {
+            check.on_send(ctx.src_key.id(), data.object.len())?;
+        }
         if let AdnlSendMethod::Fast = &method {
             if data.object.len() > Self::MAX_SIZE_ORDINARY_BROADCAST {
                 return BroadcastFecProtocol::for_send(&ctx).send(ctx).await;
@@ -1626,12 +1672,17 @@ impl OverlayNode {
             src_key: self.calc_src_key_for_broadcast(&overlay, src_key),
             src_adnl_key_id: overlay.overlay_key().unwrap_or(&self.node_key).id(),
         };
+        // Outgoing broadcast auth (C++ `OverlayPrivacyRules`).
+        if let OverlayType::Private { bcast_check: Some(check), .. } = &overlay.overlay_type {
+            check.on_send(ctx.src_key.id(), data.object.len())?;
+        }
         let neighbours = overlay.calc_broadcast_twostep_neighbours();
         let big_data = data.object.len() >= Self::MIN_BYTES_FEC_TWO_STEPS_BROADCAST;
+        let reliable = big_data || overlay.overlay_type.quic_requested();
         if big_data && (neighbours >= Self::MIN_NODES_FEC_TWO_STEPS_BROADCAST) {
             BroadcastTwostepFecProtocol::for_send(data.object, neighbours, extra)?.send(ctx).await
         } else {
-            BroadcastTwostepSimpleProtocol::for_send(big_data, extra).send(ctx).await
+            BroadcastTwostepSimpleProtocol::for_send(reliable, extra).send(ctx).await
         }
     }
 
@@ -1977,11 +2028,7 @@ impl OverlayNode {
             penalty: 1,
             to_block: Self::MAX_FAIL_COUNT,
         };
-        let quic = if let OverlayType::Private { use_quic: true, .. } = &overlay_type {
-            self.quic.get().cloned()
-        } else {
-            None
-        };
+        let quic = if overlay_type.quic_requested() { self.quic.get().cloned() } else { None };
         let overlay = Overlay {
             adnl: self.adnl.clone(),
             rldp: self.rldp.get().cloned(),
@@ -1997,6 +2044,7 @@ impl OverlayNode {
             overlay_id: params.overlay_id.clone(),
             overlay_type,
             owned_broadcasts: lockfree::map::Map::new(),
+            pending_peers: lockfree::queue::Queue::new(),
             purge_broadcasts: lockfree::queue::Queue::new(),
             purge_broadcasts_count: AtomicU32::new(0),
             queue_one_time_broadcasts: sender_one_time,
@@ -2039,24 +2087,77 @@ impl OverlayNode {
             let overlay = self.get_overlay(params.overlay_id, "Cannot add overlay")?;
             let handle = params.runtime.unwrap_or_else(tokio::runtime::Handle::current);
             handle.spawn(async move {
-                let mut timeout_peers = 0;
+                let local_adnl_key = if overlay.overlay_type.is_private() {
+                    Some(overlay.overlay_key().unwrap_or(&default_key).id())
+                } else {
+                    None
+                };
+                let base_tick_ms = Self::TIMEOUT_BROADCAST_GC_MS
+                    .min(Self::TIMEOUT_NEIGHBOURS_MS)
+                    .min(Self::TIMEOUT_PING_MS);
+                let mut timeout_broadcast_gc = 0;
+                let mut timeout_neighbours = 0;
+                let mut timeout_pending_peers = 0;
+                let mut timeout_ping = 0;
+                let mut has_pending = local_adnl_key.is_some();
                 let mut last_one_time_broadcast = None;
-                let mut next_ping = None;
                 #[cfg(feature = "xp25")]
                 let mut last_repeated_broadcast = None;
+                let mut next_ping = None;
                 while Arc::strong_count(&overlay) > 1 {
-                    overlay
-                        .purge_broadcasts(
-                            &mut last_one_time_broadcast,
-                            &mut receiver_one_time,
-                            #[cfg(feature = "xp25")]
-                            &mut last_repeated_broadcast,
-                            #[cfg(feature = "xp25")]
-                            &mut receiver_repeated,
-                        )
-                        .await;
-                    timeout_peers += Self::TIMEOUT_GC_MS;
-                    if timeout_peers > Self::TIMEOUT_PEERS_MS {
+                    let mut tick_ms = if has_pending {
+                        base_tick_ms.min(Self::TIMEOUT_PENDING_PEERS_MS)
+                    } else {
+                        base_tick_ms
+                    };
+                    if timeout_broadcast_gc >= Self::TIMEOUT_BROADCAST_GC_MS {
+                        timeout_broadcast_gc = 0;
+                        overlay
+                            .purge_broadcasts(
+                                &mut last_one_time_broadcast,
+                                &mut receiver_one_time,
+                                #[cfg(feature = "xp25")]
+                                &mut last_repeated_broadcast,
+                                #[cfg(feature = "xp25")]
+                                &mut receiver_repeated,
+                            )
+                            .await;
+                    }
+                    let mut update_neighbours = timeout_neighbours >= Self::TIMEOUT_NEIGHBOURS_MS;
+                    if has_pending && (timeout_pending_peers >= Self::TIMEOUT_PENDING_PEERS_MS) {
+                        timeout_pending_peers = 0;
+                        if let Some(key) = &local_adnl_key {
+                            let mut pending = Vec::new();
+                            while let Some(peer) = overlay.pending_peers.pop() {
+                                pending.push(peer);
+                            }
+                            if pending.is_empty() {
+                                has_pending = false;
+                            }
+                            for peer in pending {
+                                match overlay.try_add_peer(key, &peer) {
+                                    Ok(true) => {
+                                        log::info!(
+                                            target: TARGET,
+                                            "Resolved pending peer {peer} in overlay {}",
+                                            overlay.overlay_id
+                                        );
+                                        update_neighbours = true;
+                                        continue;
+                                    }
+                                    Err(e) => log::warn!(
+                                        target: TARGET,
+                                        "Error resolving pending peer {peer} in overlay {}: {e}",
+                                        overlay.overlay_id
+                                    ),
+                                    _ => (),
+                                }
+                                overlay.pending_peers.push(peer);
+                            }
+                        }
+                    }
+                    if update_neighbours {
+                        timeout_neighbours = 0;
                         // let result = if overlay.overlay_type.is_private() {
                         //     overlay.update_neighbours(1)
                         // } else {
@@ -2066,50 +2167,114 @@ impl OverlayNode {
                         if let Err(e) = overlay.update_neighbours(1) {
                             log::error!(target: TARGET, "Error: {}", e)
                         }
-                        timeout_peers = 0;
                     }
-                    let peer = if let Some(iter) = next_ping.as_mut() {
-                        overlay.known_peers.all().next(iter)
-                    } else {
-                        let (iter, peer) = overlay.known_peers.all().first();
-                        next_ping.replace(iter);
-                        peer
-                    };
-                    let sleep_ms = if let Some(peer) = peer {
-                        let query_start = std::time::Instant::now();
-                        let ping_task = overlay.ping_peer(&default_key, &peer, Self::TIMEOUT_GC_MS);
-                        let (ping_res, peers_res) = if overlay.overlay_type.is_private() {
-                            (ping_task.await, None)
+                    let elapsed_ms = if timeout_ping >= Self::TIMEOUT_PING_MS {
+                        timeout_ping = 0;
+                        let peer = if let Some(iter) = next_ping.as_mut() {
+                            overlay.known_peers.all().next(iter)
                         } else {
-                            let v2 = overlay.overlay_type.has_certified_members();
-                            let peers_task = overlay.get_random_peers(
-                                &peer,
-                                &default_key,
-                                v2,
-                                Some(Self::TIMEOUT_GC_MS),
-                            );
-                            let (ping_res, peers_res) = tokio::join!(ping_task, peers_task);
-                            (ping_res, Some(peers_res))
+                            let (iter, peer) = overlay.known_peers.all().first();
+                            next_ping.replace(iter);
+                            peer
                         };
-                        if let Err(e) = ping_res {
-                            log::info!(target: TARGET, "Error in overlay ping {peer}: {e}");
+                        if let Some(peer) = peer {
+                            let query_start = std::time::Instant::now();
+                            let ping_task =
+                                overlay.ping_peer(&default_key, &peer, Self::TIMEOUT_PING_MS);
+                            let (ping_res, peers_res) = if overlay.overlay_type.is_private() {
+                                (ping_task.await, None)
+                            } else {
+                                let v2 = overlay.overlay_type.has_certified_members();
+                                let peers_task = overlay.get_random_peers(
+                                    &peer,
+                                    &default_key,
+                                    v2,
+                                    Some(Self::TIMEOUT_PING_MS),
+                                );
+                                let (ping_res, peers_res) = tokio::join!(ping_task, peers_task);
+                                (ping_res, Some(peers_res))
+                            };
+                            if let Err(e) = ping_res {
+                                log::info!(target: TARGET, "Error in overlay ping {peer}: {e}");
+                            }
+                            if let Some(Err(e)) = peers_res {
+                                log::info!(
+                                    target: TARGET,
+                                    "Error get random peers from {peer}: {e}"
+                                );
+                            }
+                            query_start.elapsed().as_millis() as u64
+                        } else {
+                            next_ping = None;
+                            0
                         }
-                        if let Some(Err(e)) = peers_res {
-                            log::info!(target: TARGET, "Error get random peers from {peer}: {e}");
-                        }
-                        let elapsed_ms = query_start.elapsed().as_millis() as u64;
-                        Self::TIMEOUT_GC_MS.saturating_sub(elapsed_ms)
                     } else {
-                        next_ping = None;
-                        Self::TIMEOUT_GC_MS
+                        0
                     };
+                    let sleep_ms = tick_ms.saturating_sub(elapsed_ms);
                     if sleep_ms > 0 {
                         tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                    } else {
+                        tick_ms = elapsed_ms;
                     }
+                    timeout_broadcast_gc += tick_ms;
+                    timeout_neighbours += tick_ms;
+                    timeout_pending_peers += tick_ms;
+                    timeout_ping += tick_ms;
+                }
+                // Reduce inbound cap for pending peers of Private overlays
+                // additionally to known peers
+                if !matches!(overlay.overlay_type, OverlayType::Private { .. }) {
+                    return;
+                }
+                let Some(rldp) = &overlay.rldp else {
+                    return;
+                };
+                let mut remaining: Vec<Arc<KeyId>> = Vec::new();
+                while let Some(peer) = overlay.pending_peers.pop() {
+                    remaining.push(peer);
+                }
+                if remaining.is_empty() {
+                    return;
+                }
+                if let Err(e) = rldp.change_inbound_cap_for_peers(&remaining, -1) {
+                    log::warn!(
+                        target: TARGET,
+                        "Error reducing inbound cap for pending peers in overlay {}: {e}",
+                        overlay.overlay_id
+                    );
                 }
             });
         }
         Ok(added)
+    }
+
+    fn add_peers_to_overlay(
+        &self,
+        overlay_id: &Arc<OverlayShortId>,
+        peers: &[Arc<KeyId>],
+        msg: &str,
+    ) -> Result<usize> {
+        let overlay = self.get_overlay(overlay_id, msg)?;
+        let our_key = overlay.overlay_key().unwrap_or(&self.node_key).id();
+        let mut ret = 0;
+        for peer in peers {
+            if peer == our_key {
+                continue;
+            }
+            if overlay.try_add_peer(our_key, peer)? {
+                ret += 1;
+            } else {
+                log::info!(
+                    target: TARGET,
+                    "Peer {peer} has no ADNL address yet in overlay {}, queued for later",
+                    overlay.overlay_id
+                );
+                overlay.pending_peers.push(peer.clone());
+            }
+        }
+        overlay.update_neighbours(Self::MAX_OVERLAY_NEIGHBOURS)?;
+        Ok(ret)
     }
 
     fn add_typed_private_overlay(
@@ -2120,17 +2285,27 @@ impl OverlayNode {
     ) -> Result<bool> {
         let overlay_id = params.overlay_id;
         if self.add_overlay(overlay_type, params)? {
-            let overlay = self.get_overlay(&overlay_id, "Cannot add the private overlay")?;
-            let our_key = overlay.overlay_key().unwrap_or(&self.node_key).id();
-            for peer in peers {
-                if peer != our_key {
-                    overlay.known_peers.add(peer)?;
-                }
+            self.add_peers_to_overlay(overlay_id, peers, "Cannot add the private overlay")?;
+            if let Some(rldp) = self.rldp.get() {
+                rldp.change_inbound_cap_for_peers(peers, 1)?;
             }
-            overlay.update_neighbours(Self::MAX_OVERLAY_NEIGHBOURS)?;
             Ok(true)
         } else {
             Ok(false)
+        }
+    }
+
+    fn calc_src_key_for_broadcast<'a>(
+        &'a self,
+        overlay: &'a Overlay,
+        src_key: Option<&'a Arc<dyn KeyOption>>,
+    ) -> &'a Arc<dyn KeyOption> {
+        if let Some(source) = src_key {
+            source
+        } else if let Some(key) = overlay.overlay_key() {
+            key
+        } else {
+            &self.node_key
         }
     }
 
@@ -2172,6 +2347,27 @@ impl OverlayNode {
                 }
             } else if overlay.overlay_type.is_private() {
                 fail!("Try to delete private overlay {} as public", overlay_id)
+            }
+            if let Some(rldp) = self.rldp.get() {
+                let roots: Vec<Arc<KeyId>> = match &overlay.overlay_type {
+                    OverlayType::CertifiedMembers { root_adnl_ids, .. } => {
+                        root_adnl_ids.iter().cloned().collect()
+                    }
+                    OverlayType::Private { .. } => {
+                        let mut roots = Vec::new();
+                        let known = overlay.known_peers.all();
+                        let (mut iter, mut peer) = known.first();
+                        while let Some(p) = peer {
+                            roots.push(p);
+                            peer = known.next(&mut iter);
+                        }
+                        roots
+                    }
+                    OverlayType::Public => Vec::new(),
+                };
+                if !roots.is_empty() {
+                    rldp.change_inbound_cap_for_peers(&roots, -1)?;
+                }
             }
             overlay.received_peers.stop();
             overlay.received_rawbytes.stop();
@@ -2271,6 +2467,9 @@ impl Subscriber for OverlayNode {
         self.telemetry.send_transfers.update(self.allocated.send_transfers.load(Ordering::Relaxed));
         self.telemetry.stats_peer.update(self.allocated.stats_peer.load(Ordering::Relaxed));
         self.telemetry.stats_transfer.update(self.allocated.stats_transfer.load(Ordering::Relaxed));
+        for overlay in self.overlays.iter() {
+            overlay.val().try_print_stats();
+        }
     }
 
     async fn try_consume_custom(&self, data: &[u8], peers: &AdnlPeers) -> Result<bool> {
@@ -2304,7 +2503,11 @@ impl Subscriber for OverlayNode {
             return Ok(true);
         }
         if let Err(e) = overlay.check_peer(peers.other(), certificate.as_ref()) {
-            log::warn!("Error checking peer {}: {e}", peers.other());
+            log::warn!(
+                target: TARGET,
+                "Error checking peer {} in overlay {overlay_id}: {e}",
+                peers.other()
+            );
             return Ok(true);
         }
 
@@ -2325,7 +2528,7 @@ impl Subscriber for OverlayNode {
                             u32::from_le_bytes([suffix[0], suffix[1], suffix[2], suffix[3]])
                         };
                         #[cfg(feature = "telemetry")]
-                        overlay.update_stats(peers.other(), tag, false).await?;
+                        overlay.update_stats(peers.other(), tag, false)?;
                         return Ok(true);
                     }
                     _ => (),
@@ -2336,22 +2539,31 @@ impl Subscriber for OverlayNode {
             None
         };
 
-        let (mut bundle, postfix_offset) = deserialize_boxed_bundle_with_suffix(suffix)?;
-        if bundle.len() > 2 {
-            return Ok(false);
+        let (first, mut postfix_offset) = deserialize_boxed_with_suffix(suffix)?;
+        let mut second: Option<TLObject> = None;
+        let mut have_postfix = false;
+        if postfix_offset < suffix.len() {
+            if let Ok((s, pos2)) = deserialize_boxed_with_suffix(&suffix[postfix_offset..]) {
+                second = Some(s);
+                postfix_offset += pos2;
+            }
+            if postfix_offset < suffix.len() {
+                if postfix_offset + 1 < suffix.len() {
+                    return Ok(false);
+                }
+                have_postfix = true;
+            }
         }
-        let have_postfix = postfix_offset < suffix.len();
 
         #[cfg(feature = "telemetry")]
-        overlay.update_stats(peers.other(), bundle[0].bare_object().constructor(), false).await?;
-        if bundle.len() == 2 {
+        overlay.update_stats(peers.other(), first.bare_object().constructor(), false)?;
+        if let Some(second) = second {
             // Catchain/validator session messages in private overlay
-            let catchain_update = match bundle.remove(0).downcast::<CatchainBlockUpdateBoxed>() {
+            let catchain_update = match first.downcast::<CatchainBlockUpdateBoxed>() {
                 Ok(CatchainBlockUpdateBoxed::Catchain_BlockUpdate(upd)) => upd,
                 Err(msg) => fail!("Unsupported private overlay message {:?}", msg),
             };
-            let inner_update = match bundle.remove(0).downcast::<ValidatorSessionBlockUpdateBoxed>()
-            {
+            let inner_update = match second.downcast::<ValidatorSessionBlockUpdateBoxed>() {
                 Ok(ValidatorSessionBlockUpdateBoxed::ValidatorSession_BlockUpdate(upd)) => {
                     CatchainData::ValidatorSession(upd)
                 }
@@ -2370,7 +2582,6 @@ impl Subscriber for OverlayNode {
             receiver.push((catchain_update, inner_update, peers.other().clone()));
             Ok(true)
         } else {
-            let message = bundle.remove(0);
             let (data, hops) = if have_postfix {
                 (&data[..suffix_offset + postfix_offset + 1], Some(suffix[postfix_offset]))
             } else {
@@ -2383,7 +2594,7 @@ impl Subscriber for OverlayNode {
                 overlay: &overlay,
                 peers,
             };
-            let message = match message.downcast::<Broadcast>() {
+            let message = match first.downcast::<Broadcast>() {
                 Ok(Broadcast::Overlay_BroadcastFec(bcast)) => {
                     if let Err(e) = Self::check_fec_broadcast_message(&bcast) {
                         // Ignore invalid messages as early as possible
@@ -2407,7 +2618,8 @@ impl Subscriber for OverlayNode {
                 }
                 Ok(Broadcast::Overlay_BroadcastTwostepSimple(bcast)) => {
                     let big_data = bcast.data.len() >= Self::MIN_BYTES_FEC_TWO_STEPS_BROADCAST;
-                    BroadcastTwostepSimpleProtocol::for_recv(big_data).recv(bcast, ctx).await?;
+                    let reliable = big_data || ctx.overlay.overlay_type.quic_requested();
+                    BroadcastTwostepSimpleProtocol::for_recv(reliable).recv(bcast, ctx).await?;
                     return Ok(true);
                 }
                 Ok(bcast) => fail!("Unsupported overlay broadcast message {:?}", bcast),
@@ -2461,9 +2673,7 @@ impl Subscriber for OverlayNode {
         let other_workchain = (overlay.flags & Overlay::FLAG_OVERLAY_OTHER_WORKCHAIN) != 0;
         #[cfg(feature = "telemetry")]
         if !other_workchain {
-            overlay
-                .update_stats(peers.other(), objects[0].bare_object().constructor(), false)
-                .await?;
+            overlay.update_stats(peers.other(), objects[0].bare_object().constructor(), false)?;
         }
         let object = match objects.remove(0).downcast::<GetRandomPeers>() {
             Ok(query) => {

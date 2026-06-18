@@ -59,7 +59,7 @@ impl HashmapE {
         let mut root = slice.clone();
         let label = LabelReader::read_label(slice, self.bit_len)?;
         if label.remaining_bits() != self.bit_len {
-            slice.shrink_references(2..);
+            slice.shrink_references(2..)?;
             root.shrink_by_remainder(slice);
         } else {
             // all remainded slice as single item
@@ -410,9 +410,6 @@ macro_rules! define_HashmapE {
             pub fn count(&self, max: usize) -> Result<usize> {
                 $crate::HashmapType::count(&self.0, max)
             }
-            pub fn count_cells(&self, max: usize) -> Result<usize> {
-                $crate::HashmapType::count_cells(&self.0, max)
-            }
             /// iterates items
             pub fn iterate<F>(&self, mut p: F) -> Result<bool>
             where
@@ -492,9 +489,9 @@ macro_rules! define_HashmapE {
                 let key = key.write_to_bitstring()?;
                 self.add_key_serialized(key)
             }
-            pub fn multiset<I>(&mut self, iter: I) -> Result<()>
+            pub fn multiset<'a, I>(&mut self, iter: I) -> Result<()>
             where
-                I: Iterator<Item = (SliceData, Option<SliceData>)>,
+                I: IntoIterator<Item = ($crate::dictionary::FixedBitsKey<'a>, Option<SliceData>)>,
             {
                 $crate::HashmapType::hashmap_multiset(&mut self.0, iter)?;
                 Ok(())
@@ -505,6 +502,9 @@ macro_rules! define_HashmapE {
                     .transpose()
             }
             pub fn get_as_slice<K: Serializable>(&self, key: &K) -> Result<Option<SliceData>> {
+                if self.is_empty() {
+                    return Ok(None);
+                }
                 let key = key.write_to_bitstring()?;
                 self.get_raw(key)
             }

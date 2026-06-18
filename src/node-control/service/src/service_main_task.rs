@@ -7,6 +7,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::{
+    elections::election_task::BindingStatusCallback,
     http::http_server_task,
     runtime_config::RuntimeConfigStore,
     task::{ContractsTask, ElectionsTask, VotingTask, task_manager::TaskController},
@@ -16,7 +17,6 @@ use common::{
     app_config::AppConfig, log::setup_log, snapshot::SnapshotStore,
     task_cancellation::CancellationCtx,
 };
-use elections::election_task::BindingStatusCallback;
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 pub async fn run(cancellation_ctx: CancellationCtx, config_path: String) {
@@ -55,17 +55,18 @@ pub async fn run_with_config(
     let store = Arc::new(SnapshotStore::new());
 
     // Status callback: when the elections runner detects binding status changes,
-    // update the runtime config and save to file.
+    // atomically update the runtime config and persist it to file.
     let cfg = runtime_cfg.clone();
     let on_status_change: BindingStatusCallback = Arc::new(move |statuses| {
-        let _ = cfg.update_with(|app_cfg| {
+        if let Err(e) = cfg.update_and_save(|app_cfg| {
             for (node_id, new_status) in &statuses {
                 if let Some(binding) = app_cfg.bindings.get_mut(node_id) {
                     binding.status = *new_status;
                 }
             }
-        });
-        cfg.save_to_file();
+        }) {
+            tracing::error!("failed to persist binding status: {e:#}");
+        }
     });
 
     let mut tasks = HashMap::new();
@@ -73,7 +74,7 @@ pub async fn run_with_config(
         "contracts",
         Arc::new(TaskController::new(
             "contracts",
-            ContractsTask::new(runtime_cfg.clone(), store.clone()),
+            ContractsTask::new(runtime_cfg.clone()),
             runtime_cfg.clone(),
         )),
     );
@@ -104,11 +105,14 @@ pub async fn run_with_config(
         let _ = tasks.get("voting").expect("voting task").enable().await;
     }
 
+    let config_changed = Arc::new(tokio::sync::Notify::new());
+
     let http_task_handle = tokio::spawn(http_server_task::run(
         cancellation_ctx.clone(),
         store.clone(),
         runtime_cfg.clone(),
         tasks.clone(),
+        config_changed.clone(),
     ));
 
     let max_wait = std::time::Duration::from_secs(10);
@@ -120,10 +124,27 @@ pub async fn run_with_config(
 
         tokio::select! {
             _ = &mut timeout => {
-                // Reload config from file if changed
+                // Reload config from file if changed externally
                 if runtime_cfg.reload_from_file().await {
                     for task in tasks.values() {
                         let _ = task.restart().await;
+                    }
+                }
+            }
+            _ = config_changed.notified() => {
+                // REST mutation changed structural config — rebuild caches.
+                // Only restart tasks if caches are consistent; otherwise tasks
+                // keep running against the previous caches.
+                match runtime_cfg.force_reload().await {
+                    Ok(()) => {
+                        for task in tasks.values() {
+                            let _ = task.restart().await;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "cache rebuild after config mutation failed; skipping task restart: {e:#}"
+                        );
                     }
                 }
             }

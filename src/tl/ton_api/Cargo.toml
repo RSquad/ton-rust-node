@@ -21,4 +21,3 @@ ton_block = { path = '../../block' }
 [build-dependencies]
 serde_json = '1.0.52'
 ton_tl_codegen = { path = '../ton_tl_codegen' }
-

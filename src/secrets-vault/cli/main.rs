@@ -6,8 +6,8 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-#![cfg(feature = "secrets-vault-cli")]
 
+mod copy_file_to_hashicorp;
 mod delete;
 mod generate;
 mod get;
@@ -37,7 +37,14 @@ struct Cli {
 #[derive(clap::Subcommand)]
 enum Commands {
     Init {},
-    List {},
+    List {
+        #[arg(long, short)]
+        full: bool,
+
+        /// Reveal private key material in --full output. WARNING: writes raw key bytes to stdout.
+        #[arg(long)]
+        show_private: bool,
+    },
     Delete {
         #[arg(required = true)]
         secret_ids: Vec<String>,
@@ -90,6 +97,19 @@ enum Commands {
         signature: HexBytes,
     },
     Migrate {},
+    CopyFileToHashicorp {
+        /// Conflict policy when destination already has a secret with the same id
+        #[arg(long, default_value = "fail")]
+        on_conflict: String,
+
+        /// Print plan without writing to destination
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Continue on per-secret errors instead of aborting
+        #[arg(long)]
+        continue_on_error: bool,
+    },
 }
 
 #[tokio::main]
@@ -98,7 +118,7 @@ async fn main() {
 
     let result = match cli.command {
         Commands::Init {} => init::execute().await,
-        Commands::List {} => list::execute().await,
+        Commands::List { full, show_private } => list::execute(full, show_private).await,
         Commands::Delete { secret_ids } => delete::execute(&secret_ids).await,
         Commands::Import { secret_id, algorithm, extractable, overwrite, data } => {
             let algo: Algorithm = match algorithm.parse() {
@@ -128,6 +148,16 @@ async fn main() {
             verify::execute(&secret_id, data.0.as_slice(), signature.0.as_slice()).await
         }
         Commands::Migrate {} => migrate::execute().await,
+        Commands::CopyFileToHashicorp { on_conflict, dry_run, continue_on_error } => {
+            let on_conflict: copy_file_to_hashicorp::OnConflict = match on_conflict.parse() {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{} {}", "Error:".red().bold(), e);
+                    std::process::exit(1);
+                }
+            };
+            copy_file_to_hashicorp::execute(on_conflict, dry_run, continue_on_error).await
+        }
     };
 
     if let Err(e) = result {

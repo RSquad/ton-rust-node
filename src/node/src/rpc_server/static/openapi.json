@@ -1137,6 +1137,47 @@
                 }
             }
         },
+        "/getLibrariesExt": {
+            "get": {
+                "tags": [
+                    "get config"
+                ],
+                "summary": "Get Libraries Ext",
+                "description": "Get all libraries from the masterchain state as a serialized BoC dictionary suitable for the TVM emulator.",
+                "operationId": "get_libraries_ext_getLibrariesExt_get",
+                "parameters": [
+                    {
+                        "description": "Masterchain seqno. If omitted, the latest committed masterchain state is used.",
+                        "required": false,
+                        "schema": {
+                            "type": "integer",
+                            "title": "Seqno",
+                            "description": "Masterchain seqno. If omitted, the latest committed masterchain state is used."
+                        },
+                        "name": "seqno",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/TonResponse"
+                                }
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error"
+                    },
+                    "504": {
+                        "description": "Lite Server Timeout"
+                    }
+                }
+            }
+        },
         "/getTokenData": {
             "get": {
                 "tags": [

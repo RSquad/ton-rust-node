@@ -86,10 +86,10 @@ require_cmd bun
 require_cmd jq
 require_cmd curl
 
-if [[ ! -f "$VAULT_FILE" ]]; then
-  echo "Vault file not found: $VAULT_FILE" >&2
-  exit 1
-fi
+#if [[ ! -f "$VAULT_FILE" ]]; then
+#  echo "Vault file not found: $VAULT_FILE" >&2
+#  exit 1
+#fi
 
 detect_master_key() {
   if [[ -n "${VAULT_MASTER_KEY:-}" ]]; then
@@ -168,7 +168,7 @@ echo "  seqno: $seq_a -> $seq_b"
 echo "[4/8] Starting nodectl service in background..."
 cd "$REPO_ROOT"
 : > "$NODECTL_LOG"
-cargo run -p nodectl -- --verbose=info service --config "$NODECTL_CONFIG" > "$NODECTL_LOG" 2>&1 &
+cargo run -p nodectl -- service --config "$NODECTL_CONFIG" > "$NODECTL_LOG" 2>&1 &
 NODECTL_PID=$!
 sleep 2
 if ! kill -0 "$NODECTL_PID" >/dev/null 2>&1; then

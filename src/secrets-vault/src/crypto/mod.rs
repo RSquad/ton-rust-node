@@ -6,15 +6,9 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-/// crypto-default
-#[cfg(any(feature = "crypto-default", feature = "crypto-block"))]
 pub mod aes_gcm;
 #[cfg(feature = "crypto-default")]
 pub mod default_impl;
-
-/// crypto-block
-#[cfg(feature = "crypto-block")]
-pub mod block_impl;
 
 /// common
 pub(crate) mod blob_in_memory;

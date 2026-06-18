@@ -6,11 +6,8 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::{
-    storage::utils::b64,
-    types::{
-        algorithm::Algorithm, payload::PayloadType, secret_id::SecretId, secret_spec::SecretSpec,
-    },
+use crate::types::{
+    algorithm::Algorithm, payload::PayloadType, secret_id::SecretId, secret_spec::SecretSpec,
 };
 use std::collections::HashMap;
 
@@ -112,7 +109,7 @@ impl Metadata {
 
     pub fn get_tag_blob_b64(&self, key: &str) -> anyhow::Result<Vec<u8>> {
         let str = self.tags.get(key).ok_or_else(|| anyhow::anyhow!("Tag `{}` not found", key))?;
-        let data = b64::decode(str)?;
+        let data = base64::decode(str)?;
         Ok(data)
     }
 }

@@ -18,7 +18,6 @@ members = [
     'node-control/common',
     'node-control/contracts',
     'node-control/control-client',
-    'node-control/elections',
     'node-control/nodectl', 
     'node-control/service',
     'node-control/ton-http-api-client',

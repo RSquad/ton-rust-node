@@ -14,6 +14,7 @@
         "@ton/sandbox": "^0.36.0",
         "@ton/test-utils": "^0.10.0",
         "@ton/ton": "^15.2.1",
+        "@tonkite/highload-wallet-v3": "3.0.2",
         "@types/jest": "^29.5.14",
         "@types/node": "^22.15.24",
         "bip39": "^3.1.0",
@@ -220,6 +221,8 @@
     "@tonconnect/protocol": ["@tonconnect/protocol@2.2.6", "", { "dependencies": { "tweetnacl": "^1.0.3", "tweetnacl-util": "^0.15.1" } }, "sha512-kyoDz5EqgsycYP+A+JbVsAUYHNT059BCrK+m0pqxykMODwpziuSAXfwAZmHcg8v7NB9VKYbdFY55xKeXOuEd0w=="],
 
     "@tonconnect/sdk": ["@tonconnect/sdk@2.2.0", "", { "dependencies": { "@tonconnect/isomorphic-eventsource": "^0.0.1", "@tonconnect/isomorphic-fetch": "^0.0.2", "@tonconnect/protocol": "^2.2.5" } }, "sha512-8plnAXzaLhapUnt47ZqAOQSIQ8NHSvgTSR74QVJdPWqg8128smgGM4cDYewKdBfTD6Lup0odT1WMMrJu+rE4NQ=="],
+
+    "@tonkite/highload-wallet-v3": ["@tonkite/highload-wallet-v3@3.0.2", "", { "peerDependencies": { "@ton/core": "^0.56.3", "@ton/crypto": "^3.3.0" } }, "sha512-aRCj+ppAzv+dT9PGhlzu8t6rbtoOw9naHVefAOa1jPHG3mLVjOExnNOavYf5fmO0VMFTtcrVPmCAKxhAlkEZtg=="],
 
     "@tonstudio/parser-runtime": ["@tonstudio/parser-runtime@0.0.1", "", {}, "sha512-5s4fLkXWxa4SAd7QGGvJXe13GakEo0J3VF5dUI/i3A//bGZxMwCp1FcnbErpNs3y0LcAZoXE5FCUnDowDQptqw=="],
 

@@ -12,6 +12,7 @@ use crate::{
     block::BlockStuff,
     block_proof::BlockProofStuff,
     config::{CollatorConfig, CollatorTestBundlesGeneralConfig, TonNodeConfig},
+    confirmed_blocks::ConfirmedBlockEvents,
     engine::{EngineFlags, SplitQueues},
     internal_db::BlockResult,
     shard_state::ShardStateStuff,
@@ -30,7 +31,7 @@ use adnl::PrivateOverlayShortId;
 use catchain::{
     CatchainNode, CatchainOverlay, CatchainOverlayListenerPtr, CatchainOverlayLogReplayListenerPtr,
 };
-use consensus_common::OverlayTransportType;
+use consensus_common::{BlockSyncOverlayParams, OverlayTransportType};
 use std::{
     collections::HashSet,
     sync::{atomic::AtomicU64, Arc},
@@ -58,11 +59,20 @@ pub struct EngineTelemetry {
     pub awaiters: Arc<Metric>,
     pub catchain_clients: Arc<Metric>,
     pub cells: Arc<Metric>,
+    pub cells_mb: Arc<Metric>,
+    pub arena_cells: Arc<Metric>,
+    pub arena_bytes_mb: Arc<Metric>,
     pub shard_states: Arc<Metric>,
     pub top_blocks: Arc<Metric>,
     pub validator_adnl_keys: Arc<Metric>,
     pub validator_peers: Arc<Metric>,
     pub validator_sets: Arc<Metric>,
+    pub account_state_cache_mb: Arc<Metric>,
+    pub storage_dicts_cache_cells: Arc<Metric>,
+    pub jemalloc_allocated_mb: Arc<Metric>,
+    pub jemalloc_resident_mb: Arc<Metric>,
+    pub jemalloc_mapped_mb: Arc<Metric>,
+    pub jemalloc_retained_mb: Arc<Metric>,
 }
 
 pub struct EngineAlloc {
@@ -74,6 +84,7 @@ pub struct EngineAlloc {
     pub validator_adnl_keys: Arc<AtomicU64>,
     pub validator_peers: Arc<AtomicU64>,
     pub validator_sets: Arc<AtomicU64>,
+    pub account_state_cache_bytes: Arc<AtomicU64>,
 }
 
 /// Config-level binding of a validator key to an election.
@@ -96,29 +107,20 @@ pub struct ValidatorKeyBinding {
 /// # C++ counterpart
 ///
 /// C++ uses `get_validator()` (`manager.cpp`) which returns a `PublicKeyHash`
-/// (zero = not a validator). There is no explicit `network_ready` concept in C++ because
-/// ADNL identity is always resolvable (falling back to the validator public key hash when
-/// `addr` is zero, see `create_validator_group()` in `manager.cpp`). The `network_ready` flag is a
-/// Rust-specific extension that decouples validator membership from ADNL/overlay readiness.
-/// Rust still records validator membership immediately, while overlay activation is retried
-/// until the network layer finishes loading the ADNL key.
+/// (zero = not a validator). Membership is determined by pubkey-in-set only;
+/// ADNL/overlay readiness is handled in transport/context paths, not in the
+/// membership outcome itself.
 ///
 /// # Variants
 ///
-/// - `Selected { key, matching_keys, network_ready }` -- local node's public key is in the
+/// - `Selected { key, matching_keys }` -- local node's public key is in the
 ///   validator set. `key` is the first selected local key used for network setup, while
 ///   `matching_keys` preserves all local matches in C++ `temp_keys_` order so shard subsets
-///   can still choose the right local validator key. `network_ready` is `true` when the
-///   corresponding ADNL key and overlay infrastructure are operational; `false` when the
-///   pubkey matched but ADNL setup is still pending.
+///   can still choose the right local validator key.
 /// - `NotValidator` -- no local key matches the validator set.
 #[derive(Debug)]
 pub enum ValidatorListOutcome {
-    Selected {
-        key: Arc<dyn KeyOption>,
-        matching_keys: Vec<Arc<dyn KeyOption>>,
-        network_ready: bool,
-    },
+    Selected { key: Arc<dyn KeyOption>, matching_keys: Vec<Arc<dyn KeyOption>> },
     NotValidator,
 }
 
@@ -129,6 +131,8 @@ pub trait PrivateOverlayOperations: Sync + Send {
         validator_list_id: UInt256,
         validators: &[CatchainNode],
     ) -> Result<ValidatorListOutcome>;
+
+    fn has_validator_list_context(&self, validator_list_id: &UInt256) -> bool;
 
     fn activate_validator_list(&self, validator_list_id: UInt256) -> Result<()>;
 
@@ -144,6 +148,9 @@ pub trait PrivateOverlayOperations: Sync + Send {
         _log_replay_listener: CatchainOverlayLogReplayListenerPtr,
         broadcast_hops: Option<u8>,
         transport_type: OverlayTransportType,
+        // Block-sync overlay membership/auth + overlay_id (Some only when
+        // simplex session has `enable_observers=true`).
+        block_sync_params: Option<BlockSyncOverlayParams>,
     ) -> Result<Arc<dyn CatchainOverlay + Send>>;
 
     fn stop_catchain_client(&self, overlay_short_id: &Arc<PrivateOverlayShortId>);
@@ -191,6 +198,21 @@ pub trait EngineOperations: Sync + Send {
 
     fn validator_network(&self) -> Arc<dyn PrivateOverlayOperations> {
         unimplemented!()
+    }
+
+    /// returns the underlying `adnl::OverlayNode`
+    /// Used by `BlockSyncObserver` to join the block-sync overlay directly
+    /// (bypasses the consensus-private-overlay creation path used by validators).
+    /// Default `None` for test stubs; the real `Engine` impl returns `Some`
+    fn overlay_node(&self) -> Option<Arc<adnl::OverlayNode>> {
+        None
+    }
+
+    /// look up a local ADNL key by its short id.
+    /// Used by `BlockSyncObserver` activation to resolve the validator-class ADNL key
+    /// that joins the block-sync overlay. Default `None` for test stubs
+    fn adnl_key_by_id(&self, _id: &Arc<ton_block::KeyId>) -> Option<Arc<dyn ton_block::KeyOption>> {
+        None
     }
 
     fn validation_status(&self) -> ValidationStatus {
@@ -262,6 +284,7 @@ pub trait EngineOperations: Sync + Send {
         _log_replay_listener: CatchainOverlayLogReplayListenerPtr,
         broadcast_hops: Option<u8>,
         _transport_type: OverlayTransportType,
+        _block_sync_params: Option<BlockSyncOverlayParams>,
     ) -> Result<Arc<dyn CatchainOverlay + Send>> {
         unimplemented!()
     }
@@ -726,10 +749,13 @@ pub trait EngineOperations: Sync + Send {
     }
     fn complete_external_messages(
         &self,
-        to_delay: Vec<(UInt256, String)>,
-        to_delete: Vec<(UInt256, i32)>,
+        to_delay: &[UInt256],
+        to_delete: &[UInt256],
     ) -> Result<()> {
         unimplemented!()
+    }
+    fn confirmed_block_events(&self) -> Option<ConfirmedBlockEvents> {
+        None
     }
 
     // Utils
@@ -964,7 +990,7 @@ pub trait EngineOperations: Sync + Send {
         before_split_block: &BlockIdExt,
         queue0: OutMsgQueue,
         queue1: OutMsgQueue,
-        visited_cells: HashSet<UInt256>,
+        visited_cells: ahash::AHashSet<UInt256>,
     ) {
         unimplemented!();
     }

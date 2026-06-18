@@ -26,8 +26,9 @@ use crate::{
         supported_capabilities, supported_version, UNREGISTERED_CHAIN_MAX_LEN,
     },
     validator::{
+        consensus::ResolverPurpose,
         out_msg_queue::{MsgQueueManager, OutMsgQueueInfoStuff, StatesManager},
-        validator_group::PipelineContext,
+        state_resolver_cache::{self, StateResolverCache},
         validator_utils::{calc_subset_for_masterchain, PrevBlockHistory},
         BlockCandidate, CollatorSettings, McData,
     },
@@ -42,7 +43,7 @@ use std::{
     mem,
     ops::Deref,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -73,6 +74,7 @@ use ton_vm::smart_contract_info::PrevBlocksInfo;
 pub const SPLIT_MERGE_DELAY: u32 = 100; // prepare (delay) split/merge for 100 seconds
 pub const SPLIT_MERGE_INTERVAL: u32 = 100; // split/merge is enabled during 60 second interval
 pub const MAX_ERROR_ATTEMPTS: u32 = 5;
+pub const PREV_STATE_WAIT_TIMEOUT_MS: u64 = 1_000;
 
 pub struct CycleVec<'a, T> {
     items: Vec<Option<&'a T>>,
@@ -250,10 +252,11 @@ struct CollatorData {
     shard_top_block_descriptors: Vec<Arc<TopBlockDescrStuff>>,
     block_create_count: HashMap<UInt256, u64>,
     new_messages: BinaryHeap<NewMessage>, // using for priority queue
-    accepted_ext_messages: Vec<(UInt256, i32)>, // message id and wokchain id
-    rejected_ext_messages: Vec<(UInt256, String)>, // message id and reject reason
+    accepted_ext_messages: Vec<UInt256>,
+    rejected_ext_messages: Vec<UInt256>,
     usage_tree: UsageTree,
-    imported_visited: HashSet<UInt256>,
+    external_messages: Vec<(Arc<Message>, UInt256)>, // for bundle in case of error
+    imported_visited: ahash::AHashSet<UInt256>,
     last_dispatch_queue_emitted_lt: HashMap<AccountId, u64>,
     unprocessed_deferred_messages: HashMap<AccountId, usize>, // number of messages from dispatch queue in new_msgs
     sender_generated_messages_count: HashMap<AccountId, usize>,
@@ -333,7 +336,8 @@ impl CollatorData {
             accepted_ext_messages: Default::default(),
             rejected_ext_messages: Default::default(),
             usage_tree,
-            imported_visited: HashSet::new(),
+            external_messages: Vec::new(),
+            imported_visited: ahash::AHashSet::default(),
             unprocessed_deferred_messages: HashMap::new(),
             sender_generated_messages_count: HashMap::new(),
             last_dispatch_queue_emitted_lt: HashMap::new(),
@@ -755,6 +759,16 @@ impl CollatorData {
         Ok(self.has_unprocessed_deferred_messages(account_id)
             || self.has_dispatch_queue(account_id)?)
     }
+
+    fn reject_ext_message(&mut self, msg_id: UInt256, reason: impl ToString) {
+        log::trace!(
+            target: EXT_MESSAGES_TRACE_TARGET,
+            "rejecting external message {:x}: {}",
+            msg_id,
+            reason.to_string()
+        );
+        self.rejected_ext_messages.push(msg_id);
+    }
 }
 
 type MessageSender = tokio::sync::mpsc::UnboundedSender<(Arc<AsyncMessage>, Option<MsgMetadata>)>;
@@ -786,6 +800,8 @@ struct ExecutionManager {
     config: BlockchainConfig,
     prev_blocks_info: PrevBlocksInfo,
     engine: Arc<dyn EngineOperations>,
+    cancel_ext: tokio_util::sync::CancellationToken,
+    stop_flag: tokio_util::sync::CancellationToken,
 }
 
 impl ExecutionManager {
@@ -798,6 +814,8 @@ impl ExecutionManager {
         config: BlockchainConfig,
         max_collate_threads: usize,
         collated_block_descr: Arc<String>,
+        stop_flag: tokio_util::sync::CancellationToken,
+        cancel_ext: tokio_util::sync::CancellationToken,
         debug: bool,
         lt_compatible: bool,
     ) -> Result<Self> {
@@ -824,17 +842,9 @@ impl ExecutionManager {
                 mc_data.state.shard_state_extra()?.prev_blocks.clone(),
             ),
             engine,
+            cancel_ext,
+            stop_flag,
         })
-    }
-
-    // waits and finalizes all parallel tasks
-    pub async fn wait_transactions(&mut self, collator_data: &mut CollatorData) -> Result<()> {
-        log::trace!("{}: wait_transactions", self.collated_block_descr);
-        while self.wait_tr.count() > 0 {
-            self.wait_transaction(collator_data).await?;
-        }
-        self.min_lt.fetch_max(self.max_lt.load(Ordering::Relaxed), Ordering::Relaxed);
-        Ok(())
     }
 
     // checks if a number of parallel transactilns is not too big, waits and finalizes some if needed.
@@ -856,7 +866,7 @@ impl ExecutionManager {
         msg_metadata: Option<MsgMetadata>,
         prev_data: &PrevData,
         collator_data: &mut CollatorData,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         log::trace!("{}: execute (adding into queue): {:x}", self.collated_block_descr, account_id);
         if let Some((sender, _handle)) = self.changed_accounts.get(&account_id) {
             self.wait_tr.request();
@@ -865,10 +875,15 @@ impl ExecutionManager {
             let shard_acc = if let Some(shard_acc) = prev_data.accounts().account(&account_id)? {
                 shard_acc
             } else if let AsyncMessage::Ext(_, _, msg_id) = msg {
+                log::trace!(
+                    "{}: account {:x} not found for external message {:x}, rejecting",
+                    self.collated_block_descr,
+                    account_id,
+                    msg_id
+                );
                 collator_data
-                    .rejected_ext_messages
-                    .push((msg_id, format!("account {:x} not found", account_id)));
-                return Ok(true); // skip external messages for unexisting accounts
+                    .reject_ext_message(msg_id, format!("account {:x} not found", account_id));
+                return Ok(()); // skip external messages for unexisting accounts
             } else {
                 ShardAccount::default()
             };
@@ -881,7 +896,19 @@ impl ExecutionManager {
 
         self.check_parallel_transactions(collator_data).await?;
 
-        Ok(true)
+        Ok(())
+    }
+
+    // waits and finalizes all parallel tasks
+    async fn wait_transactions(&mut self, collator_data: &mut CollatorData) -> Result<()> {
+        log::trace!("{}: wait_transactions", self.collated_block_descr);
+
+        while self.wait_tr.count() != 0 {
+            self.wait_transaction(collator_data).await?;
+        }
+
+        self.min_lt.fetch_max(self.max_lt.load(Ordering::Relaxed), Ordering::Relaxed);
+        Ok(())
     }
 
     fn spawn_account_job(
@@ -910,10 +937,11 @@ impl ExecutionManager {
         let engine = self.engine.clone();
         let dict_hash_min_cells = self.config.size_limits_config().acc_state_cells_for_storage_dict;
         let lt_compatible = self.lt_compatible;
+        let cancel_ext = self.cancel_ext.clone();
         let handle = tokio::spawn(async move {
             let lt = lt.max(min_lt.load(Ordering::Relaxed));
             let full_collated_data = config.has_capability(GlobalCapabilities::CapFullCollatedData);
-            let mut shard_acc = tokio::task::spawn_blocking(move || {
+            let init = tokio::task::spawn_blocking(move || {
                 ShardAccountStuff::init(
                     &engine,
                     account_id,
@@ -924,17 +952,45 @@ impl ExecutionManager {
                     dict_hash_min_cells,
                 )
             })
-            .await??;
+            .await
+            .map_err(|join_err| join_err.into())
+            .flatten();
+            let mut shard_acc = match init {
+                Ok(shard_acc) => shard_acc,
+                Err(err) => {
+                    receiver.close();
+                    // If initialization of shard account stuff failed, we should respond to all pending messages and exit.
+                    while receiver.recv().await.is_some() {
+                        wait_tr.respond(None);
+                    }
+                    return Err(err);
+                }
+            };
             while let Some((new_msg, msg_metadata)) = receiver.recv().await {
                 log::trace!(
                     "{}: new message for {:x}",
                     collated_block_descr,
                     shard_acc.account_id()
                 );
+                if cancel_ext.is_cancelled() {
+                    if let AsyncMessage::Ext(_, _, msg_id) = &*new_msg {
+                        log::debug!(
+                            target: EXT_MESSAGES_TRACE_TARGET,
+                            "{}: account {:x} ext message {:x} cancelled by cutoff timeout before exec",
+                            collated_block_descr, shard_acc.account_id(), msg_id,
+                        );
+                        wait_tr.respond(None);
+                        continue;
+                    }
+                }
+
                 let config = config.clone(); // TODO: use Arc
 
-                shard_acc.fetch_max_lt(min_lt.load(Ordering::Relaxed));
-
+                let mut min_lt = min_lt.load(Ordering::Relaxed);
+                if let AsyncMessage::Deferred(enq) = &*new_msg {
+                    min_lt = min_lt.max(enq.emitted_lt().saturating_add(1));
+                };
+                shard_acc.fetch_max_lt(min_lt);
                 let mut account = shard_acc.account().clone();
 
                 let params = ExecuteParams {
@@ -948,16 +1004,34 @@ impl ExecutionManager {
                     ..ExecuteParams::default()
                 };
                 let new_msg1 = new_msg.clone();
-                let (mut transaction_res, account, duration) =
-                    tokio::task::spawn_blocking(move || {
-                        let now = Instant::now();
-                        (
-                            Self::execute_new_message(&new_msg1, &mut account, config, params),
-                            account,
-                            now.elapsed().as_micros() as u64,
-                        )
-                    })
-                    .await?;
+                let task = tokio::task::spawn_blocking(move || {
+                    let now = Instant::now();
+                    (
+                        Self::execute_new_message(&new_msg1, &mut account, config, params),
+                        account,
+                        now.elapsed().as_micros() as u64,
+                    )
+                });
+
+                let ext_msg_id =
+                    if let AsyncMessage::Ext(_, _, id) = &*new_msg { Some(id) } else { None };
+
+                let (mut transaction_res, account, duration) = if let Some(msg_id) = ext_msg_id {
+                    tokio::select! {
+                        res = task => res?,
+                        _ = cancel_ext.cancelled() => {
+                            log::debug!(
+                                target: EXT_MESSAGES_TRACE_TARGET,
+                                "{}: account {:x} ext message {:x} cancelled by cutoff timeout in-flight",
+                                collated_block_descr, shard_acc.account_id(), msg_id,
+                            );
+                            wait_tr.respond(None);
+                            continue;
+                        }
+                    }
+                } else {
+                    task.await?
+                };
 
                 if let Ok(transaction) = transaction_res.as_mut() {
                     let res = shard_acc.add_transaction(transaction, account);
@@ -1006,13 +1080,27 @@ impl ExecutionManager {
         executor.execute_with_params(msg_opt, account, params)
     }
 
-    async fn wait_transaction(&mut self, collator_data: &mut CollatorData) -> Result<()> {
+    async fn wait_transaction(
+        &mut self,
+        collator_data: &mut CollatorData,
+    ) -> Result<Option<Arc<AsyncMessage>>> {
         log::trace!("{}: wait_transaction", self.collated_block_descr);
-        let wait_op = self.wait_tr.wait(&mut self.receive_tr, false).await;
+        let wait_op = tokio::select! {
+            biased;
+            _ = self.stop_flag.cancelled() => fail!("Stop flag was set"),
+            res = self.wait_tr.wait(&mut self.receive_tr, false) => res,
+        };
         if let Some(Some((new_msg, msg_metadata, transaction_res))) = wait_op {
-            self.finalize_transaction(new_msg, msg_metadata, transaction_res, collator_data)?;
+            self.finalize_transaction(
+                new_msg.clone(),
+                msg_metadata,
+                transaction_res,
+                collator_data,
+            )?;
+            Ok(Some(new_msg))
+        } else {
+            Ok(None)
         }
-        Ok(())
     }
 
     fn finalize_transaction(
@@ -1032,7 +1120,7 @@ impl ExecutionManager {
                     "{}: account {} rejected inbound external message {:x}, by reason: {}",
                     self.collated_block_descr, address, msg_id, err
                 );
-                collator_data.rejected_ext_messages.push((msg_id.clone(), err.to_string()));
+                collator_data.rejected_ext_messages.push(msg_id.clone());
                 return Ok(());
             } else {
                 log::debug!(
@@ -1040,9 +1128,8 @@ impl ExecutionManager {
                     "{}: account {} accepted inbound external message {:x}",
                     self.collated_block_descr, address, msg_id,
                 );
-                collator_data
-                    .accepted_ext_messages
-                    .push((msg_id.clone(), msg.dst_workchain_id().unwrap_or_default()));
+                collator_data.accepted_ext_messages.push(msg_id.clone());
+                collator_data.external_messages.push((msg.clone(), msg_id.clone()));
             }
         }
         let tr = transaction_res?;
@@ -1228,6 +1315,7 @@ pub enum CollateResult {
     },
     Err {
         usage_tree: UsageTree,
+        external_messages: Vec<(Arc<Message>, UInt256)>,
         err: Error,
     },
 }
@@ -1237,7 +1325,7 @@ pub struct Collator {
     shard: ShardIdent,
     min_mc_seqno: u32,
     prev_blocks_ids: Vec<BlockIdExt>,
-    pipeline_context: PipelineContext,
+    state_resolver_cache: Arc<tokio::sync::Mutex<StateResolverCache>>,
     new_block_id_part: BlockIdExt,
     created_by: UInt256,
     after_merge: bool,
@@ -1252,7 +1340,8 @@ pub struct Collator {
     rand_seed: UInt256,
 
     started: Instant,
-    stop_flag: Arc<AtomicBool>,
+    stop_flag: tokio_util::sync::CancellationToken,
+    cancel_ext: tokio_util::sync::CancellationToken,
 }
 
 impl Collator {
@@ -1260,7 +1349,7 @@ impl Collator {
         shard: ShardIdent,
         min_mc_seqno: u32,
         prev_blocks_history: &PrevBlockHistory,
-        pipeline_context: PipelineContext,
+        state_resolver_cache: Arc<tokio::sync::Mutex<StateResolverCache>>,
         validator_set: ValidatorSet,
         created_by: UInt256,
         engine: Arc<dyn EngineOperations>,
@@ -1270,7 +1359,6 @@ impl Collator {
         let prev_blocks_ids = prev_blocks_history.get_prevs().to_vec();
         let collated_block_descr = Arc::new(prev_blocks_history.get_next_block_descr(None));
         log::trace!("{}: new", collated_block_descr);
-        log::debug!("{} pipeline context: {}", collated_block_descr, pipeline_context);
         log::debug!("{} prev_blocks_ids:{}", collated_block_descr, prev_blocks_history);
 
         let new_block_seqno = match prev_blocks_ids.len() {
@@ -1352,7 +1440,7 @@ impl Collator {
             shard,
             min_mc_seqno,
             prev_blocks_ids,
-            pipeline_context,
+            state_resolver_cache,
             created_by,
             after_merge,
             after_split,
@@ -1362,11 +1450,12 @@ impl Collator {
             debug: true,
             rand_seed,
             started: Instant::now(),
-            stop_flag: Arc::new(AtomicBool::new(false)),
+            stop_flag: tokio_util::sync::CancellationToken::new(),
+            cancel_ext: tokio_util::sync::CancellationToken::new(),
         })
     }
 
-    pub async fn collate(mut self) -> Result<CollateResult> {
+    pub async fn collate(mut self, mc_state_id: &BlockIdExt) -> Result<CollateResult> {
         log::info!(
             "{}: COLLATE min_mc_seqno = {}, prev_blocks_ids: {} {}",
             self.collated_block_descr,
@@ -1389,7 +1478,7 @@ impl Collator {
             let attempt_started = Instant::now();
 
             // load required data including masterchain and shards states
-            let imported_data = self.import_data().await.inspect_err(|e| {
+            let imported_data = self.import_data(mc_state_id).await.inspect_err(|e| {
                 log::warn!(
                     "{}: COLLATION FAILED: TIME: {}ms import_data: {:?}",
                     self.collated_block_descr,
@@ -1429,8 +1518,11 @@ impl Collator {
                         error_attempt += 1;
                         continue;
                     } else {
-                        let collate_result =
-                            CollateResult::Err { usage_tree: collator_data.usage_tree, err };
+                        let collate_result = CollateResult::Err {
+                            usage_tree: collator_data.usage_tree,
+                            external_messages: collator_data.external_messages,
+                            err,
+                        };
                         return Ok(collate_result);
                     }
                 }
@@ -1506,24 +1598,72 @@ impl Collator {
         Ok(collate_result)
     }
 
-    async fn import_data(&self) -> Result<ImportedData> {
-        log::trace!("{}: import_data", self.collated_block_descr);
+    async fn import_data(&self, mc_state_id: &BlockIdExt) -> Result<ImportedData> {
+        log::trace!("{}: import_data with mc state id {mc_state_id}", self.collated_block_descr);
 
         if self.shard.is_masterchain() {
             let (prev_states, prev_ext_blocks_refs) = self.import_prev_stuff().await?;
-            let top_shard_blocks_descr =
-                self.engine.get_shard_blocks(&prev_states[0], None).await?;
-            Ok(ImportedData {
-                mc_state: prev_states[0].clone(),
-                prev_states,
-                prev_ext_blocks_refs,
-                top_shard_blocks_descr,
-            })
+            let mc_state = prev_states[0].clone();
+            let mc_seqno_at_call = mc_state.block_id().seq_no;
+            let mut actual_mc_seqno = mc_seqno_at_call;
+            // The two `get_shard_blocks` impls behind `cfg(feature = "xp25")`
+            // disagree on what they do when the speculative parent is *ahead*
+            // of the applied MC head:
+            //   * default build (`shard_blocks.rs`) — `fail!()` on `!=`
+            //     either direction, so the `Err if actual < requested` arm
+            //     below catches it
+            //   * xp25 build (`shard_blocks_intershard.rs`) — only
+            //     `fail!()` on `<`; the speculative-ahead case returns
+            //     `Ok(top_blocks)` with `actual_mc_seqno` pointing at a
+            //     smaller value, so we have to repeat the same check on
+            //     the `Ok` arm or the bootstrap-safe fallback never fires
+            //     on xp25 and the collator silently uses a stale shard
+            //     view.
+            let top_shard_blocks_descr = match self
+                .engine
+                .get_shard_blocks(&mc_state, Some(&mut actual_mc_seqno))
+                .await
+            {
+                Ok(_) if actual_mc_seqno < mc_seqno_at_call => {
+                    log::warn!(
+                        "{}: fallback to empty shard-blocks view (xp25 Ok arm): speculative_mc_seqno={} actual_mc_seqno={}",
+                        self.collated_block_descr,
+                        mc_seqno_at_call,
+                        actual_mc_seqno
+                    );
+                    Vec::new()
+                }
+                Ok(top_blocks) => top_blocks,
+                Err(e) if actual_mc_seqno < mc_seqno_at_call => {
+                    // Bootstrap-safe fallback for speculative parent flow on
+                    // the default build: simplex may choose a notarized MC
+                    // parent whose state is already available in
+                    // resolver/cache, while the shard-blocks view still
+                    // tracks the last applied MC. Continue collation and
+                    // rely on shard refs from prev state rather than
+                    // failing hard on the seqno mismatch.
+                    log::warn!(
+                        "{}: fallback to empty shard-blocks view: speculative_mc_seqno={} actual_mc_seqno={} ({e})",
+                        self.collated_block_descr,
+                        mc_seqno_at_call,
+                        actual_mc_seqno
+                    );
+                    Vec::new()
+                }
+                Err(e) => {
+                    log::warn!(
+                        "{}: Skipped top shard blocks import: {e}. Continue w/a shards update.",
+                        self.collated_block_descr
+                    );
+                    Vec::new()
+                }
+            };
+            Ok(ImportedData { mc_state, prev_states, prev_ext_blocks_refs, top_shard_blocks_descr })
         } else {
             #[cfg(not(feature = "xp25"))]
             {
                 let (mc_state, (prev_states, prev_ext_blocks_refs)) =
-                    try_join!(self.import_mc_stuff(), self.import_prev_stuff())?;
+                    try_join!(self.import_mc_stuff(mc_state_id), self.import_prev_stuff())?;
 
                 Ok(ImportedData {
                     mc_state,
@@ -1536,7 +1676,7 @@ impl Collator {
             #[cfg(feature = "xp25")]
             loop {
                 let (mc_state, (prev_states, prev_ext_blocks_refs)) =
-                    try_join!(self.import_mc_stuff(), self.import_prev_stuff())?;
+                    try_join!(self.import_mc_stuff(mc_state_id), self.import_prev_stuff())?;
 
                 let top_shard_blocks_descr = {
                     // Wait until all blocks referenced in master are applied.
@@ -1762,11 +1902,21 @@ impl Collator {
             collator_data.config.clone(),
             max_collate_threads,
             self.collated_block_descr.clone(),
+            self.stop_flag.clone(),
+            self.cancel_ext.clone(),
             self.debug,
             self.collator_settings.lt_compatible,
         )?;
 
         self.process_dispatch_queue(collator_data).await?;
+
+        // update min_lt to keep proper message ordering
+        let max_emitted_lt = collator_data.last_dispatch_queue_emitted_lt.values().max();
+        if let Some(max_emitted_lt) = max_emitted_lt {
+            let target = max_emitted_lt + 1;
+            exec_manager.max_lt.fetch_max(target, Ordering::Relaxed);
+            exec_manager.min_lt.fetch_max(target, Ordering::Relaxed);
+        }
 
         // tick & special transactions
         if self.shard.is_masterchain() {
@@ -2005,16 +2155,14 @@ impl Collator {
     // import
     //
 
-    async fn import_mc_stuff(&self) -> Result<Arc<ShardStateStuff>> {
-        log::trace!("{}: import_mc_stuff", self.collated_block_descr);
-        let mc_state = self.engine.load_last_applied_mc_state().await?;
-
-        if mc_state.block_id().seq_no() < self.min_mc_seqno {
+    async fn import_mc_stuff(&self, mc_state_id: &BlockIdExt) -> Result<Arc<ShardStateStuff>> {
+        log::trace!("{}: import_mc_stuff with {mc_state_id}", self.collated_block_descr);
+        if mc_state_id.seq_no() < self.min_mc_seqno {
             fail!(
                 "requested to create a block referring to a non-existent future masterchain block"
             );
         }
-        Ok(mc_state)
+        self.engine.load_state(mc_state_id).await
     }
 
     async fn import_prev_stuff(&self) -> Result<(Vec<Arc<ShardStateStuff>>, Vec<ExtBlkRef>)> {
@@ -2022,9 +2170,13 @@ impl Collator {
         let mut prev_states = vec![];
         let mut prev_ext_blocks_refs = vec![];
         for (i, prev_id) in self.prev_blocks_ids.iter().enumerate() {
-            let prev_state = match self.pipeline_context.try_get_state(prev_id) {
-                Some(state) => state,
-                None => self.engine.clone().wait_state(prev_id, Some(1_000), true).await?,
+            let prev_state = if self.collator_settings.is_simplex {
+                self.wait_prev_state_via_engine_or_cache(prev_id).await?
+            } else {
+                self.engine
+                    .clone()
+                    .wait_state(prev_id, Some(PREV_STATE_WAIT_TIMEOUT_MS), true)
+                    .await?
             };
 
             let end_lt = prev_state.state()?.gen_lt();
@@ -2067,6 +2219,24 @@ impl Collator {
             }
         }
         Ok((prev_states, prev_ext_blocks_refs))
+    }
+
+    /// Simplex OR-wait semantics for parent state retrieval.
+    ///
+    /// Races resolver-cache async subscription against `engine.wait_state()`.
+    /// If cache wins, we can collate on notarized-but-unfinalized parents.
+    async fn wait_prev_state_via_engine_or_cache(
+        &self,
+        prev_id: &BlockIdExt,
+    ) -> Result<Arc<ShardStateStuff>> {
+        state_resolver_cache::wait_prev_state(
+            &self.state_resolver_cache,
+            &self.engine,
+            prev_id,
+            ResolverPurpose::SimplexCollationParent,
+            PREV_STATE_WAIT_TIMEOUT_MS,
+        )
+        .await
     }
 
     //
@@ -2180,11 +2350,14 @@ impl Collator {
         let prev = max(mc_data.state().state()?.gen_time(), prev_now);
         log::trace!("{}: init_utime prev_time: {}", self.collated_block_descr, prev);
         let allow_same_timestamp = self.allow_same_timestamp(mc_data);
+        let now_ms = self.collator_settings.min_gen_utime_ms.map_or_else(
+            || self.engine.now_ms(),
+            |min_now_ms| self.engine.now_ms().max(min_now_ms),
+        );
         // Compute gen_utime_ms first, then derive gen_utime from it (like C++).
         // This guarantees gen_utime_ms / 1000 == gen_utime, avoiding second-boundary
         // mismatches in ConsensusExtraData validation.
-        let (gen_utime, gen_utime_ms) =
-            Self::calc_utime(prev, self.engine.now_ms(), allow_same_timestamp);
+        let (gen_utime, gen_utime_ms) = Self::calc_utime(prev, now_ms, allow_same_timestamp);
         Ok((gen_utime, gen_utime_ms))
     }
 
@@ -2343,9 +2516,17 @@ impl Collator {
         collator_data: &mut CollatorData,
     ) -> Result<MsgQueueManager> {
         log::debug!("{}: request_neighbor_msg_queues", self.collated_block_descr);
+        let prev_chain = if self.collator_settings.is_simplex && self.prev_blocks_ids.len() == 1 {
+            self.state_resolver_cache
+                .lock()
+                .await
+                .collect_local_chain_from(&self.prev_blocks_ids[0])
+        } else {
+            Vec::new()
+        };
         let states_manager = StatesManager::with_collator_data(
             self.engine.clone(),
-            self.pipeline_context.clone(),
+            prev_chain,
             collator_data.config.has_capability(GlobalCapabilities::CapFullCollatedData),
         )?;
         MsgQueueManager::init(
@@ -3485,18 +3666,15 @@ impl Collator {
                 if to_us {
                     let account_id = enq.dst_account_id().clone();
                     log::debug!(
-                        "{}: message {:x} sent to execution to account {account_id:x}",
+                        "{}: internal message {:x} sent to execution to account {account_id:x}",
                         self.collated_block_descr,
                         key.hash,
                     );
                     let msg_metadata = enq.msg_metadata_add_depth();
                     let msg = AsyncMessage::Int(enq, our);
-                    if !exec_manager
+                    exec_manager
                         .execute(account_id, msg, msg_metadata, prev_data, collator_data)
-                        .await?
-                    {
-                        break;
-                    }
+                        .await?;
                 } else {
                     // println!("{:x} {:#}", key, enq);
                     // println!("cur: {}, dst: {}", enq.cur_prefix(), enq.dst_prefix());
@@ -3575,6 +3753,14 @@ impl Collator {
             );
             return Ok(());
         }
+        if collator_data.error_attempt >= 2 {
+            log::info!(
+                "{}: attempt #{}: skipping external messages",
+                self.collated_block_descr,
+                collator_data.error_attempt
+            );
+            return Ok(());
+        }
         log::debug!("{}: process_inbound_external_messages", self.collated_block_descr);
         let finish_time_ms = self.get_external_messages_finish_time_micros();
         let mut iter =
@@ -3604,20 +3790,16 @@ impl Collator {
                 }
                 let (_, account_id) = header.dst.extract_std_address(true)?;
                 log::debug!(
-                    "{}: message {:x} sent to execution",
+                    "{}: external message {msg_id:x} sent to execution to account {account_id:x}",
                     self.collated_block_descr,
-                    msg_id
                 );
                 let msg = AsyncMessage::Ext(msg, msg_cell, msg_id);
                 let initiator_addr =
                     MsgAddressInt::with_params(self.shard.workchain_id(), account_id.clone())?;
                 let msg_metadata = Some(MsgMetadata::new(initiator_addr, 0));
-                if !exec_manager
+                exec_manager
                     .execute(account_id, msg, msg_metadata, prev_data, collator_data)
-                    .await?
-                {
-                    break;
-                }
+                    .await?;
             } else {
                 // usually node collates more than one shard, the message can belong another one,
                 // so we can't postpone it
@@ -3627,9 +3809,29 @@ impl Collator {
             self.check_stop_flag()?;
         }
         exec_manager.wait_transactions(collator_data).await?;
-        let accepted = mem::take(&mut collator_data.accepted_ext_messages);
-        let rejected = mem::take(&mut collator_data.rejected_ext_messages);
-        self.engine.complete_external_messages(rejected, accepted)?;
+        // Accepted: postpone so the next collation pass within the pipeline
+        // window skips them; the authoritative cleanup happens once the block
+        // is applied (process_applied_block). If apply never lands, postpone
+        // generations exhaust and the messages are dropped, allowing rebroadcast.
+        //
+        // Note: this diverges from the C++ collator, which leaves accepted
+        // messages fully active in the pool until apply (see C++
+        // Collator::create_block_candidate sending only delay/bad to
+        // complete_external_messages). C++ relies on the wallet seqno cache
+        // (ExtMessagePool::wallets_) to short-circuit retries of the same
+        // logical wallet message between collate and apply. We don't have that
+        // cache, so a naive C++-mirror would re-execute every accepted message
+        // in subsequent collation attempts within the pipeline window. Routing
+        // accepted via to_delay instead gives that dedup cheaply through the
+        // existing postpone/generations machinery while preserving liveness:
+        // forced erase only happens after MESSAGE_MAX_GENERATIONS cycles, by
+        // which point apply should have either landed (and cleaned up via
+        // norm-hash) or visibly failed.
+        let to_delay = mem::take(&mut collator_data.accepted_ext_messages);
+        // Rejected: erase by raw id. Norm-hash siblings are kept so sibling
+        // variants with valid signatures can still be tried.
+        let to_delete = mem::take(&mut collator_data.rejected_ext_messages);
+        self.engine.complete_external_messages(&to_delay, &to_delete)?;
         Ok(())
     }
 
@@ -3644,11 +3846,13 @@ impl Collator {
         collator_data: &mut CollatorData,
     ) -> Result<Option<AsyncMessage>> {
         let from_dispatch_queue = msg.tr_cell.is_empty();
-        if (collator_data.block_full || collator_data.have_unprocessed_account_dispatch_queue)
+        if (collator_data.block_full
+            || collator_data.have_unprocessed_account_dispatch_queue
+            || self.check_cutoff_timeout())
             && !collator_data.enqueue_only
         {
             log::debug!(
-                "{}: BLOCK FULL or unprocessed dispatch queue, stop processing new messages",
+                "{}: BLOCK FULL or unprocessed dispatch queue or cutoff timeout, stop processing new messages",
                 self.collated_block_descr
             );
             collator_data.enqueue_only = true;
@@ -3700,11 +3904,12 @@ impl Collator {
             }
             Ok(None)
         } else {
-            collator_data.update_last_proc_int_msg((msg.enq.lt(), msg_hash.clone()))?;
             log::debug!(
-                "{}: new message {msg_hash:x} sent to execution",
+                "{}: new message {msg_hash:x} sent to execution to account {:x}",
                 self.collated_block_descr,
+                msg.enq.dst_account_id(),
             );
+            collator_data.update_last_proc_int_msg((msg.enq.lt(), msg_hash.clone()))?;
             let msg = if from_dispatch_queue {
                 AsyncMessage::Deferred(msg.enq)
             } else {
@@ -3737,12 +3942,9 @@ impl Collator {
                 let msg_metadata = msg.enq.msg_metadata_add_depth();
                 let account_id = msg.enq.dst_account_id().clone();
                 if let Some(msg) = self.process_new_message(msg, collator_data)? {
-                    if !exec_manager
+                    exec_manager
                         .execute(account_id, msg, msg_metadata, prev_data, collator_data)
-                        .await?
-                    {
-                        collator_data.enqueue_only = true;
-                    }
+                        .await?;
                     if self.collator_settings.lt_compatible {
                         new_messages.append(&mut collator_data.new_messages);
                     }
@@ -3874,7 +4076,7 @@ impl Collator {
         mut exec_manager: ExecutionManager,
         output_queue_manager: &MsgQueueManager,
     ) -> Result<(CollateResult, ExecutionManager)> {
-        log::trace!("{}: finalize_block", self.collated_block_descr);
+        log::debug!("{}: finalize_block", self.collated_block_descr);
         let (want_split, overload_history) = collator_data.want_split();
         let (want_merge, underload_history) = collator_data.want_merge();
 
@@ -3889,9 +4091,13 @@ impl Collator {
         let mut new_config_opt = None;
         for (account_id, (sender, handle)) in mem::take(&mut exec_manager.changed_accounts) {
             mem::drop(sender);
-            let mut shard_acc = handle.await.map_err(|err| {
-                error!("account {:x} thread didn't finish: {}", account_id, err)
-            })??;
+            let mut shard_acc = tokio::select! {
+                biased;
+                _ = self.stop_flag.cancelled() => fail!("Stop flag was set on account {account_id:x}"),
+                res = handle => res.map_err(|err| {
+                    error!("account {:x} thread didn't finish: {}", account_id, err)
+                })??,
+            };
             if let Some(addr) = &config_addr {
                 if addr == &account_id {
                     new_config_opt = Some(Self::extract_new_config(shard_acc.account(), addr)?);
@@ -3925,7 +4131,7 @@ impl Collator {
             new_config_opt = Some(new_config);
         }
 
-        log::trace!("{}: finalize_block: calc value flow", self.collated_block_descr);
+        log::debug!("{}: finalize_block: calc value flow", self.collated_block_descr);
         // calc value flow
         let mut value_flow = collator_data.value_flow.clone();
         value_flow.imported = collator_data.in_msgs.root_extra().value_imported.clone();
@@ -3967,7 +4173,7 @@ impl Collator {
             self.validator_set.catchain_seqno(),
         )?;
 
-        log::trace!("{}: finalize_block: fill block info", self.collated_block_descr);
+        log::debug!("{}: finalize_block: fill block info", self.collated_block_descr);
         // calc block info
         let mut info = BlockInfo::default();
         info.set_version(0);
@@ -3995,7 +4201,7 @@ impl Collator {
             }));
         }
 
-        log::trace!("{}: finalize_block: calc new state", self.collated_block_descr);
+        log::debug!("{}: finalize_block: calc new state", self.collated_block_descr);
         // Calc new state, then state update
 
         let mut new_state = ShardStateUnsplit::with_ident(self.shard.clone());
@@ -4067,7 +4273,7 @@ impl Collator {
             )?;
         }
 
-        log::trace!("{}: finalize_block: calc merkle update", self.collated_block_descr);
+        log::debug!("{}: finalize_block: calc merkle update", self.collated_block_descr);
         let new_ss_root = new_state.serialize()?;
 
         self.check_stop_flag()?;
@@ -4084,11 +4290,11 @@ impl Collator {
         self.check_stop_flag()?;
 
         // calc block extra
+        log::debug!("{}: finalize_block: fill BlockExtra", self.collated_block_descr);
         let mut extra = BlockExtra::default();
         extra.write_in_msg_descr(&collator_data.in_msgs)?;
         extra.write_out_msg_descr(&collator_data.out_msgs)?;
         extra.write_account_blocks(&accounts)?;
-        log::trace!("{}: finalize_block: BlockExtra 1", self.collated_block_descr);
         // mc block extra
         if let Some(mc_state_extra) = mc_state_extra {
             log::trace!("{}: finalize_block: McBlockExtra", self.collated_block_descr);
@@ -4121,11 +4327,10 @@ impl Collator {
         // construct block
         let new_block = Block::with_params(global_id, info, value_flow, state_update, extra)?;
         let mut block_id = self.new_block_id_part.clone();
-        let workchain_id = block_id.shard().workchain_id();
 
-        log::trace!("{}: finalize_block: fill block candidate", self.collated_block_descr);
+        log::debug!("{}: finalize_block: fill block candidate", self.collated_block_descr);
         let cell = new_block.serialize()?;
-        block_id.root_hash = cell.repr_hash();
+        block_id.root_hash = cell.repr_hash().clone();
         let mut data = Vec::new();
         // Block must be serialized the same way as in the cpp collator implementation
         // because all nodes expect this serialisation while receiving compressed blocks.
@@ -4157,34 +4362,11 @@ impl Collator {
             collated_data,
             created_by: self.created_by.clone(),
         };
-        if workchain_id != -1
-            && (collator_data.dequeue_count != 0
-                || collator_data.enqueue_count != 0
-                || collator_data.in_msg_count != 0
-                || collator_data.out_msg_count != 0
-                || collator_data.execute_count != 0
-                || collator_data.transit_count != 0
-                || collator_data.remove_count != 0)
-        {
-            log::debug!(
-                "{}: finalize_block finished: \
-                dequeue_count: {}, enqueue_count: {}, in_msg_count: {}, out_msg_count: {}, \
-                execute_count: {}, transit_count: {}, remove_count: {} msg_queue_depth_sum: {}",
-                self.collated_block_descr,
-                collator_data.dequeue_count,
-                collator_data.enqueue_count,
-                collator_data.in_msg_count,
-                collator_data.out_msg_count,
-                collator_data.execute_count,
-                collator_data.transit_count,
-                collator_data.remove_count,
-                collator_data.msg_queue_depth_sum
-            );
-        }
-        log::trace!(
+        log::debug!(
             "{}: finalize_block finished: \
             dequeue_count: {}, enqueue_count: {}, in_msg_count: {}, out_msg_count: {}, \
-            execute_count: {}, transit_count: {}, remove_count: {}, data len: {}",
+            execute_count: {}, transit_count: {}, remove_count: {}, msg_queue_depth_sum: {}, \
+            data len: {}",
             self.collated_block_descr,
             collator_data.dequeue_count,
             collator_data.enqueue_count,
@@ -4193,6 +4375,7 @@ impl Collator {
             collator_data.execute_count,
             collator_data.transit_count,
             collator_data.remove_count,
+            collator_data.msg_queue_depth_sum,
             candidate.data.len()
         );
         let collate_result = CollateResult::Ok {
@@ -4209,13 +4392,15 @@ impl Collator {
         cell: &Cell,
         visited: &HashSet<UInt256>,
         visited_from_root: &mut HashSet<UInt256>,
-    ) {
-        if visited.contains(&cell.repr_hash()) {
-            visited_from_root.insert(cell.repr_hash());
-            for r in cell.clone_references() {
-                Self::_check_visited_integrity(&r, visited, visited_from_root);
+    ) -> Result<()> {
+        if visited.contains(cell.repr_hash()) {
+            visited_from_root.insert(cell.repr_hash().clone());
+            let refs = cell.clone_references()?;
+            for r in refs.iter() {
+                Self::_check_visited_integrity(r, visited, visited_from_root)?;
             }
         }
+        Ok(())
     }
 
     fn extract_new_config(account: &Account, config_addr: &AccountId) -> Result<ConfigParams> {
@@ -4823,17 +5008,25 @@ impl Collator {
     fn init_timeout(&mut self) {
         self.started = Instant::now();
 
-        let stop_timeout = self.engine.collator_config().stop_timeout_ms;
+        let stop_deadline = Instant::now()
+            + Duration::from_millis(self.engine.collator_config().stop_timeout_ms as u64);
         let stop_flag = self.stop_flag.clone();
         tokio::spawn(async move {
-            futures_timer::Delay::new(Duration::from_millis(stop_timeout as u64)).await;
-            stop_flag.store(true, Ordering::Relaxed);
+            tokio::time::sleep_until(stop_deadline.into()).await;
+            stop_flag.cancel();
+        });
+
+        let cutoff_deadline = Instant::now()
+            + Duration::from_millis(self.engine.collator_config().cutoff_timeout_ms as u64);
+        let cancel_ext = self.cancel_ext.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep_until(cutoff_deadline.into()).await;
+            cancel_ext.cancel();
         });
     }
 
     fn check_cutoff_timeout(&self) -> bool {
-        let cutoff_timeout = self.engine.collator_config().cutoff_timeout_ms;
-        self.started.elapsed().as_millis() as u32 > cutoff_timeout
+        self.cancel_ext.is_cancelled()
     }
 
     fn get_remaining_cutoff_time_limit_nanos(&self) -> i128 {
@@ -4860,7 +5053,7 @@ impl Collator {
     }
 
     fn check_stop_flag(&self) -> Result<()> {
-        if self.stop_flag.load(Ordering::Relaxed) {
+        if self.stop_flag.is_cancelled() {
             fail!("Stop flag was set")
         }
         Ok(())
@@ -4870,7 +5063,7 @@ impl Collator {
         &self,
         collator_data: &CollatorData,
         prev_data: &PrevData,
-        accounts: impl Iterator<Item = &'a ShardAccountStuff>,
+        accounts: impl Iterator<Item = &'a ShardAccountStuff> + Clone,
         output_queue_manager: &MsgQueueManager,
     ) -> Result<Vec<u8>> {
         let mut roots = Vec::new();
@@ -4944,6 +5137,13 @@ impl Collator {
                     Ok(true)
                 },
             )?;
+            for account in accounts.clone() {
+                let _ = output_queue_manager
+                    .prev()
+                    .out_queue_extra()
+                    .dispatch_queue()
+                    .get(account.account_id())?;
+            }
         }
 
         // 2. Proofs for hashes of states: previous states + neighbors
@@ -4982,26 +5182,28 @@ impl Collator {
         // 4. Previous state proof (only shadchains) and storage dict proofs
         if !self.shard.is_masterchain() {
             let mut roots_to_include = HashSet::new();
-            let mut ss_visited = collator_data.usage_tree.build_visited_set();
-            // extend with visited cells from neighbour msg queues to properly calculate previous state proof size difference:
-            // if some cell is already included in neighbour msg queue proof, it should not be counted again
-            // and we also include message queue from the previous state into the proof
-            ss_visited.extend(neighbours_msg_queue_visited.into_iter().flatten());
+            // Cell-status model of the previous-state proof: every cell loaded during
+            // collation is `Loaded`, its children `Pruned`.
+            let mut stat = collator_data.usage_tree.build_proof_stat()?;
+            for visited in neighbours_msg_queue_visited {
+                for hash in visited {
+                    stat.set_loaded_hash(hash);
+                }
+            }
             for account_stuff in accounts {
                 if let Some(dict_usage) = account_stuff.storage_dict_usage() {
                     let dict_proof_size = dict_usage.estimate_proof_serialized_size()?;
                     let dict = StorageStatDict::with_hashmap(Some(dict_usage.original_root()))
                         .export_keys::<UInt256>()?;
-                    let mut ss_visited_update = ss_visited.clone();
-                    let mut ss_proof_size_diff = 0;
-                    for update in account_stuff.account_updates() {
-                        ss_proof_size_diff += UsageTree::add_branch_to_visited(
-                            update,
-                            &mut ss_visited_update,
-                            &|hash| dict.contains(hash),
-                        )?;
-                    }
-                    if ss_proof_size_diff > dict_proof_size {
+                    let updates = account_stuff.account_updates();
+                    // Single walk with early-exit: if keeping the account's cells in the state
+                    // proof is no larger than the dict proof, it commits them and returns true;
+                    // otherwise it bails out as soon as that's known and we emit the dict proof.
+                    if !stat.try_load_branches(
+                        updates,
+                        &|hash| dict.contains(hash),
+                        dict_proof_size,
+                    )? {
                         let proof = MerkleProof::create_by_usage_tree(
                             &dict_usage.original_root(),
                             dict_usage,
@@ -5014,20 +5216,18 @@ impl Collator {
                             dict_usage.original_root().repr_hash(),
                             account_stuff.account_id(),
                         );
-                    } else {
-                        ss_visited = ss_visited_update;
                     }
-                } else {
+                } else if account_stuff.has_root_change() {
                     log::debug!("Added full account state {:x} ", account_stuff.account_id());
                     roots_to_include.insert(account_stuff.original_root().repr_hash());
                 }
+                // else: a non-dict account whose storage roots never changed in this block —
+                // no data needed
             }
             for state in prev_states {
                 let proof = MerkleProof::create_with_subtrees(
                     &state,
-                    |hash| {
-                        ss_visited.contains(hash) || collator_data.imported_visited.contains(hash)
-                    },
+                    |hash| stat.is_loaded(hash) || collator_data.imported_visited.contains(hash),
                     |hash| roots_to_include.contains(hash),
                 )?;
                 roots.push(proof.serialize()?);

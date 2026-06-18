@@ -278,8 +278,8 @@ Expected output:
 {
   "list": [
     {
-      "type_id": 1209251014,
-      "pub_key": "<BASE64_PUBLIC_KEY>"
+        "type_id": 1209251014,
+        "pub_key": "<BASE64_PUBLIC_KEY>"
     }
   ]
 }

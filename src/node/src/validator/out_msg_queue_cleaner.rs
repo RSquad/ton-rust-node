@@ -1097,7 +1097,7 @@ impl HashmapOrderedFilterCursor {
 
             let new_node_cell = builder.into_cell()?;
 
-            let restored_branch_key = current.node_obj_ref().key().get_slice(branch_key_len)?;
+            let restored_branch_key = current.node_obj_ref().key().get_slice(0, branch_key_len)?;
 
             let parse_res = HashmapNodeObj::parse_node_from_cell(
                 new_node_cell.clone(),
@@ -1164,7 +1164,7 @@ impl HashmapOrderedFilterCursor {
 
             let new_node_cell = builder.into_cell()?;
 
-            let restored_branch_key = curr_node_obj.key().get_slice(branch_key_len)?;
+            let restored_branch_key = curr_node_obj.key().get_slice(0, branch_key_len)?;
 
             let parse_res = HashmapNodeObj::parse_node_from_cell(
                 new_node_cell.clone(),

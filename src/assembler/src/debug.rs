@@ -161,7 +161,7 @@ impl DbgInfo {
     fn collect(&mut self, cell: Cell, dbg: DbgNode) {
         let mut stack = vec![(cell.clone(), dbg)];
         while let Some((cell, mut dbg)) = stack.pop() {
-            let hash = cell.repr_hash().inner();
+            let hash = cell.repr_hash().clone().inner();
             let offsets_len = dbg.offsets.len();
             self.map.insert(hash, dbg.offsets.into_iter().collect());
             debug_assert_eq!(Some(offsets_len), self.map.get(&hash).map(|v| v.len()));
@@ -170,7 +170,7 @@ impl DbgInfo {
                     continue;
                 }
                 let child_cell = cell.reference(i).unwrap();
-                let child_hash = child_cell.repr_hash().inner();
+                let child_hash = child_cell.repr_hash().clone().inner();
                 if !self.map.contains_key(&child_hash) {
                     let child_dbg = std::mem::take(&mut dbg.children[i]);
                     stack.push((child_cell, child_dbg));

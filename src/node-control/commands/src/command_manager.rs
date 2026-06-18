@@ -44,6 +44,10 @@ impl CommandManager {
                 cmd.run().await?;
                 Ok(None)
             }
+            Commands::Automation(cmd) => {
+                cmd.run().await?;
+                Ok(None)
+            }
             // Key management
             Commands::Key(cmd) => {
                 cmd.run().await?;
@@ -51,6 +55,11 @@ impl CommandManager {
             }
             // Service
             Commands::Service(cmd) => Ok(Some(cmd.run(cancellation_ctx).await?)),
+            // Voting
+            Commands::Vote(cmd) => {
+                cmd.run().await?;
+                Ok(None)
+            }
         }
     }
 }

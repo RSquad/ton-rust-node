@@ -54,7 +54,7 @@ fn test_proof_from_proof() {
 
     let _cell = proof.serialize().unwrap();
 
-    assert_eq!(new_proof.hash, new_proof.proof.hash(0));
+    assert_eq!(new_proof.hash, *new_proof.proof.hash(0));
     assert_eq!(new_proof.proof.hash(0), original_proof.proof.hash(0));
 }
 

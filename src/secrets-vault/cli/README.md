@@ -43,6 +43,7 @@ hashicorp://<vault_address>?api_key=<token>&namespace=<namespace>
 | `delete`   | Delete one or more secrets               |
 | `sign`     | Sign data using a stored key             |
 | `verify`   | Verify a signature against stored key    |
+| `copy-file-to-hashicorp` | Copy all secrets from a file vault to a HashiCorp Vault (see [COPY_FILE_TO_HASHICORP.md](./COPY_FILE_TO_HASHICORP.md) for the runbook) |
 
 ## Examples
 
@@ -116,6 +117,46 @@ secrets-vault-cli --url='file://vault.json?master_key=<KEY_HEX>' verify \
 secrets-vault-cli --url='file://vault.json?master_key=<KEY_HEX>' delete secret_01
 ```
 
+### Copy Secrets From a File Vault to HashiCorp Vault
+
+Copies every secret from a file-backed source vault to a HashiCorp Vault
+destination. Source URL is read from `FROM_VAULT_URL`, destination from
+`VAULT_URL`. Each secret is loaded from the source, its metadata is logged, and
+it is written to the destination.
+
+```bash
+export FROM_VAULT_URL='file:///etc/ton/vault.json?master_key=<KEY_HEX>'
+export VAULT_URL='hashicorp://https://vault.example.com:8200?api_key=<API_KEY>&kv_mount=ton&kv_prefix=mainnet&transit_mount=ton-transit'
+
+secrets-vault-cli copy-file-to-hashicorp
+```
+
+Inspect the plan first without writing:
+
+```bash
+secrets-vault-cli copy-file-to-hashicorp --dry-run
+```
+
+Overwrite existing entries on the destination and keep going on per-secret
+errors:
+
+```bash
+secrets-vault-cli copy-file-to-hashicorp --on-conflict overwrite --continue-on-error
+```
+
+Notes:
+- Non-extractable source keys (e.g. HashiCorp Transit keys without
+  `exportable=true`) cannot be loaded and are skipped.
+- The destination is flushed once at the end if anything was written.
+- Identical source and destination URLs are rejected.
+- `api_key`, `master_key`, and `token` query parameters are redacted in the
+  log banner.
+
+For the operational procedure of migrating a running TON Node from file
+storage to HashiCorp Vault (timing relative to elections, StatefulSet update,
+Pod restart, rollback), see
+[COPY_FILE_TO_HASHICORP.md](./COPY_FILE_TO_HASHICORP.md).
+
 ## Command Reference
 
 ### `generate`
@@ -173,6 +214,20 @@ Delete one or more secrets.
 ```bash
 secrets-vault-cli --url='<url>' delete <secret_id> [<secret_id>...]
 ```
+
+### `copy-file-to-hashicorp`
+
+Copy all secrets from a file vault at `FROM_VAULT_URL` to a HashiCorp Vault at
+`VAULT_URL`. Both must be set in the environment; passing the same URL for both
+is rejected.
+
+| Option                  | Required | Description                                                                 |
+|-------------------------|----------|-----------------------------------------------------------------------------|
+| `--on-conflict <MODE>`  | No       | When destination already has the same id: `fail` (default), `skip`, `overwrite` |
+| `--dry-run`             | No       | Print the plan without writing to destination                               |
+| `--continue-on-error`   | No       | Keep going on per-secret errors instead of aborting                         |
+
+Exit status is non-zero if any secret failed to copy.
 
 ## Secret Properties
 

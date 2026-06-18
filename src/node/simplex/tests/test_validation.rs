@@ -26,11 +26,31 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use ton_block::{
-    error, sha256_digest, BlockIdExt, BlockSignaturesVariant, BocFlags, BocWriter, BuilderData,
-    Ed25519KeyOption, ShardIdent, UInt256,
+    sha256_digest, BlockIdExt, BlockSignaturesVariant, BocFlags, BocWriter, BuilderData,
+    Ed25519KeyOption, ShardIdent, UInt256, ZeroizingBytes,
 };
 
 include!("../../../common/src/info.rs");
+
+fn session_start_args(
+    shard: &ShardIdent,
+    initial_block_seqno: u32,
+) -> (Vec<BlockIdExt>, BlockIdExt) {
+    (
+        vec![BlockIdExt::with_params(
+            shard.clone(),
+            initial_block_seqno.saturating_sub(1),
+            UInt256::default(),
+            UInt256::default(),
+        )],
+        BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            0,
+            UInt256::default(),
+            UInt256::default(),
+        ),
+    )
+}
 
 /*
     Test constants
@@ -60,10 +80,10 @@ struct ValidationTestListener {
     collation_count: Arc<AtomicU32>,
     /// Public key for generating candidates
     public_key: PublicKey,
-    /// Next expected seqno for collation - increases after each successful collation
+    /// Next expected seqno for collation — updated on finalization
     next_expected_collation_seqno: Arc<AtomicU32>,
-    /// Next expected seqno for commit - initialized with initial_block_seqno, +1 for each commit
-    next_expected_commit_seqno: Arc<AtomicU32>,
+    /// Maximum finalized seqno observed (monotonically advances via fetch_max)
+    max_finalized_seqno: Arc<AtomicU32>,
 }
 
 impl SessionListener for ValidationTestListener {
@@ -111,19 +131,12 @@ impl SessionListener for ValidationTestListener {
         self.collation_requested.store(true, Ordering::Release);
         self.collation_count.fetch_add(1, Ordering::Relaxed);
 
-        // Derive seqno from explicit parent hint or use stable counter value for implicit case
         let seqno = match &parent {
             consensus_common::CollationParentHint::Implicit => {
-                // Keep seqno stable across retries for the same slot.
-                // The counter is advanced on commit.
-                self.next_expected_collation_seqno.load(Ordering::SeqCst)
+                panic!("Simplex validation test must not receive implicit parent hints")
             }
-            consensus_common::CollationParentHint::Explicit(parent_id) => {
-                // Explicit parent: derive seqno from parent (parent_seqno + 1)
-                let derived_seqno = parent_id.seq_no + 1;
-                // Update counter to match derived seqno for next iteration
-                self.next_expected_collation_seqno.store(derived_seqno + 1, Ordering::SeqCst);
-                derived_seqno
+            consensus_common::CollationParentHint::Explicit(parent_ids) => {
+                parent_ids.iter().map(|id| id.seq_no).max().unwrap_or(0) + 1
             }
         };
 
@@ -175,28 +188,41 @@ impl SessionListener for ValidationTestListener {
 
     fn on_block_committed(
         &self,
-        source_info: simplex::BlockSourceInfo,
-        root_hash: BlockHash,
+        _source_info: simplex::BlockSourceInfo,
+        _root_hash: BlockHash,
         _file_hash: BlockHash,
         _data: BlockPayloadPtr,
         _signatures: BlockSignaturesVariant,
         _approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
         _stats: consensus_common::SessionStats,
     ) {
-        let slot = source_info.priority.round;
+        panic!(
+            "on_block_committed must not be called for Simplex sessions (finalized-driven only)"
+        );
+    }
 
-        // Increment next_expected_commit_seqno and update next_expected_collation_seqno
-        let committed_seqno = self.next_expected_commit_seqno.fetch_add(1, Ordering::SeqCst);
-        let next_commit_seqno = committed_seqno + 1;
-        self.next_expected_collation_seqno.store(next_commit_seqno, Ordering::SeqCst);
+    fn on_block_finalized(
+        &self,
+        block_id: BlockIdExt,
+        source_info: simplex::BlockSourceInfo,
+        _root_hash: BlockHash,
+        _file_hash: BlockHash,
+        _data: BlockPayloadPtr,
+        _signatures: BlockSignaturesVariant,
+        _approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
+    ) {
+        let slot = source_info.priority.round;
+        let seqno = block_id.seq_no;
+
+        self.max_finalized_seqno.fetch_max(seqno + 1, Ordering::SeqCst);
+        self.next_expected_collation_seqno.fetch_max(seqno + 1, Ordering::SeqCst);
 
         log::info!(
-            "ValidationTestListener[{}]::on_block_committed: slot={}, hash={:?}, committed_seqno={}, next_expected={}",
+            "ValidationTestListener[{}]::on_block_finalized: slot={}, seqno={}, block_id={}",
             self.node_idx,
             slot,
-            root_hash,
-            committed_seqno,
-            next_commit_seqno
+            seqno,
+            block_id,
         );
     }
 
@@ -207,21 +233,17 @@ impl SessionListener for ValidationTestListener {
     fn get_approved_candidate(
         &self,
         _source: PublicKey,
-        _root_hash: BlockHash,
+        root_hash: BlockHash,
         _file_hash: BlockHash,
         _collated_data_hash: BlockHash,
         _callback: ValidatorBlockCandidateCallback,
     ) {
-        // Not used in this test
-    }
-
-    fn get_committed_candidate(
-        &self,
-        block_id: BlockIdExt,
-        callback: consensus_common::CommittedBlockProofCallback,
-    ) {
-        log::info!("get_committed_candidate: STUB for block_id={block_id}");
-        callback(Err(error!("get_committed_candidate not implemented in test")));
+        panic!(
+            "unexpected legacy get_approved_candidate request in simplex validation test \
+             (node_idx={}, root_hash={}); active simplex flow must not use this callback",
+            self.node_idx,
+            root_hash.to_hex_string()
+        );
     }
 }
 
@@ -315,8 +337,10 @@ fn run_validation_test() {
     log::info!("=== STARTING VALIDATION TEST ===");
 
     // Create two nodes
-    let private_key_0 = Ed25519KeyOption::generate().expect("Failed to generate private key 0");
-    let private_key_1 = Ed25519KeyOption::generate().expect("Failed to generate private key 1");
+    let private_key_0 =
+        Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate private key 0");
+    let private_key_1 =
+        Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate private key 1");
 
     let node_0 = SessionNode {
         adnl_id: private_key_0.id().clone(),
@@ -374,7 +398,7 @@ fn run_validation_test() {
         collation_count: collation_count_0.clone(),
         public_key: private_key_0.clone(),
         next_expected_collation_seqno: Arc::new(AtomicU32::new(initial_block_seqno)),
-        next_expected_commit_seqno: Arc::new(AtomicU32::new(initial_block_seqno)),
+        max_finalized_seqno: Arc::new(AtomicU32::new(initial_block_seqno)),
     });
 
     let listener_1 = Arc::new(ValidationTestListener {
@@ -385,7 +409,7 @@ fn run_validation_test() {
         collation_count: collation_count_1.clone(),
         public_key: private_key_1.clone(),
         next_expected_collation_seqno: Arc::new(AtomicU32::new(initial_block_seqno)),
-        next_expected_commit_seqno: Arc::new(AtomicU32::new(initial_block_seqno)),
+        max_finalized_seqno: Arc::new(AtomicU32::new(initial_block_seqno)),
     });
 
     let session_listener_0: Arc<dyn SessionListener + Send + Sync> = listener_0.clone();
@@ -409,7 +433,9 @@ fn run_validation_test() {
         Arc::downgrade(&session_listener_0),
     )
     .expect("Failed to create session 0");
-    session_0.start(initial_block_seqno);
+    let (prev_blocks_0, min_masterchain_block_id_0) =
+        session_start_args(&shard, initial_block_seqno);
+    session_0.start(prev_blocks_0, min_masterchain_block_id_0);
 
     let session_1 = SessionFactory::create_session(
         &session_opts,
@@ -422,7 +448,9 @@ fn run_validation_test() {
         Arc::downgrade(&session_listener_1),
     )
     .expect("Failed to create session 1");
-    session_1.start(initial_block_seqno);
+    let (prev_blocks_1, min_masterchain_block_id_1) =
+        session_start_args(&shard, initial_block_seqno);
+    session_1.start(prev_blocks_1, min_masterchain_block_id_1);
 
     log::info!("Sessions created, waiting for validation callback on node 1...");
 

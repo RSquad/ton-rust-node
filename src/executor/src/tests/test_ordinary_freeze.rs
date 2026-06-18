@@ -71,7 +71,7 @@ fn send_money_to_frozen_account(mut acc: Account, bounce: bool) -> Account {
     let new_acc_balance = if bounce { 0.into() } else { Coins::from(msg_income) - due };
     let trans =
         execute_c(&msg, &mut acc, tr_lt, new_acc_balance, if bounce { 1 } else { 0 }).unwrap();
-    acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+    acc.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
 
     let mut new_acc = Account::frozen(
         acc.get_addr().unwrap().clone(),
@@ -82,8 +82,8 @@ fn send_money_to_frozen_account(mut acc: Account, bounce: bool) -> Account {
         acc.frozen_hash().unwrap().clone(),
     );
 
-    new_acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
-    acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+    new_acc.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
+    acc.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
     assert_eq!(acc, new_acc);
 
     let mut description = TransactionDescrOrdinary::default();
@@ -157,7 +157,7 @@ fn lead_account_into_even_more_debt(mut acc: Account, bounce: bool) -> Account {
     acc.set_last_paid(acc.last_paid() - 100);
     let new_balance = if bounce { msg_income } else { 0 };
     let trans = execute_c(&msg, &mut acc, tr_lt, new_balance, 0).unwrap();
-    acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+    acc.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
 
     assert!(old_due < acc.due_payment().cloned().unwrap_or_default());
 
@@ -170,7 +170,7 @@ fn lead_account_into_even_more_debt(mut acc: Account, bounce: bool) -> Account {
         acc.frozen_hash().unwrap().clone(),
     );
     new_acc.set_balance(new_balance.into());
-    new_acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+    new_acc.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
     assert_eq!(acc, new_acc);
 
     let mut description = TransactionDescrOrdinary::default();
@@ -220,7 +220,7 @@ fn send_message_to_freeze_account(mut acc: Account, start_balance: u64, bounce: 
         create_int_msg(THIRD_ACCOUNT.clone(), SENDER_ACCOUNT.clone(), msg_income, bounce, BLOCK_LT);
 
     let state_init = acc.state_init().unwrap().clone();
-    let frozen_hash = state_init.serialize().unwrap().repr_hash();
+    let frozen_hash = state_init.serialize().unwrap().repr_hash().clone();
 
     // send message to freeze account
     let mut new_acc = Account::frozen(
@@ -231,11 +231,11 @@ fn send_message_to_freeze_account(mut acc: Account, start_balance: u64, bounce: 
         Some(due_payment.into()),
         frozen_hash,
     );
-    new_acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+    new_acc.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
 
     let tr_lt = BLOCK_LT + 1;
     let trans = execute_c(&msg, &mut acc, tr_lt, 0, if bounce { 1 } else { 0 }).unwrap();
-    acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+    acc.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
 
     assert_eq!(acc, new_acc);
 
@@ -318,13 +318,13 @@ fn unfreeze_account(mut acc: Account, state_init: &StateInit, bounce: bool) -> A
     let tr_lt = BLOCK_LT + 3;
     msg.set_state_init(state_init.clone());
     let trans = execute_c(&msg, &mut acc, tr_lt, new_acc_balance, 2).unwrap();
-    acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+    acc.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
 
     let mut new_acc = acc.clone();
     new_acc.set_last_paid(BLOCK_UT);
     new_acc.set_last_tr_time(acc.last_tr_time().unwrap());
     new_acc.set_balance(CurrencyCollection::from_coins(new_acc_balance));
-    new_acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+    new_acc.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
 
     let (mut msg1, mut msg2) = create_two_internal_messages();
     let mut actions = OutActions::default();
@@ -413,13 +413,13 @@ fn try_unfreeze_account_with_small_value(
     let tr_lt = BLOCK_LT + 3;
     msg.set_state_init(state_init.clone());
     let trans = execute_c(&msg, &mut acc, tr_lt, new_acc_balance, 0).unwrap();
-    acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+    acc.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
 
     let mut new_acc = acc.clone();
     new_acc.set_last_paid(BLOCK_UT);
     new_acc.set_last_tr_time(tr_lt + 1);
     new_acc.set_balance(CurrencyCollection::with_coins(new_acc_balance));
-    new_acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+    new_acc.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
 
     assert_eq!(acc.status(), AccountStatus::AccStateFrozen);
     assert_eq!(acc, new_acc);
@@ -519,7 +519,7 @@ fn delete_frozen_account(mut acc: Account, bounce: bool) -> Account {
         );
         new_acc.set_last_paid(acc.last_paid());
         new_acc.set_last_tr_time(BLOCK_LT + 4);
-        new_acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+        new_acc.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
         new_acc
     } else {
         Account::default()
@@ -678,8 +678,8 @@ fn try_delete_active_account(mut acc: Account, bounce: bool) -> Account {
         BLOCK_UT,
     );
     new_acc.set_due_payment(Some(Coins::from(due + if bounce { msg_income } else { 0 })));
-    new_acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
-    acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+    new_acc.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
+    acc.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
     assert_eq!(acc, new_acc);
 
     let mut description = TransactionDescrOrdinary::default();
@@ -737,7 +737,7 @@ fn delete_uninit_account(mut acc: Account, bounce: bool) -> Account {
         );
         new_acc.set_last_paid(acc.last_paid());
         new_acc.set_last_tr_time(BLOCK_LT + 4);
-        new_acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+        new_acc.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
         new_acc
     } else {
         Account::default()
@@ -803,7 +803,7 @@ fn delete_uninit_account_with_small_due(mut acc: Account, bounce: bool) {
 
     let due = 8803;
     let new_acc = Account::default();
-    acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+    acc.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
     assert_eq!(acc, new_acc);
 
     let mut description = TransactionDescrOrdinary::default();

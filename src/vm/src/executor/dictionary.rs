@@ -283,7 +283,7 @@ fn keyreader_from_slice(key: &StackItem, nbits: usize) -> Result<SliceData> {
         fail!(ExceptionCode::CellUnderflow)
     } else {
         key.shrink_data(..nbits);
-        key.shrink_references(..0);
+        key.shrink_references(..0)?;
         Ok(key)
     }
 }

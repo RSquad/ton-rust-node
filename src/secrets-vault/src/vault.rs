@@ -30,6 +30,10 @@ impl SecretVault {
         SecretVault { storage, event_handler }
     }
 
+    pub fn storage(&self) -> &Arc<dyn Storage> {
+        &self.storage
+    }
+
     pub async fn flush(&self) -> anyhow::Result<()> {
         self.storage.flush().await
     }
@@ -50,13 +54,14 @@ impl SecretVault {
         Ok(secret)
     }
 
-    pub async fn get(&self, secret_id: &SecretId) -> anyhow::Result<Secret> {
+    pub async fn load(&self, secret_id: &SecretId) -> anyhow::Result<Secret> {
         self.storage.load(secret_id).await
     }
 
     pub async fn exists(&self, secret_id: &SecretId) -> anyhow::Result<bool> {
-        match self.storage.load(secret_id).await {
-            Ok(_) => Ok(true),
+        match self.storage.load_metadata(secret_id).await {
+            Ok(Some(_)) => Ok(true),
+            Ok(None) => Ok(false),
             Err(e) => {
                 if e.downcast_ref::<VaultError>()
                     .is_some_and(|ve| ve.code() == VaultError::NOT_FOUND)
@@ -69,19 +74,8 @@ impl SecretVault {
         }
     }
 
-    pub async fn put(&self, secret: &Secret, mode: StoreMode) -> anyhow::Result<()> {
-        self.storage.store(secret, mode).await
-    }
-
-    pub async fn put_vec(&self, secrets: Vec<(Secret, StoreMode)>) -> anyhow::Result<()> {
-        let mut secrets_data = Vec::with_capacity(secrets.len());
-
-        for (secret, mode) in secrets {
-            let data = secret.serialize().await?;
-            secrets_data.push((data, secret.metadata().clone(), mode));
-        }
-
-        self.storage.store_vec(secrets_data).await
+    pub async fn store(&self, secret: &Secret, mode: StoreMode) -> anyhow::Result<()> {
+        self.storage.store(secret, mode, None).await
     }
 
     pub async fn delete(&self, secret_id: &SecretId) -> anyhow::Result<()> {
@@ -98,5 +92,19 @@ impl SecretVault {
 
     pub async fn list_metadata(&self) -> anyhow::Result<Vec<Metadata>> {
         self.storage.list_metadata().await
+    }
+
+    #[cfg(test)]
+    pub async fn clear(&self) -> anyhow::Result<()> {
+        self.storage.clear().await
+    }
+}
+
+impl std::fmt::Debug for SecretVault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretVault")
+            .field("storage", &"<dyn Storage>")
+            .field("event_handler", &"<dyn EventHandler>")
+            .finish()
     }
 }

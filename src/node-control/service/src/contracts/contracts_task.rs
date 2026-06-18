@@ -8,38 +8,52 @@
  */
 use crate::runtime_config::RuntimeConfig;
 use anyhow::Context;
-use common::{app_config::AppConfig, snapshot::SnapshotStore, task_cancellation::CancellationCtx};
-use contracts::{NominatorWrapper, TonWallet, contract_provider};
+use common::{
+    app_config::{AppConfig, ContractsAutomationConfig},
+    task_cancellation::CancellationCtx,
+    time_format,
+};
+use contracts::{
+    NominatorWrapper, PoolKind, TonWallet, contract_provider,
+    nominator::ton_core_pool as tc_messages,
+};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
     time::Duration,
 };
+use tokio::time::{self, MissedTickBehavior};
 use ton_block::{Cell, MsgAddressInt, write_boc};
 use ton_http_api_client::v2::{client_json_rpc::ClientJsonRpc, data_models::AccountState};
 
-/// Minimal required balance for the master wallet before it can be deployed.
-/// Note: 0.1 TON to cover the gas cost of the deploy transaction.
-const DEPLOY_AMOUNT: u64 = 1_100_000_000; // 1.1 TON
-/// Minimal required balance for a wallet before it will be topped up.
-const MIN_WALLET_BALANCE: u64 = 5_000_000_000; // 5 TON
-/// Gas cost for sending message from a wallet.
+/// Gas cost for sending a simple message from a wallet (deploy, top-up).
 const WALLET_GAS: u64 = 100_000_000; // 0.1 TON
-/// Amount to top up a wallet if its balance is below the minimum threshold.
-const TOP_UP_AMOUNT: u64 = 10_000_000_000; // 10 TON
+/// Gas for masterchain pool operations (update_validator_set, etc.)
+/// Masterchain gas prices are ~25x basechain; 0.1 TON is not enough
+/// for load_data + get_current_validator_set + cell_hash + save_data.
+const POOL_OP_GAS: u64 = 500_000_000; // 0.5 TON
+/// Minimum interval between op6 sends to the same pool (fallback when p34 unavailable,
+/// and de-duplication while a previous op6 is still in flight).
+const UPDATE_VALIDATOR_SET_FALLBACK_INTERVAL_SEC: u64 = 10 * 60;
 
 pub(crate) async fn run(
     cancellation_ctx: CancellationCtx,
-    app_config: Arc<AppConfig>,
+    _app_config: Arc<AppConfig>,
     runtime_cfg: Arc<dyn RuntimeConfig>,
-    store: Arc<SnapshotStore>,
 ) -> anyhow::Result<()> {
     let master_wallet = runtime_cfg.master_wallet();
     let pools = runtime_cfg.pools();
     let wallets = runtime_cfg.wallets();
     let rpc_client = runtime_cfg.rpc_client();
-    let monitor = ContractsMonitor { master_wallet, pools, wallets, rpc_client, _store: store };
-    monitor.run_loop(cancellation_ctx, app_config.tick_interval).await
+    let mut monitor = ContractsMonitor {
+        master_wallet,
+        pools,
+        wallets,
+        rpc_client,
+        runtime_cfg,
+        last_update_sent_at: HashMap::new(),
+    };
+    monitor.run_loop(cancellation_ctx).await
 }
 
 struct ContractsMonitor {
@@ -47,26 +61,39 @@ struct ContractsMonitor {
     pools: Arc<HashMap<String, Arc<dyn NominatorWrapper>>>,
     wallets: Arc<HashMap<String, Arc<dyn TonWallet>>>,
     rpc_client: Arc<ClientJsonRpc>,
-    _store: Arc<SnapshotStore>,
+    runtime_cfg: Arc<dyn RuntimeConfig>,
+    /// Last op6 broadcast time per node and pool address (no string formatting on lookup).
+    last_update_sent_at: HashMap<String, HashMap<MsgAddressInt, u64>>,
 }
 
 impl ContractsMonitor {
-    async fn run_loop(
-        &self,
-        cancellation_ctx: CancellationCtx,
-        tick_interval: u64,
-    ) -> anyhow::Result<()> {
-        let tick_interval = Duration::from_secs(tick_interval);
+    fn automation(&self) -> ContractsAutomationConfig {
+        self.runtime_cfg.get().automation.clone()
+    }
+
+    async fn run_loop(&mut self, cancellation_ctx: CancellationCtx) -> anyhow::Result<()> {
         let mut cancel = cancellation_ctx.subscribe();
-        let mut interval = tokio::time::interval(tick_interval);
+        let mut tick_secs = self.automation().tick_interval_sec.max(1);
+        let mut ticker = time::interval(Duration::from_secs(tick_secs));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
         loop {
             tokio::select! {
-                _ = interval.tick() => {
-                    tracing::info!(target: "contracts", "TICK");
+                _ = ticker.tick() => {
                     if let Err(e) = self.run().await {
                         tracing::error!(target: "contracts", "run error: {:#}", e);
                     }
-                    tracing::info!(target: "contracts", "SLEEP");
+
+                    let next_secs = self.automation().tick_interval_sec.max(1);
+                    if next_secs != tick_secs {
+                        tick_secs = next_secs;
+                        let period = Duration::from_secs(tick_secs);
+                        // `time::interval` fires its first tick immediately; after a period change,
+                        // schedule the next tick one full period from now to avoid two runs in a row.
+                        let start = time::Instant::now() + period;
+                        ticker = time::interval_at(start, period);
+                        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                    }
                 }
                 _ = cancel.changed() => {
                     tracing::info!(target: "contracts", "cancel received");
@@ -76,22 +103,32 @@ impl ContractsMonitor {
         }
     }
 
-    async fn run(&self) -> anyhow::Result<()> {
-        if !self.ensure_master_deployed().await? {
+    async fn run(&mut self) -> anyhow::Result<()> {
+        let auto = self.automation();
+        // Master is only needed for deploy/top-up paths. TonCore `update_validator_set` uses the
+        // per-node validator wallet, so observe-only mode can run without a funded master.
+        if !auto.auto_deploy && !auto.auto_topup {
+            self.ensure_pool_validator_sets_updated().await?;
+            return Ok(());
+        }
+        if !self.ensure_master_deployed(&auto).await? {
             return Ok(());
         }
         let provider = contract_provider!(self.rpc_client.clone());
         let mut seqno = provider
-            .get_method(self.master_wallet.address().to_string(), "seqno", vec![])
+            .get_method(self.master_wallet.address().await?.to_string(), "seqno", vec![])
             .await?
             .i64(0)?;
-        if !self.ensure_wallets_deployed(&mut seqno).await? {
+        if !self.ensure_wallets_deployed(&auto, &mut seqno).await? {
             return Ok(());
         }
-        if !self.ensure_pools_deployed(&mut seqno).await? {
+        if !self.ensure_pools_deployed(&auto, &mut seqno).await? {
             return Ok(());
         }
-        if !self.ensure_wallet_balances(&mut seqno).await? {
+        if !self.ensure_wallet_balances(&auto, &mut seqno).await? {
+            return Ok(());
+        }
+        if !self.ensure_pool_validator_sets_updated().await? {
             return Ok(());
         }
         tracing::info!(target: "contracts", "all contracts are ready");
@@ -123,8 +160,11 @@ impl ContractsMonitor {
     /// Step 1: Deploy master wallet if uninitialized.
     /// Returns `true` when master is active and ready for subsequent steps.
     /// Returns an error if master is frozen or has insufficient balance.
-    async fn ensure_master_deployed(&self) -> anyhow::Result<bool> {
-        let addr = self.master_wallet.address();
+    async fn ensure_master_deployed(
+        &self,
+        auto: &ContractsAutomationConfig,
+    ) -> anyhow::Result<bool> {
+        let addr = self.master_wallet.address().await?;
         let (state, balance) = self.account_info(&addr).await.context("get master wallet state")?;
 
         match state {
@@ -135,8 +175,9 @@ impl ContractsMonitor {
             AccountState::Uninitialized => {}
         }
 
-        if balance < DEPLOY_AMOUNT {
-            return Err(Self::insufficient_master_balance_error(balance, DEPLOY_AMOUNT));
+        let min_balance = auto.wallet.deploy;
+        if balance < min_balance {
+            return Err(Self::insufficient_master_balance_error(balance, min_balance));
         }
 
         tracing::info!(
@@ -157,15 +198,22 @@ impl ContractsMonitor {
     /// Step 2: Deploy uninitialized wallets through the master wallet.
     ///
     /// The master wallet sends an internal message carrying the wallet's
-    /// state_init and `DEPLOY_AMOUNT` TON, deploying and funding it in one go.
+    /// state_init and configured `wallet.deploy` (nanotons), deploying and funding it in one go.
     ///
     /// Returns `false` if master balance is insufficient (caller should sleep).
-    async fn ensure_wallets_deployed(&self, seqno: &mut i64) -> anyhow::Result<bool> {
+    async fn ensure_wallets_deployed(
+        &self,
+        auto: &ContractsAutomationConfig,
+        seqno: &mut i64,
+    ) -> anyhow::Result<bool> {
+        if !auto.auto_deploy {
+            return Ok(true);
+        }
         let mut all_deployed = true;
         let mut processed_wallets = HashSet::new();
 
         for (node_id, wallet) in self.wallets.iter() {
-            let wallet_addr = wallet.address();
+            let wallet_addr = wallet.address().await?;
             let is_new = processed_wallets.insert(wallet_addr.clone());
             if !is_new {
                 tracing::debug!(
@@ -177,7 +225,7 @@ impl ContractsMonitor {
                 continue;
             }
 
-            match self.deploy_wallet(&node_id, wallet.clone(), *seqno).await {
+            match self.deploy_wallet(auto, &node_id, wallet.clone(), *seqno).await {
                 Ok(true) => (),
                 Ok(false) => {
                     all_deployed = false;
@@ -194,12 +242,13 @@ impl ContractsMonitor {
 
     async fn deploy_wallet(
         &self,
+        auto: &ContractsAutomationConfig,
         node_id: &str,
         wallet: Arc<dyn TonWallet>,
         seqno: i64,
     ) -> anyhow::Result<bool> {
-        let addr = wallet.address();
-        let (state, balance) = self.account_info(&addr).await.context("wallet state")?;
+        let addr = wallet.address().await?;
+        let (state, balance) = self.account_info(&addr).await.context("get wallet state")?;
 
         match state {
             AccountState::Active => return Ok(true),
@@ -215,11 +264,12 @@ impl ContractsMonitor {
             node_id, addr, balance as f64 / 1e9,
         );
 
+        let deploy_amount = auto.wallet.deploy;
         let master_balance = self.master_wallet.balance().await.context("master wallet balance")?;
-        if master_balance < DEPLOY_AMOUNT + WALLET_GAS {
+        if master_balance < deploy_amount + WALLET_GAS {
             return Err(Self::insufficient_master_balance_error(
                 master_balance,
-                DEPLOY_AMOUNT + WALLET_GAS,
+                deploy_amount + WALLET_GAS,
             ));
         }
 
@@ -228,13 +278,13 @@ impl ContractsMonitor {
         tracing::info!(
             target: "contracts",
             "[{}] deploy wallet: amount={:.4} TON",
-            node_id, DEPLOY_AMOUNT as f64 / 1e9,
+            node_id, deploy_amount as f64 / 1e9,
         );
         let msg = self
             .master_wallet
             .build_message(
                 addr,
-                DEPLOY_AMOUNT,
+                deploy_amount,
                 Cell::default(),
                 false,
                 Some(u32::try_from(seqno)?),
@@ -252,31 +302,41 @@ impl ContractsMonitor {
     /// Otherwise only funds are sent and a warning is logged.
     ///
     /// Returns `false` if master balance is insufficient (caller should sleep).
-    async fn ensure_pools_deployed(&self, seqno: &mut i64) -> anyhow::Result<bool> {
+    async fn ensure_pools_deployed(
+        &self,
+        auto: &ContractsAutomationConfig,
+        seqno: &mut i64,
+    ) -> anyhow::Result<bool> {
+        if !auto.auto_deploy {
+            return Ok(true);
+        }
         let mut all_deployed = true;
-        for (node_id, pool) in self.pools.iter() {
-            match self.deploy_pool(&node_id, pool.clone(), *seqno).await {
-                Ok(true) => (),
-                Ok(false) => {
-                    all_deployed = false;
-                    *seqno += 1;
-                }
-                Err(e) => {
-                    all_deployed = false;
-                    tracing::error!(target: "contracts", "[{}] deploy pool error: {:#}", node_id, e);
-                }
-            };
+        for (node_id, pool_binding) in self.pools.iter() {
+            for pool in pool_binding.inner_pools() {
+                match self.deploy_pool(auto, node_id, pool, *seqno).await {
+                    Ok(true) => (),
+                    Ok(false) => {
+                        all_deployed = false;
+                        *seqno += 1;
+                    }
+                    Err(e) => {
+                        all_deployed = false;
+                        tracing::error!(target: "contracts", "[{}] deploy pool error: {:#}", node_id, e);
+                    }
+                };
+            }
         }
         Ok(all_deployed)
     }
 
     async fn deploy_pool(
         &self,
+        auto: &ContractsAutomationConfig,
         node_id: &str,
         pool: Arc<dyn NominatorWrapper>,
         seqno: i64,
     ) -> anyhow::Result<bool> {
-        let pool_addr = pool.address();
+        let pool_addr = pool.address().await?;
         let (state, _) = self.account_info(&pool_addr).await.context("get pool state")?;
 
         match state {
@@ -293,12 +353,17 @@ impl ContractsMonitor {
             node_id, pool_addr,
         );
 
+        let deploy_amount = match pool.pool_kind() {
+            PoolKind::SNP => auto.pool.snp,
+            PoolKind::TONCore => auto.pool.ton_core,
+        };
+
         let master_balance =
             self.master_wallet.balance().await.context("get master wallet balance")?;
-        if master_balance < DEPLOY_AMOUNT + WALLET_GAS {
+        if master_balance < deploy_amount + WALLET_GAS {
             return Err(Self::insufficient_master_balance_error(
                 master_balance,
-                DEPLOY_AMOUNT + WALLET_GAS,
+                deploy_amount + WALLET_GAS,
             ));
         }
 
@@ -307,12 +372,12 @@ impl ContractsMonitor {
         }
 
         tracing::info!(target: "contracts", "[{}] deploy pool: amount={:.4} TON",
-                node_id, DEPLOY_AMOUNT as f64 / 1e9);
+                node_id, deploy_amount as f64 / 1e9);
         let msg = self
             .master_wallet
             .build_message(
                 pool_addr,
-                DEPLOY_AMOUNT,
+                deploy_amount,
                 Cell::default(),
                 false,
                 Some(u32::try_from(seqno)?),
@@ -326,11 +391,23 @@ impl ContractsMonitor {
     }
 
     /// Step 4: Top up active wallets whose balance is below the minimum threshold.
-    async fn ensure_wallet_balances(&self, seqno: &mut i64) -> anyhow::Result<bool> {
+    ///
+    /// Step 5 (`ensure_pool_validator_sets_updated`) depends on the pools being
+    /// deployed and wallets funded, so this step runs first.
+    async fn ensure_wallet_balances(
+        &self,
+        auto: &ContractsAutomationConfig,
+        seqno: &mut i64,
+    ) -> anyhow::Result<bool> {
+        if !auto.auto_topup {
+            return Ok(true);
+        }
+        let threshold = auto.wallet.threshold;
+        let topup_amount = auto.wallet.topup;
         let mut all_topped_up = true;
         let mut processed_wallets = HashSet::new();
         for (node_id, wallet) in self.wallets.iter() {
-            let addr = wallet.address();
+            let addr = wallet.address().await?;
             let is_new = processed_wallets.insert(addr.clone());
             if !is_new {
                 tracing::debug!(
@@ -354,7 +431,7 @@ impl ContractsMonitor {
                 continue;
             }
 
-            if balance >= MIN_WALLET_BALANCE {
+            if balance >= threshold {
                 continue;
             }
 
@@ -362,15 +439,15 @@ impl ContractsMonitor {
             tracing::info!(
                 target: "contracts",
                 "[{}] top-up wallet: address={} current_balance={:.4} TON topup_amount={:.4} TON",
-                node_id, addr, balance as f64 / 1e9, TOP_UP_AMOUNT as f64 / 1e9,
+                node_id, addr, balance as f64 / 1e9, topup_amount as f64 / 1e9,
             );
 
             let master_balance =
                 self.master_wallet.balance().await.context("get master wallet balance")?;
-            if master_balance < TOP_UP_AMOUNT + WALLET_GAS {
+            if master_balance < topup_amount + WALLET_GAS {
                 return Err(Self::insufficient_master_balance_error(
                     master_balance,
-                    TOP_UP_AMOUNT + WALLET_GAS,
+                    topup_amount + WALLET_GAS,
                 ));
             }
 
@@ -378,7 +455,7 @@ impl ContractsMonitor {
                 .master_wallet
                 .build_message(
                     addr,
-                    TOP_UP_AMOUNT,
+                    topup_amount,
                     Cell::default(),
                     false,
                     Some(u32::try_from(*seqno)?),
@@ -400,14 +477,183 @@ impl ContractsMonitor {
         }
         Ok(all_topped_up)
     }
+
+    /// Step 5: Send `update_validator_set` (opcode 6) to TonCore pools
+    /// that are in staking state (state == 2) but haven't detected enough validator
+    /// set changes for recovery.
+    ///
+    /// The TonCore pool contract tracks the on-chain validator set hash
+    /// (config param 34) and increments an internal counter each time it changes.
+    /// Recovery is only allowed once `validator_set_changes_count >= 2`.
+    /// Unlike the SNP contract, the TonCore pool does not update this counter
+    /// automatically — opcode 6 must be sent explicitly (by anyone).
+    ///
+    /// The message is sent from the **validator wallet** for the pool's node (`self.wallets[node_id]`),
+    /// not the master wallet — by staking time that wallet is deployed and typically topped up.
+    ///
+    /// Skips op 6 when config param 34 cell hash matches the pool's `saved_validator_set_hash`
+    /// (same check as on-chain op 6). When config param 34 cannot be fetched, falls back to a
+    /// per-pool rate-limited send every `UPDATE_VALIDATOR_SET_FALLBACK_INTERVAL_SEC`.
+    async fn ensure_pool_validator_sets_updated(&mut self) -> anyhow::Result<bool> {
+        let provider = contract_provider!(self.rpc_client.clone());
+        let mut all_updated = true;
+
+        // Fetch once per tick. None → fall back to per-pool rate-limited send.
+        let current_vset_hash: Option<[u8; 32]> = match self
+            .rpc_client
+            .get_config_param_cell(34)
+            .await
+        {
+            Ok(cell) => {
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(cell.repr_hash().as_slice());
+                Some(hash)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "contracts",
+                    "update_validator_set: config param 34 unavailable, proceeding with rate-limited fallback: {:#}",
+                    e
+                );
+                None
+            }
+        };
+
+        for (node_id, pool_binding) in
+            self.pools.iter().filter(|(_, b)| b.pool_kind() == PoolKind::TONCore)
+        {
+            let validator_wallet = match self.wallets.get(node_id.as_str()) {
+                Some(w) => (*w).clone(),
+                None => {
+                    tracing::warn!(
+                        target: "contracts",
+                        "[{}] ensure_pool_validator_sets_updated: no validator wallet in config (skip TonCore pools)",
+                        node_id
+                    );
+                    all_updated = false;
+                    continue;
+                }
+            };
+
+            let wallet_addr = validator_wallet.address().await?;
+            let mut seqno: Option<i64> = None;
+
+            for pool in pool_binding.inner_pools() {
+                let pool_addr = pool.address().await?;
+                let pool_data = match pool.get_pool_data().await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "contracts",
+                            "[{}] get_pool_data error (skipping update_validator_set): pool={} {:#}",
+                            node_id, pool_addr, e
+                        );
+                        continue;
+                    }
+                };
+
+                tracing::info!(
+                    target: "contracts",
+                    "[{}] pool={} state={} vsc_count={}",
+                    node_id, pool_addr, pool_data.state, pool_data.validator_set_changes_count
+                );
+
+                if pool_data.state != 2 || pool_data.validator_set_changes_count >= 2 {
+                    continue;
+                }
+
+                // Decide skip vs. send. Falling out of this block means "send".
+                if let Some(current) = current_vset_hash {
+                    if current == pool_data.saved_validator_set_hash {
+                        tracing::debug!(
+                            target: "contracts",
+                            "[{}] skip update_validator_set: pool={}, vsc_count={}, validator set unchanged",
+                            node_id,
+                            pool_addr,
+                            pool_data.validator_set_changes_count,
+                        );
+                        continue;
+                    }
+                } else if let Some(last_sent_at) = self
+                    .last_update_sent_at
+                    .get(node_id)
+                    .and_then(|by_pool| by_pool.get(&pool_addr))
+                    .copied()
+                {
+                    let now = time_format::now();
+                    let elapsed = now.saturating_sub(last_sent_at);
+                    if elapsed < UPDATE_VALIDATOR_SET_FALLBACK_INTERVAL_SEC {
+                        tracing::debug!(
+                            target: "contracts",
+                            "[{}] skip fallback update_validator_set: pool={}, vsc_count={}, sent {}s ago",
+                            node_id,
+                            pool_addr,
+                            pool_data.validator_set_changes_count,
+                            elapsed,
+                        );
+                        all_updated = false;
+                        continue;
+                    }
+                }
+
+                let current_seqno = match seqno {
+                    Some(s) => s,
+                    None => provider
+                        .get_method(wallet_addr.to_string(), "seqno", vec![])
+                        .await?
+                        .i64(0)?,
+                };
+
+                tracing::info!(
+                    target: "contracts",
+                    "[{}] update_validator_set: pool={}, state={}, vsc_count={}, from_wallet={}",
+                    node_id,
+                    pool_addr,
+                    pool_data.state,
+                    pool_data.validator_set_changes_count,
+                    wallet_addr,
+                );
+
+                let body = tc_messages::update_validator_set(0)?;
+                let msg = validator_wallet
+                    .build_message(
+                        pool_addr.clone(),
+                        POOL_OP_GAS,
+                        body,
+                        true,
+                        Some(u32::try_from(current_seqno)?),
+                        None,
+                        None,
+                    )
+                    .await?;
+                self.broadcast(&msg).await?;
+                self.last_update_sent_at
+                    .entry(node_id.clone())
+                    .or_default()
+                    .insert(pool_addr.clone(), time_format::now());
+                seqno = Some(current_seqno + 1);
+                all_updated = false;
+            }
+        }
+        Ok(all_updated)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ContractsMonitor;
+    use super::{ContractsMonitor, UPDATE_VALIDATOR_SET_FALLBACK_INTERVAL_SEC};
+    use crate::runtime_config::RuntimeConfig;
     use axum::{Json, Router, extract::State, routing::post};
-    use common::snapshot::SnapshotStore;
-    use contracts::{NominatorWrapper, SmartContract, TonWallet};
+    use base64::Engine;
+    use common::{
+        app_config::{AppConfig, ContractsAutomationConfig, HttpConfig, TonHttpApiConfig},
+        time_format,
+    };
+    use contracts::{
+        NominatorWrapper, PoolKind, SmartContract, TonWallet,
+        nominator::{NominatorRoles, PoolData},
+    };
+    use secrets_vault::vault::SecretVault;
     use std::{
         collections::HashMap,
         sync::{
@@ -415,13 +661,68 @@ mod tests {
             atomic::{AtomicUsize, Ordering},
         },
     };
-    use ton_block::{Cell, MsgAddressInt, StateInit};
+    use ton_block::{Cell, MsgAddressInt, StateInit, write_boc};
     use ton_http_api_client::v2::client_json_rpc::ClientJsonRpc;
+
+    /// Minimal [`RuntimeConfig`] for unit tests that only call `get()`.
+    struct CfgRuntime(Arc<AppConfig>);
+
+    impl RuntimeConfig for CfgRuntime {
+        fn get(&self) -> Arc<AppConfig> {
+            self.0.clone()
+        }
+
+        fn master_wallet(&self) -> Arc<dyn TonWallet> {
+            unimplemented!("CfgRuntime: use ContractsMonitor.master_wallet")
+        }
+
+        fn pools(&self) -> Arc<HashMap<String, Arc<dyn NominatorWrapper>>> {
+            unimplemented!("CfgRuntime: use ContractsMonitor.pools")
+        }
+
+        fn wallets(&self) -> Arc<HashMap<String, Arc<dyn TonWallet>>> {
+            unimplemented!("CfgRuntime: use ContractsMonitor.wallets")
+        }
+
+        fn rpc_client(&self) -> Arc<ClientJsonRpc> {
+            unimplemented!("CfgRuntime: use ContractsMonitor.rpc_client")
+        }
+
+        fn vault(&self) -> Option<Arc<SecretVault>> {
+            None
+        }
+
+        fn update_and_save(
+            &self,
+            _f: Box<dyn FnOnce(&mut AppConfig) + Send>,
+        ) -> anyhow::Result<()> {
+            unimplemented!("CfgRuntime: read-only")
+        }
+    }
+
+    fn test_app_config() -> Arc<AppConfig> {
+        Arc::new(AppConfig {
+            nodes: HashMap::new(),
+            wallets: HashMap::new(),
+            pools: HashMap::new(),
+            bindings: HashMap::new(),
+            ton_http_api: TonHttpApiConfig::default(),
+            elections: None,
+            voting: None,
+            http: HttpConfig { auth: None, ..Default::default() },
+            master_wallet: None,
+            tick_interval: 30,
+            automation: Default::default(),
+            log: None,
+        })
+    }
 
     #[derive(Clone)]
     struct MockRpcState {
         account_state: &'static str,
         account_balance: u64,
+        config_param_cell: Cell,
+        fail_config_param: bool,
         send_boc_calls: Arc<AtomicUsize>,
     }
 
@@ -434,10 +735,35 @@ mod tests {
 
     impl MockRpcServer {
         async fn start(account_state: &'static str, account_balance: u64) -> Self {
+            Self::start_with_config_param(account_state, account_balance, Cell::default()).await
+        }
+
+        async fn start_with_config_param(
+            account_state: &'static str,
+            account_balance: u64,
+            config_param_cell: Cell,
+        ) -> Self {
+            Self::start_with_config_param_mode(
+                account_state,
+                account_balance,
+                config_param_cell,
+                false,
+            )
+            .await
+        }
+
+        async fn start_with_config_param_mode(
+            account_state: &'static str,
+            account_balance: u64,
+            config_param_cell: Cell,
+            fail_config_param: bool,
+        ) -> Self {
             let send_boc_calls = Arc::new(AtomicUsize::new(0));
             let state = MockRpcState {
                 account_state,
                 account_balance,
+                config_param_cell,
+                fail_config_param,
                 send_boc_calls: send_boc_calls.clone(),
             };
             let app = Router::new().route("/jsonRPC", post(mock_jsonrpc)).with_state(state);
@@ -499,6 +825,39 @@ mod tests {
                 "jsonrpc": "2.0",
                 "id": id
             }),
+            "getConfigParam" => {
+                if state.fail_config_param {
+                    return Json(serde_json::json!({
+                        "ok": false,
+                        "error": "forced getConfigParam failure",
+                        "code": 500,
+                        "jsonrpc": "2.0",
+                        "id": id
+                    }));
+                }
+                let boc = write_boc(&state.config_param_cell).expect("write config param boc");
+                let b64 = base64::engine::general_purpose::STANDARD.encode(boc);
+                serde_json::json!({
+                    "ok": true,
+                    "result": {
+                        "config": { "bytes": b64 }
+                    },
+                    "jsonrpc": "2.0",
+                    "id": id
+                })
+            }
+            "runGetMethod" => serde_json::json!({
+                "ok": true,
+                "result": {
+                    "gas_used": 0,
+                    "stack": [["num", 1]],
+                    "exit_code": 0,
+                    "last_transaction_id": null,
+                    "block_id": null
+                },
+                "jsonrpc": "2.0",
+                "id": id
+            }),
             "sendBoc" => {
                 state.send_boc_calls.fetch_add(1, Ordering::Relaxed);
                 serde_json::json!({
@@ -532,8 +891,8 @@ mod tests {
             Ok(u64::MAX)
         }
 
-        fn address(&self) -> MsgAddressInt {
-            self.addr.clone()
+        async fn address(&self) -> anyhow::Result<MsgAddressInt> {
+            Ok(self.addr.clone())
         }
     }
 
@@ -570,6 +929,83 @@ mod tests {
         }
     }
 
+    struct MockTonCoreRouter {
+        inner: Vec<Arc<dyn NominatorWrapper>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SmartContract for MockTonCoreRouter {
+        async fn balance(&self) -> anyhow::Result<u64> {
+            Ok(0)
+        }
+
+        async fn address(&self) -> anyhow::Result<MsgAddressInt> {
+            Ok(addr(10))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl NominatorWrapper for MockTonCoreRouter {
+        async fn get_roles(&self) -> anyhow::Result<NominatorRoles> {
+            unimplemented!("not used by contracts_task tests")
+        }
+
+        async fn get_pool_data(&self) -> anyhow::Result<PoolData> {
+            unimplemented!("router pool data is not used by contracts_task tests")
+        }
+
+        fn inner_pools(&self) -> Vec<Arc<dyn NominatorWrapper>> {
+            self.inner.clone()
+        }
+
+        fn storage_reserve(&self) -> u64 {
+            0
+        }
+
+        fn pool_kind(&self) -> PoolKind {
+            PoolKind::TONCore
+        }
+    }
+
+    struct MockTonCorePool {
+        addr: MsgAddressInt,
+        data: PoolData,
+    }
+
+    #[async_trait::async_trait]
+    impl SmartContract for MockTonCorePool {
+        async fn balance(&self) -> anyhow::Result<u64> {
+            Ok(0)
+        }
+
+        async fn address(&self) -> anyhow::Result<MsgAddressInt> {
+            Ok(self.addr.clone())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl NominatorWrapper for MockTonCorePool {
+        async fn get_roles(&self) -> anyhow::Result<NominatorRoles> {
+            unimplemented!("not used by contracts_task tests")
+        }
+
+        async fn get_pool_data(&self) -> anyhow::Result<PoolData> {
+            Ok(self.data.clone())
+        }
+
+        fn inner_pools(&self) -> Vec<Arc<dyn NominatorWrapper>> {
+            vec![]
+        }
+
+        fn storage_reserve(&self) -> u64 {
+            0
+        }
+
+        fn pool_kind(&self) -> PoolKind {
+            PoolKind::TONCore
+        }
+    }
+
     fn addr(byte: u8) -> MsgAddressInt {
         MsgAddressInt::with_standart(None, -1, [byte; 32].into()).unwrap()
     }
@@ -579,14 +1015,194 @@ mod tests {
         master_wallet: Arc<dyn TonWallet>,
         wallets: Arc<HashMap<String, Arc<dyn TonWallet>>>,
     ) -> ContractsMonitor {
-        let rpc_client = Arc::new(ClientJsonRpc::connect(rpc_url, None).unwrap());
+        build_monitor_with_pools(
+            rpc_url,
+            master_wallet,
+            wallets,
+            Arc::<HashMap<String, Arc<dyn NominatorWrapper>>>::default(),
+        )
+    }
+
+    fn build_monitor_with_pools(
+        rpc_url: String,
+        master_wallet: Arc<dyn TonWallet>,
+        wallets: Arc<HashMap<String, Arc<dyn TonWallet>>>,
+        pools: Arc<HashMap<String, Arc<dyn NominatorWrapper>>>,
+    ) -> ContractsMonitor {
+        let rpc_client = Arc::new(
+            ClientJsonRpc::connect_many(
+                vec![(rpc_url, None)],
+                None,
+                common::app_config::EndpointTimeouts::default(),
+                common::app_config::FreshnessConfig::disabled(),
+            )
+            .unwrap(),
+        );
         ContractsMonitor {
             master_wallet,
-            pools: Arc::<HashMap<String, Arc<dyn NominatorWrapper>>>::default(),
+            pools,
             wallets,
             rpc_client,
-            _store: Arc::new(SnapshotStore::new()),
+            runtime_cfg: Arc::new(CfgRuntime(test_app_config())) as Arc<dyn RuntimeConfig>,
+            last_update_sent_at: HashMap::new(),
         }
+    }
+
+    fn toncore_pool_binding(saved_hash: [u8; 32]) -> Arc<dyn NominatorWrapper> {
+        let data = PoolData {
+            state: 2,
+            validator_set_changes_count: 0,
+            saved_validator_set_hash: saved_hash,
+            ..Default::default()
+        };
+        let pool: Arc<dyn NominatorWrapper> = Arc::new(MockTonCorePool { addr: addr(4), data });
+        Arc::new(MockTonCoreRouter { inner: vec![pool] })
+    }
+
+    #[tokio::test]
+    async fn ensure_pool_validator_sets_updated_skips_broadcast_when_hash_matches() {
+        let config_param_cell = Cell::default();
+        let mut current_hash = [0u8; 32];
+        current_hash.copy_from_slice(config_param_cell.repr_hash().as_slice());
+        let server = MockRpcServer::start_with_config_param("active", 0, config_param_cell).await;
+
+        let wallet: Arc<dyn TonWallet> =
+            Arc::new(DummyWallet { addr: addr(3), state_init: Some(StateInit::default()) });
+        let wallets = Arc::new(HashMap::from([("node-a".to_string(), wallet.clone())]));
+        let pools =
+            Arc::new(HashMap::from([("node-a".to_string(), toncore_pool_binding(current_hash))]));
+        let master_wallet: Arc<dyn TonWallet> =
+            Arc::new(DummyWallet { addr: addr(9), state_init: Some(StateInit::default()) });
+
+        let mut monitor =
+            build_monitor_with_pools(server.url.clone(), master_wallet, wallets, pools);
+        let all_updated = monitor.ensure_pool_validator_sets_updated().await.unwrap();
+
+        assert!(all_updated);
+        assert_eq!(server.send_boc_calls.load(Ordering::Relaxed), 0);
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ensure_pool_validator_sets_updated_broadcasts_when_hash_differs() {
+        let config_param_cell = Cell::default();
+        let mut current_hash = [0u8; 32];
+        current_hash.copy_from_slice(config_param_cell.repr_hash().as_slice());
+        let mut saved_hash = current_hash;
+        saved_hash[0] ^= 0xff;
+        let server = MockRpcServer::start_with_config_param("active", 0, config_param_cell).await;
+
+        let wallet: Arc<dyn TonWallet> =
+            Arc::new(DummyWallet { addr: addr(3), state_init: Some(StateInit::default()) });
+        let wallets = Arc::new(HashMap::from([("node-a".to_string(), wallet.clone())]));
+        let pools =
+            Arc::new(HashMap::from([("node-a".to_string(), toncore_pool_binding(saved_hash))]));
+        let master_wallet: Arc<dyn TonWallet> =
+            Arc::new(DummyWallet { addr: addr(9), state_init: Some(StateInit::default()) });
+
+        let mut monitor =
+            build_monitor_with_pools(server.url.clone(), master_wallet, wallets, pools);
+        let all_updated = monitor.ensure_pool_validator_sets_updated().await.unwrap();
+
+        assert!(!all_updated);
+        assert_eq!(server.send_boc_calls.load(Ordering::Relaxed), 1);
+        assert!(
+            monitor
+                .last_update_sent_at
+                .get("node-a")
+                .and_then(|by_pool| by_pool.get(&addr(4)))
+                .is_some(),
+            "send on Available branch must record last_update_sent_at"
+        );
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ensure_pool_validator_sets_updated_falls_back_when_config_param_unavailable() {
+        let server =
+            MockRpcServer::start_with_config_param_mode("active", 0, Cell::default(), true).await;
+
+        let wallet: Arc<dyn TonWallet> =
+            Arc::new(DummyWallet { addr: addr(3), state_init: Some(StateInit::default()) });
+        let wallets = Arc::new(HashMap::from([("node-a".to_string(), wallet.clone())]));
+        // Equal hash would normally skip, but with missing p34 we fall back to sending op6.
+        let pools =
+            Arc::new(HashMap::from([("node-a".to_string(), toncore_pool_binding([0u8; 32]))]));
+        let master_wallet: Arc<dyn TonWallet> =
+            Arc::new(DummyWallet { addr: addr(9), state_init: Some(StateInit::default()) });
+
+        let mut monitor =
+            build_monitor_with_pools(server.url.clone(), master_wallet, wallets, pools);
+        let all_updated = monitor.ensure_pool_validator_sets_updated().await.unwrap();
+
+        assert!(!all_updated);
+        assert_eq!(server.send_boc_calls.load(Ordering::Relaxed), 1);
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ensure_pool_validator_sets_updated_rate_limits_fallback_when_config_unavailable() {
+        let server =
+            MockRpcServer::start_with_config_param_mode("active", 0, Cell::default(), true).await;
+
+        let wallet: Arc<dyn TonWallet> =
+            Arc::new(DummyWallet { addr: addr(3), state_init: Some(StateInit::default()) });
+        let wallets = Arc::new(HashMap::from([("node-a".to_string(), wallet.clone())]));
+        let pools =
+            Arc::new(HashMap::from([("node-a".to_string(), toncore_pool_binding([0u8; 32]))]));
+        let master_wallet: Arc<dyn TonWallet> =
+            Arc::new(DummyWallet { addr: addr(9), state_init: Some(StateInit::default()) });
+
+        let mut monitor =
+            build_monitor_with_pools(server.url.clone(), master_wallet, wallets, pools);
+        let _ = monitor.ensure_pool_validator_sets_updated().await.unwrap();
+        let first_calls = server.send_boc_calls.load(Ordering::Relaxed);
+        let _ = monitor.ensure_pool_validator_sets_updated().await.unwrap();
+        let second_calls = server.send_boc_calls.load(Ordering::Relaxed);
+        assert_eq!(first_calls, 1);
+        assert_eq!(second_calls, 1);
+
+        // Simulate passage of fallback interval and verify the next call is allowed.
+        let pool_addr = addr(4);
+        monitor.last_update_sent_at.entry("node-a".to_string()).or_default().insert(
+            pool_addr,
+            time_format::now().saturating_sub(UPDATE_VALIDATOR_SET_FALLBACK_INTERVAL_SEC + 1),
+        );
+        let _ = monitor.ensure_pool_validator_sets_updated().await.unwrap();
+        let third_calls = server.send_boc_calls.load(Ordering::Relaxed);
+        assert_eq!(third_calls, 2);
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ensure_pool_validator_sets_updated_marks_not_ready_when_fallback_is_rate_limited() {
+        let server =
+            MockRpcServer::start_with_config_param_mode("active", 0, Cell::default(), true).await;
+
+        let wallet: Arc<dyn TonWallet> =
+            Arc::new(DummyWallet { addr: addr(3), state_init: Some(StateInit::default()) });
+        let wallets = Arc::new(HashMap::from([("node-a".to_string(), wallet.clone())]));
+        let pools =
+            Arc::new(HashMap::from([("node-a".to_string(), toncore_pool_binding([0u8; 32]))]));
+        let master_wallet: Arc<dyn TonWallet> =
+            Arc::new(DummyWallet { addr: addr(9), state_init: Some(StateInit::default()) });
+
+        let mut monitor =
+            build_monitor_with_pools(server.url.clone(), master_wallet, wallets, pools);
+
+        // First call sends fallback op6 and records the timestamp.
+        let _ = monitor.ensure_pool_validator_sets_updated().await.unwrap();
+
+        // Second call is rate-limited fallback: no send, but still should report not-ready.
+        let all_updated = monitor.ensure_pool_validator_sets_updated().await.unwrap();
+        assert!(!all_updated);
+        assert_eq!(server.send_boc_calls.load(Ordering::Relaxed), 1);
+
+        server.shutdown().await;
     }
 
     #[tokio::test]
@@ -604,7 +1220,8 @@ mod tests {
 
         let monitor = build_monitor(server.url.clone(), master_wallet, wallets);
         let mut seqno = 1;
-        let all_deployed = monitor.ensure_wallets_deployed(&mut seqno).await.unwrap();
+        let auto = ContractsAutomationConfig::default();
+        let all_deployed = monitor.ensure_wallets_deployed(&auto, &mut seqno).await.unwrap();
 
         assert!(!all_deployed);
         assert_eq!(seqno, 2);
@@ -628,7 +1245,8 @@ mod tests {
 
         let monitor = build_monitor(server.url.clone(), master_wallet, wallets);
         let mut seqno = 10;
-        let all_topped_up = monitor.ensure_wallet_balances(&mut seqno).await.unwrap();
+        let auto = ContractsAutomationConfig::default();
+        let all_topped_up = monitor.ensure_wallet_balances(&auto, &mut seqno).await.unwrap();
 
         assert!(!all_topped_up);
         assert_eq!(seqno, 11);

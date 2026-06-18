@@ -11,172 +11,181 @@
 use crate::{
     base64_decode, base64_encode, ed25519_create_expanded_private_key, ed25519_create_private_key,
     ed25519_create_public_key, ed25519_expand_private_key, ed25519_generate_private_key,
-    ed25519_sign, ed25519_verify, fail, sha256_digest_slices, x25519_shared_secret,
-    Ed25519ExpandedPrivateKey, Ed25519PrivateKey, Result,
+    ed25519_sign, ed25519_verify, fail, sha256_digest_slices, x25519_shared_secret, Result,
+    ED25519_EXPANDED_KEY_LENGTH, ED25519_PUBLIC_KEY_LENGTH, ED25519_SECRET_KEY_LENGTH,
 };
 use std::{
-    convert::TryInto,
     fmt::{self, Debug, Display, Formatter},
+    ops::Deref,
     sync::Arc,
 };
+use zeroize::Zeroize;
 
-pub trait KeyOption: Sync + Send + Debug {
+/// Interface to cryptographic keys
+pub trait KeyOption: Sync + Send {
     fn id(&self) -> &Arc<KeyId>;
     fn type_id(&self) -> i32;
     fn pub_key(&self) -> Result<&[u8]>;
+    fn pvt_key(&self) -> Result<&dyn SecretBytes>;
+    fn exp_key(&self) -> Result<&dyn SecretBytes>;
     fn sign(&self, data: &[u8]) -> Result<Vec<u8>>;
     fn verify(&self, data: &[u8], signature: &[u8]) -> Result<()>;
-    #[cfg(feature = "export_key")]
-    fn export_key(&self) -> Result<&[u8]>;
-    /// Return the 32-byte Ed25519 private key if available.
-    fn pvt_key(&self) -> Result<&[u8; 32]>;
-    fn shared_secret(&self, other_pub_key: &[u8]) -> Result<[u8; 32]>;
+    fn shared_secret(&self, other_pub_key: &[u8]) -> Result<Box<dyn SecretBytes>>;
 }
 
-#[derive(Debug)]
-pub struct Ed25519KeyOption {
+impl Debug for dyn KeyOption {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyOption").field("id", self.id()).finish_non_exhaustive()
+    }
+}
+
+/// Backend-agnostic secret byte container
+pub trait SecretBytes: Send + Sync {
+    fn lock(&self) -> Result<SecretBytesReadGuard<'_>>;
+    fn from_slice(data: &[u8]) -> Result<Self>
+    where
+        Self: Sized;
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Ed25519 key interface
+pub struct Ed25519KeyOption<S: SecretBytes> {
     id: Arc<KeyId>,
-    pub_key: Option<[u8; Self::PUB_KEY_SIZE]>,
-    exp_key: Option<[u8; Self::EXP_KEY_SIZE]>,
-    /// 32-byte Ed25519 private key (when created via `from_private_key`).
-    pvt_key: Option<[u8; Self::PVT_KEY_SIZE]>,
+    pub_key: Option<[u8; ED25519_PUBLIC_KEY_LENGTH]>,
+    exp_key: Option<S>,
+    pvt_key: Option<S>,
 }
 
-impl Ed25519KeyOption {
-    pub const KEY_TYPE: i32 = 1209251014;
-    pub const EXP_KEY_SIZE: usize = 64;
-    pub const PVT_KEY_SIZE: usize = 32;
-    pub const PUB_KEY_SIZE: usize = 32;
+pub const ED25519_KEY_TYPE: i32 = 1209251014;
+
+impl<S: SecretBytes + 'static> Ed25519KeyOption<S> {
+    pub fn new(
+        id: Arc<KeyId>,
+        pub_key: Option<[u8; ED25519_PUBLIC_KEY_LENGTH]>,
+        exp_key: Option<S>,
+        pvt_key: Option<S>,
+    ) -> Self {
+        Self { id, pub_key, exp_key, pvt_key }
+    }
+
+    fn key_id(type_id: i32, pub_key: &[u8; ED25519_PUBLIC_KEY_LENGTH]) -> Arc<KeyId> {
+        let data = sha256_digest_slices(&[&type_id.to_le_bytes(), pub_key]);
+        KeyId::from_data(data)
+    }
 
     /// Create from Ed25519 expanded secret key raw data
-    pub fn from_expanded_key(exp_key: &[u8; Self::EXP_KEY_SIZE]) -> Result<Arc<dyn KeyOption>> {
-        Self::create_from_expanded_key(ed25519_create_expanded_private_key(exp_key)?)
+    pub fn from_expanded_key(
+        exp_key: &[u8; ED25519_EXPANDED_KEY_LENGTH],
+    ) -> Result<Arc<dyn KeyOption>> {
+        let pub_key =
+            ed25519_create_public_key(&ed25519_create_expanded_private_key(exp_key)?)?.to_bytes();
+
+        Ok(Arc::new(Ed25519KeyOption::<S> {
+            id: Self::key_id(ED25519_KEY_TYPE, &pub_key),
+            pub_key: Some(pub_key),
+            exp_key: Some(S::from_slice(exp_key)?),
+            pvt_key: None,
+        }))
     }
 
     /// Create from Ed25519 secret key raw data
-    pub fn from_private_key(pvt_key: &[u8; Self::PVT_KEY_SIZE]) -> Result<Arc<dyn KeyOption>> {
+    pub fn from_private_key(
+        pvt_key: &[u8; ED25519_SECRET_KEY_LENGTH],
+    ) -> Result<Arc<dyn KeyOption>> {
         let exp_key = ed25519_expand_private_key(&ed25519_create_private_key(pvt_key)?)?;
         let pub_key = ed25519_create_public_key(&exp_key)?.to_bytes();
-        let exp_key = exp_key.to_bytes();
-        Ok(Arc::new(Self {
-            id: Self::calc_id(Self::KEY_TYPE, &pub_key),
+
+        Ok(Arc::new(Ed25519KeyOption::<S> {
+            id: Self::key_id(ED25519_KEY_TYPE, &pub_key),
             pub_key: Some(pub_key),
-            exp_key: Some(exp_key),
-            pvt_key: Some(*pvt_key),
+            exp_key: Some(S::from_slice(exp_key.as_bytes())?),
+            pvt_key: Some(S::from_slice(pvt_key)?),
         }))
     }
 
     /// Create from Ed25519 secret key raw data and export JSON
     pub fn from_private_key_with_json(
-        pvt_key: &[u8; Self::PVT_KEY_SIZE],
+        pvt_key: &[u8; ED25519_SECRET_KEY_LENGTH],
     ) -> Result<(KeyOptionJson, Arc<dyn KeyOption>)> {
-        Self::create_from_private_key_with_json(ed25519_create_private_key(pvt_key)?)
+        let key_opt = Self::from_private_key(pvt_key)?;
+
+        let config = KeyOptionJson {
+            type_id: ED25519_KEY_TYPE,
+            pub_key: None,
+            pvt_key: Some(base64_encode(pvt_key)),
+            vault: None,
+        };
+
+        Ok((config, key_opt))
     }
 
     /// Create from Ed25519 secret key JSON
-    pub fn from_private_key_json(src: &KeyOptionJson) -> Result<Arc<dyn KeyOption>> {
-        match src.type_id {
-            Self::KEY_TYPE => match &src.pvt_key {
-                Some(key) => {
-                    if src.pub_key.is_some() {
-                        fail!("No public key expected");
-                    }
-                    let key = base64_decode(key)?;
-                    if key.len() != Self::PVT_KEY_SIZE {
-                        fail!("Bad private key");
-                    }
-                    Self::from_private_key(key.as_slice().try_into()?)
-                }
-                None => fail!("No private key"),
-            },
-            _ => fail!("Type-id {} is not supported for Ed25519 private key", src.type_id),
+    pub fn from_private_key_json(config: &KeyOptionJson) -> Result<Arc<dyn KeyOption>> {
+        if config.vault.is_some() {
+            fail!("Vault-backed key is not supported by Ed25519KeyOption");
         }
+        if config.type_id != ED25519_KEY_TYPE {
+            fail!("Type-id {} is not supported for Ed25519 private key", config.type_id);
+        }
+        let Some(pvt_key) = &config.pvt_key else {
+            fail!("No private key");
+        };
+        if config.pub_key.is_some() {
+            fail!("No public key expected");
+        }
+        let key = base64_decode(pvt_key)?;
+        if key.len() != ED25519_SECRET_KEY_LENGTH {
+            fail!("Bad private key");
+        }
+        Self::from_private_key(key.as_slice().try_into()?)
     }
 
     /// Create from Ed25519 public key raw data
-    pub fn from_public_key(pub_key: &[u8; Self::PUB_KEY_SIZE]) -> Arc<dyn KeyOption> {
-        Arc::new(Self {
-            id: Self::calc_id(Self::KEY_TYPE, pub_key),
+    pub fn from_public_key(pub_key: &[u8; ED25519_PUBLIC_KEY_LENGTH]) -> Arc<dyn KeyOption> {
+        Arc::new(Ed25519KeyOption::<S> {
+            id: Self::key_id(ED25519_KEY_TYPE, pub_key),
             pub_key: Some(*pub_key),
             exp_key: None,
             pvt_key: None,
         })
     }
 
-    /// Create from Ed265519 public key JSON
-    pub fn from_public_key_json(src: &KeyOptionJson) -> Result<Arc<dyn KeyOption>> {
-        match src.type_id {
-            Self::KEY_TYPE => match &src.pub_key {
-                Some(key) => {
-                    if src.pvt_key.is_some() {
-                        fail!("No private key expected");
-                    }
-                    let key = base64_decode(key)?;
-                    if key.len() != Self::PUB_KEY_SIZE {
-                        fail!("Bad public key");
-                    }
-                    Ok(Self::from_public_key(key.as_slice().try_into()?))
-                }
-                None => fail!("No public key"),
-            },
-            _ => fail!("Type-id {} is not supported for Ed25519 public key", src.type_id),
+    /// Create from Ed25519 public key JSON
+    pub fn from_public_key_json(config: &KeyOptionJson) -> Result<Arc<dyn KeyOption>> {
+        if config.vault.is_some() {
+            fail!("Vault-backed key is not supported by Ed25519KeyOption");
         }
+        if config.type_id != ED25519_KEY_TYPE {
+            fail!("Type-id {} is not supported for Ed25519 public key", config.type_id);
+        }
+        let Some(pub_key) = &config.pub_key else {
+            fail!("No public key");
+        };
+        if config.pvt_key.is_some() {
+            fail!("No private key expected");
+        }
+        let key = base64_decode(pub_key)?;
+        if key.len() != ED25519_PUBLIC_KEY_LENGTH {
+            fail!("Bad public key");
+        }
+        Ok(Self::from_public_key(key.as_slice().try_into()?))
     }
 
     /// Generate new Ed25519 key
     pub fn generate() -> Result<Arc<dyn KeyOption>> {
-        Self::create_from_expanded_key(
-            ed25519_expand_private_key(&ed25519_generate_private_key()?)?,
-        )
+        Self::from_private_key(ed25519_generate_private_key()?.as_bytes().try_into()?)
     }
 
-    /// Generate new Ed25519 key and export JSON
+    /// Generate new Ed25519 key and export config
     pub fn generate_with_json() -> Result<(KeyOptionJson, Arc<dyn KeyOption>)> {
-        Self::create_from_private_key_with_json(ed25519_generate_private_key()?)
-    }
-
-    pub fn create_from_expanded_key(
-        exp_key: Ed25519ExpandedPrivateKey,
-    ) -> Result<Arc<dyn KeyOption>> {
-        let pub_key = ed25519_create_public_key(&exp_key)?.to_bytes();
-        let exp_key = exp_key.to_bytes();
-        let ret = Self {
-            id: Self::calc_id(Self::KEY_TYPE, &pub_key),
-            pub_key: Some(pub_key),
-            exp_key: Some(exp_key),
-            pvt_key: None,
-        };
-        Ok(Arc::new(ret))
-    }
-
-    pub fn create_from_private_key_with_json(
-        pvt_key: Ed25519PrivateKey,
-    ) -> Result<(KeyOptionJson, Arc<dyn KeyOption>)> {
-        let ret = Self::create_from_expanded_key(ed25519_expand_private_key(&pvt_key)?)?;
-        let json = KeyOptionJson {
-            type_id: Self::KEY_TYPE,
-            pub_key: None,
-            pvt_key: Some(base64_encode(pvt_key.to_bytes())),
-        };
-        Ok((json, ret))
-    }
-
-    // Calculate key ID
-    fn calc_id(type_id: i32, pub_key: &[u8; Self::PUB_KEY_SIZE]) -> Arc<KeyId> {
-        let data = sha256_digest_slices(&[&type_id.to_le_bytes(), pub_key]);
-        KeyId::from_data(data)
-    }
-
-    fn exp_key(&self) -> Result<&[u8; Self::EXP_KEY_SIZE]> {
-        if let Some(exp_key) = self.exp_key.as_ref() {
-            Ok(exp_key)
-        } else {
-            fail!("No expansion key set for key option {}", self.id())
-        }
+        Self::from_private_key_with_json(ed25519_generate_private_key()?.as_bytes().try_into()?)
     }
 }
 
-impl KeyOption for Ed25519KeyOption {
+impl<S: SecretBytes + 'static> KeyOption for Ed25519KeyOption<S> {
     /// Get key id
     fn id(&self) -> &Arc<KeyId> {
         &self.id
@@ -184,7 +193,7 @@ impl KeyOption for Ed25519KeyOption {
 
     /// Get type id
     fn type_id(&self) -> i32 {
-        Self::KEY_TYPE
+        ED25519_KEY_TYPE
     }
 
     /// Get public key
@@ -196,9 +205,25 @@ impl KeyOption for Ed25519KeyOption {
         }
     }
 
+    fn pvt_key(&self) -> Result<&dyn SecretBytes> {
+        if let Some(pvt_key) = self.pvt_key.as_ref() {
+            Ok(pvt_key)
+        } else {
+            fail!("No private key set for key option {}", self.id())
+        }
+    }
+
+    fn exp_key(&self) -> Result<&dyn SecretBytes> {
+        if let Some(exp_key) = self.exp_key.as_ref() {
+            Ok(exp_key)
+        } else {
+            fail!("No expansion key set for key option {}", self.id())
+        }
+    }
+
     /// Calculate signature
     fn sign(&self, data: &[u8]) -> Result<Vec<u8>> {
-        ed25519_sign(self.exp_key()?, self.pub_key().ok(), data)
+        ed25519_sign(&self.exp_key()?.lock()?, self.pub_key().ok(), data)
     }
 
     /// Verify signature
@@ -207,21 +232,11 @@ impl KeyOption for Ed25519KeyOption {
     }
 
     /// Calculate shared secret
-    fn shared_secret(&self, other_pub_key: &[u8]) -> Result<[u8; 32]> {
-        x25519_shared_secret(self.exp_key()?, other_pub_key)
-    }
-
-    #[cfg(feature = "export_key")]
-    fn export_key(&self) -> Result<&[u8]> {
-        Ok(self.exp_key()?)
-    }
-
-    fn pvt_key(&self) -> Result<&[u8; 32]> {
-        if let Some(pvt_key) = self.pvt_key.as_ref() {
-            Ok(pvt_key)
-        } else {
-            fail!("No private key set for key option {}", self.id())
-        }
+    fn shared_secret(&self, other_pub_key: &[u8]) -> Result<Box<dyn SecretBytes>> {
+        let mut shared = x25519_shared_secret(&self.exp_key()?.lock()?, other_pub_key)?;
+        let result = S::from_slice(&shared)?;
+        shared.zeroize();
+        Ok(Box::new(result))
     }
 }
 
@@ -246,21 +261,42 @@ impl Display for KeyId {
 
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
 pub struct KeyOptionJson {
-    type_id: i32,
+    pub type_id: i32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub_key: Option<String>,
+    pub pub_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pvt_key: Option<String>,
+    pub pvt_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault: Option<String>,
 }
 
-impl KeyOptionJson {
-    pub fn get_pvt_key(&self) -> Result<Vec<u8>> {
-        let Some(key) = &self.pvt_key else {
-            fail!("No private key to get from KeyOptionJson");
-        };
-        base64_decode(key)
+/// RAII secret bytes read guard; derefs to `&[u8]`.
+pub enum SecretBytesReadGuard<'a> {
+    Slice(&'a [u8]),
+    Owned(Box<dyn Deref<Target = [u8]> + Send + 'a>),
+}
+
+impl Deref for SecretBytesReadGuard<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Slice(s) => s,
+            Self::Owned(b) => b,
+        }
     }
-    pub fn type_id(&self) -> &i32 {
-        &self.type_id
+}
+
+/// Default backend: zeroize-on-drop heap allocation.
+pub type ZeroizingBytes = zeroize::Zeroizing<Vec<u8>>;
+
+impl SecretBytes for ZeroizingBytes {
+    fn lock(&self) -> Result<SecretBytesReadGuard<'_>> {
+        Ok(SecretBytesReadGuard::Slice(self.as_slice()))
+    }
+    fn from_slice(data: &[u8]) -> Result<Self> {
+        Ok(zeroize::Zeroizing::new(data.to_vec()))
+    }
+    fn len(&self) -> usize {
+        self.as_slice().len()
     }
 }

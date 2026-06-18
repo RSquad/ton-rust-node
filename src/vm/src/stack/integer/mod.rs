@@ -284,32 +284,17 @@ pub mod utils {
     }
 
     #[inline]
-    pub fn process_double_result<T, FNaN>(
-        result: (Int, Int),
-        nan_constructor: FNaN,
-    ) -> Result<(IntegerData, IntegerData)>
+    pub fn process_double_result<T>((r1, r2): (Int, Int)) -> Result<(IntegerData, IntegerData)>
     where
         T: OperationBehavior,
-        FNaN: Fn() -> (IntegerData, IntegerData),
     {
-        let (r1, r2) = result;
-        match IntegerData::from(r1) {
-            Ok(r1) => Ok((r1, IntegerData::from(r2)?)),
-            Err(_) => {
+        match (IntegerData::from(r1), IntegerData::from(r2)) {
+            (Ok(r1), Ok(r2)) => Ok((r1, r2)),
+            _ => {
                 on_integer_overflow!(T)?;
-                Ok(nan_constructor())
+                Ok((IntegerData::nan(), IntegerData::nan()))
             }
         }
-    }
-
-    #[inline]
-    pub fn construct_single_nan() -> IntegerData {
-        IntegerData::nan()
-    }
-
-    #[inline]
-    pub fn construct_double_nan() -> (IntegerData, IntegerData) {
-        (construct_single_nan(), construct_single_nan())
     }
 
     /// Integer overflow checking. Returns true, if value fits into IntegerData; otherwise false.

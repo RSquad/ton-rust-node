@@ -13,6 +13,7 @@ mod block_proof;
 mod boot;
 mod collator_test_bundle;
 mod config;
+mod confirmed_blocks;
 mod engine;
 mod engine_operations;
 mod engine_traits;
@@ -47,8 +48,6 @@ use crate::{
     internal_db::restore::set_graceful_termination,
     validating_utils::supported_version,
 };
-#[cfg(target_os = "linux")]
-use std::os::raw::c_void;
 use std::sync::Arc;
 #[cfg(feature = "trace_alloc")]
 use std::{
@@ -72,20 +71,17 @@ use ton_block::UnixTime;
 #[path = "tests/test_helper.rs"]
 pub mod test_helper;
 
-#[cfg(target_os = "linux")]
-#[link(name = "tcmalloc_minimal", kind = "dylib")]
-extern "C" {
-    pub fn tc_memalign(alignment: usize, size: usize) -> *mut c_void;
-    pub fn tc_free(ptr: *mut c_void);
-}
+#[cfg(all(feature = "jemalloc", not(feature = "trace_alloc"), not(windows)))]
+#[global_allocator]
+static GLOBAL_JEMALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-#[cfg(target_os = "linux")]
-fn check_tcmalloc() {
-    unsafe {
-        let ptr = tc_memalign(10, 10);
-        tc_free(ptr);
-    }
-}
+#[cfg(feature = "jemalloc")]
+#[allow(non_upper_case_globals)]
+#[export_name = "malloc_conf"]
+// muzzy_decay_ms:0 forces MADV_DONTNEED immediately after MADV_FREE so that
+// kernel anon-rss matches what jemalloc considers freed — critical under cgroup
+// memory.max limits where phantom muzzy pages would trigger memcg OOM.
+pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0\0";
 
 #[cfg(feature = "trace_alloc")]
 struct TracingAllocator {
@@ -313,9 +309,6 @@ fn check_debug_build() {
 fn main() {
     check_debug_build();
 
-    #[cfg(target_os = "linux")]
-    check_tcmalloc();
-
     println!("{}", get_build_info());
     let version = get_version();
     println!("{}", version);
@@ -407,18 +400,38 @@ fn main() {
         matches.get_one::<String>("console_key").map(|console_key| console_key.to_string());
 
     let zerostate_path = matches.get_one::<String>("zerostate").map(String::as_str);
-    let mut config = match TonNodeConfig::from_file(
-        config_dir_path,
-        CONFIG_NAME,
-        None,
-        DEFAULT_CONFIG_NAME,
-        console_key,
-    ) {
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()
+        .expect("Can't create Engine tokio runtime");
+    let validator_runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()
+        .expect("Can't create Validator tokio runtime");
+    let liteserver_runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()
+        .expect("Can't create Liteserver tokio runtime");
+
+    let mut config = match runtime.block_on(async {
+        TonNodeConfig::from_file(
+            config_dir_path,
+            CONFIG_NAME,
+            None,
+            DEFAULT_CONFIG_NAME,
+            console_key,
+        )
+        .await
+    }) {
+        Ok(c) => c,
         Err(e) => {
             eprintln!("Can't load config: {e:?}");
             return;
         }
-        Ok(c) => c,
     };
 
     if process_conf_and_exit {
@@ -446,22 +459,6 @@ fn main() {
         .metrics()
         .expect("Bad metrics config")
         .map(|mc| (mc.address, engine::init_prometheus_recorder(&mc)));
-
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(8 * 1024 * 1024)
-        .build()
-        .expect("Can't create Engine tokio runtime");
-    let validator_runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(8 * 1024 * 1024)
-        .build()
-        .expect("Can't create Validator tokio runtime");
-    let liteserver_runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(8 * 1024 * 1024)
-        .build()
-        .expect("Can't create Liteserver tokio runtime");
 
     // Load secrets from vault to config
     if let Err(e) = runtime.block_on(SecretsVaultConfig::on_load(&mut config)) {
@@ -518,6 +515,15 @@ fn main() {
         stopper_ctrl_c.set_stop();
     })
     .expect("Error setting termination signals handler");
+
+    // Any panic signals stopper for graceful shutdown; default hook runs after.
+    let stopper_panic = stopper.clone();
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log::error!("FATAL PANIC: {info}");
+        stopper_panic.set_stop();
+        default_hook(info);
+    }));
 
     let validator_rt_handle = validator_runtime.handle().clone();
     let liteserver_rt_handle = liteserver_runtime.handle().clone();

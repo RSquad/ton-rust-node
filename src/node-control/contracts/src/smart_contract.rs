@@ -11,5 +11,5 @@ use ton_block::MsgAddressInt;
 #[async_trait::async_trait]
 pub trait SmartContract {
     async fn balance(&self) -> anyhow::Result<u64>;
-    fn address(&self) -> MsgAddressInt;
+    async fn address(&self) -> anyhow::Result<MsgAddressInt>;
 }

@@ -104,7 +104,7 @@ impl EncodingPacket {
 #[cfg_attr(feature = "serde_support", derive(Serialize, Deserialize))]
 pub struct ObjectTransmissionInformation {
     transfer_length: u64, // Limited to u40
-    symbol_size: u16,
+    symbol_size: u32,
     num_source_blocks: u8,
     num_sub_blocks: u16,
     symbol_alignment: u8,
@@ -113,14 +113,14 @@ pub struct ObjectTransmissionInformation {
 impl ObjectTransmissionInformation {
     pub fn new(
         transfer_length: u64,
-        symbol_size: u16,
+        symbol_size: u32,
         source_blocks: u8,
         sub_blocks: u16,
         alignment: u8,
     ) -> ObjectTransmissionInformation {
         // See errata (https://www.rfc-editor.org/errata/eid5548)
         assert!(transfer_length <= 942574504275);
-        assert_eq!(symbol_size % alignment as u16, 0);
+        assert_eq!(symbol_size % alignment as u32, 0);
         // See section 4.4.1.2. "These parameters MUST be set so that ceil(ceil(F/T)/Z) <= K'_max."
 
         if (symbol_size != 0) && (source_blocks != 0) {
@@ -140,6 +140,10 @@ impl ObjectTransmissionInformation {
         }
     }
 
+    #[deprecated(note = "\
+        RFC 5052 wire format, only encodes symbol_size as u16. \
+        Not used in TON — TL serialization is used instead\
+    ")]
     pub fn deserialize(data: &[u8; 12]) -> ObjectTransmissionInformation {
         ObjectTransmissionInformation {
             transfer_length: ((data[0] as u64) << 32)
@@ -147,13 +151,17 @@ impl ObjectTransmissionInformation {
                 + ((data[2] as u64) << 16)
                 + ((data[3] as u64) << 8)
                 + (data[4] as u64),
-            symbol_size: ((data[6] as u16) << 8) + data[7] as u16,
+            symbol_size: ((data[6] as u32) << 8) + data[7] as u32,
             num_source_blocks: data[8],
             num_sub_blocks: ((data[9] as u16) << 8) + data[10] as u16,
             symbol_alignment: data[11],
         }
     }
 
+    #[deprecated(note = "\
+        RFC 5052 wire format, only encodes symbol_size as u16. \
+        Not used in TON — TL serialization is used instead\
+    ")]
     pub fn serialize(&self) -> [u8; 12] {
         [
             ((self.transfer_length >> 32) & 0xFF) as u8,
@@ -175,7 +183,7 @@ impl ObjectTransmissionInformation {
         self.transfer_length
     }
 
-    pub fn symbol_size(&self) -> u16 {
+    pub fn symbol_size(&self) -> u32 {
         self.symbol_size
     }
 
@@ -196,9 +204,9 @@ impl ObjectTransmissionInformation {
         max_packet_size: u16,
         decoder_memory_requirement: u64,
     ) -> ObjectTransmissionInformation {
-        let alignment = 8;
+        let alignment: u16 = 8;
         assert!(max_packet_size >= alignment);
-        let symbol_size = max_packet_size - (max_packet_size % alignment);
+        let symbol_size = (max_packet_size - (max_packet_size % alignment)) as u32;
         let sub_symbol_size = 8;
 
         let kt = int_div_ceil(transfer_length, symbol_size as u64);

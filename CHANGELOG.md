@@ -6,6 +6,178 @@ For Helm chart changes, see [helm/ton-rust-node/CHANGELOG.md](helm/ton-rust-node
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 Versions follow the node release tags (e.g. `v0.1.2-mainnet`).
 
+## [v0.8.3] - 2026-06-04
+
+Image: `ghcr.io/rsquad/ton-rust-node/node:v0.8.3`
+
+### Added
+
+- Support of block version 14 (changes in TVM, executor, blockchain structures)
+
+## [v0.8.2] - 2026-06-02
+
+Image: `ghcr.io/rsquad/ton-rust-node/node:v0.8.2`
+
+### Added
+
+- Block sync overlay for observer-mode validators
+- SNI support for QUIC
+
+### Changed
+
+- Adapt custom overlay to QUIC transport
+- Memory optimizations
+- Simplex version propagation to validator manager
+
+### Fixed
+
+- State resolver cache fixes in collator
+
+## [v0.8.1] - 2026-05-29
+
+Image: `ghcr.io/rsquad/ton-rust-node/node:v0.8.1`
+
+### Fixed
+
+- Stability issues with validation
+
+## [v0.8.0] - 2026-05-26
+
+Image: `ghcr.io/rsquad/ton-rust-node/node:v0.8.0`
+
+### Changed
+
+- Cell DB performance boost via RocksDB merge operator
+
+### Fixed
+
+- Stability updates
+
+## [v0.7.1] - 2026-05-24
+
+Image: `ghcr.io/rsquad/ton-rust-node/node:v0.7.1`
+
+### Added
+
+- HTTP SSE endpoint for confirmed blocks
+
+### Fixed
+
+- Secure vault operation
+
+## [v0.7.0] - 2026-05-21
+
+Image: `ghcr.io/rsquad/ton-rust-node/node:v0.7.0`
+
+### Added
+
+- Do not expose node keys in config, use secrets vault
+
+### Changed
+
+- External messages processing optimization
+- Memory optimization for archival node
+- Performance and memory optimizations for CellDb
+- Stability improvements for compressed BOCs and external messages
+- TVM stability updates
+
+### Fixed
+
+- Fixes for protocol vulnerabilities
+
+## [v0.6.1] - 2026-05-06
+
+Image: `ghcr.io/rsquad/ton-rust-node/node:v0.6.1`
+
+### Added
+
+- CLI tool for copying node secrets to HashiCorp Vault
+
+### Changed
+
+- ADNL key management for fast sync overlay
+
+### Fixed
+
+- Ensure deterministic gas charging in TVM for partial-bit opcodes across all validators
+- Align ActionPhase TL-B encoding in transaction executor with the consensus-observable form (post-BOC round-trip)
+
+## [v0.6.0] - 2026-05-01
+
+Image: `ghcr.io/rsquad/ton-rust-node/node:v0.6.0`
+
+### Added
+
+- Support of HashiCorp vault for node secrets storing
+
+### Changed
+
+- Improved performance of operations with cell data representation
+- Improved performance and stability of collator
+- Improved performance of Simplex consensus protocols
+- Improved performance of node cells database
+
+### Fixed
+
+- Compatibility issues for transaction executor and TVM
+- Fix for anycast addresses in old transactions
+- Proper archive truncation after node hard reboots
+
+## [v0.5.3] - 2026-04-23
+
+Image: `ghcr.io/rsquad/ton-rust-node/node:v0.5.3`
+
+### Changed
+
+- Optimize QUIC for high latency links
+- Keep permanent ADNL validator keys
+
+## [v0.5.2] - 2026-04-21
+
+Image: `ghcr.io/rsquad/ton-rust-node/node:v0.5.2`
+
+### Changed
+
+- Optimized fast-sync overlay operation over QUIC
+
+### Fixed
+
+- TVM stack slice TL-serialization fix for LiteServer
+
+## [v0.5.1] - 2026-04-17
+
+Image: `ghcr.io/rsquad/ton-rust-node/node:v0.5.1`
+
+### Added
+
+- Switch to ubuntu base image and add console binary
+
+### Fixed
+
+- Fix LiteServer response handling for listBlockTransactions so clients accept it correctly
+
+## [v0.5.0] - 2026-04-11
+
+Image: `ghcr.io/rsquad/ton-rust-node/node:v0.5.0`
+
+### Added
+
+- Support non-standard RaptorQ symbol size (> 65536)
+- Simplex consensus updates (pipeline context, latest protocol changes)
+- QUIC connection deduplication
+
+### Changed
+
+- LiteServer runSmcMethod implementation
+- Optimized collection of overlay statistics
+
+### Fixed
+
+- Stability fix for fast Merkle update apply
+- Transaction execution fixes (two rounds)
+- Fix pipeline context for Simplex consensus
+- Fix config params creation for emulator
+
 ## [v0.4.0] - 2026-04-05
 
 Image: `ghcr.io/rsquad/ton-rust-node/node:v0.4.0`

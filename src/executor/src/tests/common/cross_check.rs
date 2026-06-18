@@ -87,7 +87,7 @@ pub(crate) fn cross_check(
     // assert!(extra.config.global_version() >= ton_block::SUPPORTED_VERSION, "global_version {} must be >= {}",
     //     config.global_version(), ton_block::SUPPORTED_VERSION);
     #[cfg(windows)]
-    let lib_name = "../../ton/build/crypto/Release/vm_run_shared.dll";
+    let lib_name = "../../../ton/build/crypto/vm_run_shared.dll";
     #[cfg(target_os = "linux")]
     let lib_name = "../../ton-node-cpp/build/crypto/libvm_run_shared.so";
     #[cfg(target_os = "macos")]
@@ -236,7 +236,6 @@ pub(crate) fn cross_check(
                 Ok(true)
             })
             .unwrap();
-        assert_eq!(acc_after, acc_file);
 
         assert_eq!(transaction.read_description().unwrap(), tx_file.read_description().unwrap());
         transaction
@@ -247,6 +246,7 @@ pub(crate) fn cross_check(
             })
             .unwrap();
         assert_eq!(transaction, tx_file);
+        assert_eq!(acc_after, acc_file);
 
         assert_eq!(acc_after.serialize().unwrap(), acc_file_cells);
         assert_eq!(transaction.serialize().unwrap(), tx_file_cells);

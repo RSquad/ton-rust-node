@@ -50,7 +50,6 @@ fmt:
 	@cargo +nightly fmt $(check) --manifest-path ./node-control/common/Cargo.toml
 	@cargo +nightly fmt $(check) --manifest-path ./node-control/contracts/Cargo.toml
 	@cargo +nightly fmt $(check) --manifest-path ./node-control/control-client/Cargo.toml
-	@cargo +nightly fmt $(check) --manifest-path ./node-control/elections/Cargo.toml
 	@cargo +nightly fmt $(check) --manifest-path ./node-control/nodectl/Cargo.toml
 	@cargo +nightly fmt $(check) --manifest-path ./node-control/service/Cargo.toml
 	@cargo +nightly fmt $(check) --manifest-path ./node-control/ton-http-api-client/Cargo.toml
@@ -58,8 +57,11 @@ fmt:
 	@cargo +nightly fmt $(check) --manifest-path ./tl/ton_tl_codegen/Cargo.toml
 	@cargo +nightly fmt $(check) --manifest-path ./secrets-vault/Cargo.toml
 	@cargo +nightly fmt $(check) --manifest-path ./vm/Cargo.toml
-	@rustfmt +nightly $(check) --edition 2021 --config-path ./ ./common/src/*.rs
-	@rustfmt +nightly $(check) --edition 2021 --config-path ./ ./common/build/*.rs
+	@rustfmt +nightly $(check) --edition 2021 --config-path ./ ./common/src/config.rs
+	@rustfmt +nightly $(check) --edition 2021 --config-path ./ ./common/src/info.rs
+	@rustfmt +nightly $(check) --edition 2021 --config-path ./ ./common/src/log.rs
+	@rustfmt +nightly $(check) --edition 2021 --config-path ./ ./common/src/test.rs
+	@rustfmt +nightly $(check) --edition 2021 --config-path ./ ./common/build/build.rs
 
 #### Tests
 
@@ -75,6 +77,7 @@ test-adnl:
 	@cargo test test_adnl_$(what) $(config) --package adnl --features "client,server,node,telemetry" -- --nocapture
 	@cargo test test_overlay_$(what) $(config) --package adnl --features "client,server,node" -- --nocapture
 	@cargo test test_rldp_$(what) $(config) --package adnl --features "client,server,node,debug" -- --nocapture
+	@cargo test test_quic_$(what) $(config) --package adnl --features "client,server,node,telemetry" -- --nocapture
 
 test-catchain:
 	@cargo test $(what) $(config) --package catchain -- --nocapture

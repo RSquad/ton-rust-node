@@ -1,6 +1,6 @@
 [package]
 name = "commands"
-version = "0.3.0"
+version = "0.5.1"
 edition = "2024"
 license = 'GPL-3.0'
 
@@ -21,15 +21,12 @@ control-client = { path = "../control-client" }
 ton-http-api-client = { path = "../ton-http-api-client" }
 adnl = { features = ["client"], path = "../../adnl" }
 ton_block = { path = "../../block" }
-elections = { path = "../elections" }
 contracts = { path = "../contracts" }
 ton_block_json = { version = "0.9.41", path = "../../block-json" }
 service = { path = "../service" }
 secrets-vault = { path = '../../secrets-vault', default-features = false, features = [
     "file-storage-json",
-    "crypto-default",
     "hashicorp-storage",
-    "with-base64",
 ] }
 scopeguard = "1"
 rpassword = "7"

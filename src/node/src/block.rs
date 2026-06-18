@@ -21,16 +21,19 @@ use ton_api::ton::{
         shardblocklink::ShardBlockLink,
         shardblockproof::ShardBlockProof,
         signature::Signature,
-        signatureset, BlockLink, SignatureSet,
+        signature_set::signatureset::{
+            Ordinary as TlSignatureSetOrdinary, Simplex as TlSignatureSetSimplex,
+        },
+        BlockLink, SignatureSet,
     },
     Bool,
 };
 use ton_block::{
     error, fail, read_single_root_boc, write_boc, AccountBlock, AccountId, AccountIdPrefixFull,
-    BlkPrevInfo, Block, BlockIdExt, BocReader, Cell, ConfigParams, CryptoSignaturePair,
-    Deserializable, ExtBlkRef, HashmapAugType, HashmapType, McStateExtra, MerkleProof,
-    OldMcBlocksInfo, Result, Serializable, ShardDescr, ShardIdent, ShardStateUnsplit, SliceData,
-    UInt256, UsageTree,
+    BlkPrevInfo, Block, BlockIdExt, BlockSignaturesVariant, BocReader, Cell, ConfigParams,
+    CryptoSignaturePair, Deserializable, ExtBlkRef, HashmapAugType, HashmapType, McStateExtra,
+    MerkleProof, OldMcBlocksInfo, Result, Serializable, ShardDescr, ShardIdent, ShardStateUnsplit,
+    SliceData, UInt256, UsageTree,
 };
 
 pub type ProofMode = i32;
@@ -74,8 +77,8 @@ impl BlockStuff {
     }
 
     pub fn deserialize_block(id: BlockIdExt, data: Arc<Vec<u8>>) -> Result<Self> {
-        let root = BocReader::new().read_inmem(data.clone())?.withdraw_single_root()?;
-        if id.root_hash != root.repr_hash() {
+        let root = BocReader::new().read(&*data)?.withdraw_single_root()?;
+        if id.root_hash != *root.repr_hash() {
             fail!("wrong root hash for {}", id)
         }
         let block = Block::construct_from_cell(root.clone())?;
@@ -101,6 +104,10 @@ impl BlockStuff {
 
     pub fn data(&self) -> &[u8] {
         &self.data
+    }
+
+    pub fn data_arc(&self) -> Arc<Vec<u8>> {
+        self.data.clone()
     }
 
     // Unused
@@ -300,7 +307,7 @@ impl BlockStuff {
         let id = BlockIdExt {
             shard_id: block_info.shard().clone(),
             seq_no: block_info.seq_no(),
-            root_hash: root.repr_hash(),
+            root_hash: root.repr_hash().clone(),
             file_hash,
         };
         Ok(Self { id, block, root, data: Arc::new(data) })
@@ -309,13 +316,13 @@ impl BlockStuff {
     pub fn read_block_from_file(filename: &str) -> Result<Self> {
         let data = Arc::new(std::fs::read(filename)?);
         let file_hash = UInt256::calc_file_hash(&data);
-        let root = BocReader::new().read_inmem(data.clone())?.withdraw_single_root()?;
+        let root = read_single_root_boc(&*data)?;
         let block = Block::construct_from_cell(root.clone())?;
         let block_info = block.read_info()?;
         let id = BlockIdExt {
             shard_id: block_info.shard().clone(),
             seq_no: block_info.seq_no(),
-            root_hash: root.repr_hash(),
+            root_hash: root.repr_hash().clone(),
             file_hash,
         };
         Ok(Self { id, block, root, data })
@@ -373,7 +380,7 @@ pub fn construct_and_check_prev_stuff(
         BlockIdExt {
             shard_id: info.shard().clone(),
             seq_no: info.seq_no(),
-            root_hash: block_root.repr_hash(),
+            root_hash: block_root.repr_hash().clone(),
             file_hash: UInt256::default(),
         }
     } else {
@@ -387,7 +394,7 @@ pub fn construct_and_check_prev_stuff(
         if id.seq_no() != info.seq_no() {
             fail!("block header contains seq_no: {}, but expected: {}", info.seq_no(), id.seq_no())
         }
-        if *id.root_hash() != block_root.repr_hash() {
+        if *id.root_hash() != *block_root.repr_hash() {
             fail!(
                 "block header has incorrect root hash: {:x}, but expected: {:x}",
                 block_root.repr_hash(),
@@ -503,12 +510,28 @@ fn sigset_from_proof_boc(id: &BlockIdExt, boc: &[u8]) -> Result<SignatureSet> {
             Ok(true)
         },
     )?;
-    let result = SignatureSet::LiteServer_SignatureSet(signatureset::SignatureSet {
-        validator_set_hash: block_sigs.validator_info().validator_list_hash_short as i32,
-        catchain_seqno: block_sigs.validator_info().catchain_seqno as i32,
-        signatures: out_sigs,
-    });
-    Ok(result)
+    let validator_set_hash = block_sigs.validator_info().validator_list_hash_short as i32;
+    let cc_seqno = block_sigs.validator_info().catchain_seqno as i32;
+
+    Ok(match block_sigs {
+        BlockSignaturesVariant::Ordinary(_) => {
+            SignatureSet::LiteServer_SignatureSet_Ordinary(TlSignatureSetOrdinary {
+                validator_set_hash,
+                catchain_seqno: cc_seqno,
+                signatures: out_sigs,
+            })
+        }
+        BlockSignaturesVariant::Simplex(simplex) => {
+            SignatureSet::LiteServer_SignatureSet_Simplex(TlSignatureSetSimplex {
+                cc_seqno,
+                validator_set_hash,
+                signatures: out_sigs,
+                session_id: simplex.session_id.clone(),
+                slot: simplex.slot as i32,
+                candidate: simplex.candidate_data_bytes()?,
+            })
+        }
+    })
 }
 
 async fn build_zs_config_proof(

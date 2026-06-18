@@ -156,7 +156,7 @@ where
     pub fn shunt(&self, id: &I, operation: impl Fn() -> Result<R>) -> Result<()> {
         if let Some(op_awaiters) = self.ops_awaiters.get(id) {
             let r = operation()?;
-            let _ = op_awaiters.1.tx.send(Some(Ok(r)));
+            self.finalize(id, &op_awaiters.1, Ok(r));
         }
         Ok(())
     }
@@ -168,9 +168,14 @@ where
     ) -> Result<()> {
         if let Some(op_awaiters) = self.ops_awaiters.get(id) {
             let r = operation.await?;
-            let _ = op_awaiters.1.tx.send(Some(Ok(r)));
+            self.finalize(id, &op_awaiters.1, Ok(r));
         }
         Ok(())
+    }
+
+    fn finalize(&self, id: &I, op_awaiters: &OperationAwaiters<R>, value: Result<R>) {
+        let _ = op_awaiters.tx.send(Some(value));
+        self.ops_awaiters.remove(id);
     }
 
     async fn wait_operation(
@@ -181,7 +186,7 @@ where
         check_complete: impl Fn() -> Result<bool>,
     ) -> Result<Option<R>> {
         let mut rx = op_awaiters.rx.clone();
-        loop {
+        let result = loop {
             log::trace!("{}: wait_operation: waiting... {}", self.description, id);
 
             let result = if let Ok(result) =
@@ -190,7 +195,7 @@ where
                 result
             } else if check_complete()? {
                 // Operation might be done before calling `wait_operation` - check it and return
-                return Ok(None);
+                break Ok(None);
             } else if let Some(timeout_ms) = timeout_ms {
                 tokio::time::timeout(Duration::from_millis(timeout_ms), rx.changed())
                     .await
@@ -201,7 +206,7 @@ where
                 rx.changed().await
             };
             if result.is_err() {
-                return Ok(None);
+                break Ok(None);
             }
 
             let r = match &*rx.borrow() {
@@ -211,7 +216,13 @@ where
             };
             log::trace!("{}: wait_operation: done {}", self.description, id);
             break r;
+        };
+        // External finalization paths (Ok(None)) own the cleanup, since the
+        // value sender (`do_operation`/`shunt`) won't fire for them.
+        if matches!(result, Ok(None)) {
+            self.ops_awaiters.remove(id);
         }
+        result
     }
 
     async fn do_operation(
@@ -225,26 +236,22 @@ where
         tokio::select! {
             result = operation => {
                 log::trace!("{}: do_operation: done {}", self.description, id);
-
-                self.ops_awaiters.remove(id);
-
                 let r = match result {
                     Ok(ref r) => Ok(r.clone()),
                     Err(ref e) => Err(error!("{}", e)), // The Error doesn't impl Clone,
                                                         // so it is impossible to clone full result
                 };
-                let _ = op_awaiters.tx.send(Some(r));
-                return result;
+                self.finalize(id, op_awaiters, r);
+                result
             }
             _ = rx.changed() => {
                 log::trace!("{}: do_operation: shunt {}", self.description, id);
-
-                self.ops_awaiters.remove(id);
-
+                // Value already published to `tx` by the external `shunt`,
+                // which also removed the entry — nothing to finalize here.
                 match &*op_awaiters.rx.borrow() {
-                    Some(Ok(r)) => return Ok(r.clone()),
-                    Some(Err(e)) => return Err(error!("{}", e)),
-                    None => return Err(error!("{}: do_operation: shunt: no result", self.description))
+                    Some(Ok(r)) => Ok(r.clone()),
+                    Some(Err(e)) => Err(error!("{}", e)),
+                    None => Err(error!("{}: do_operation: shunt: no result", self.description)),
                 }
             }
         }

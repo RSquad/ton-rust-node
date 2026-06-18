@@ -10,6 +10,7 @@
  */
 use crate::common::{AdnlHandshake, AdnlStream, AdnlStreamCrypto, Query, TaggedTlObject, Timeouts};
 use rand::{Rng, RngCore};
+use secrets_vault::vault_block::get_key_option_factory;
 use std::{
     convert::TryInto,
     net::SocketAddr,
@@ -29,7 +30,7 @@ use ton_api::{
     },
     AnyBoxedSerialize, IntoBoxed, TLObject,
 };
-use ton_block::{error, fail, Ed25519KeyOption, KeyOption, KeyOptionJson, Result};
+use ton_block::{error, fail, KeyOption, KeyOptionJson, Result};
 
 #[derive(serde::Deserialize, serde::Serialize)]
 pub struct AdnlClientConfigJson {
@@ -84,12 +85,12 @@ impl AdnlClientConfig {
     pub fn from_json_config(
         json_config: &AdnlClientConfigJson,
     ) -> Result<(Option<AdnlClientConfigJson>, Self)> {
-        let server_key = Ed25519KeyOption::from_public_key_json(&json_config.server_key)?;
+        let server_key = get_key_option_factory().from_public_key_json(&json_config.server_key)?;
         let mut result_config = None;
         let client_key = if let Some(key) = &json_config.client_key {
-            Some(Ed25519KeyOption::from_private_key_json(key)?)
+            Some(get_key_option_factory().from_private_key_json(key)?)
         } else {
-            let (json, key) = Ed25519KeyOption::generate_with_json()?;
+            let (json, key) = get_key_option_factory().generate_with_json()?;
             result_config = Some(AdnlClientConfigJson {
                 client_key: Some(json),
                 server_address: json_config.server_address.clone(),
@@ -124,19 +125,25 @@ pub struct AdnlClient {
 }
 
 impl AdnlClient {
-    /// Connect to server
+    /// Connect to server.
     pub async fn connect(config: &AdnlClientConfig) -> Result<Self> {
-        let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?;
-        socket.set_reuse_address(true)?;
-        socket.set_linger(Some(Duration::from_secs(0)))?;
-        //socket.bind(&"0.0.0.0:0".parse::<SocketAddr>()?.into())?;
-        socket.connect_timeout(&config.server_address.into(), config.timeouts.write())?;
-        socket.set_nonblocking(true)?;
+        let connect_timeout = config.timeouts.write();
+        let tcp = tokio::time::timeout(
+            connect_timeout,
+            tokio::net::TcpStream::connect(config.server_address),
+        )
+        .await
+        .map_err(|_| {
+            error!(
+                "ADNL connect to {} timed out after {:?}",
+                config.server_address, connect_timeout,
+            )
+        })?
+        .map_err(|e| error!("ADNL connect to {} failed: {}", config.server_address, e))?;
 
-        let mut stream = AdnlStream::from_stream_with_timeouts(
-            tokio::net::TcpStream::from_std(socket.into())?,
-            config.timeouts(),
-        );
+        socket2::SockRef::from(&tcp).set_linger(Some(Duration::from_secs(0)))?;
+
+        let mut stream = AdnlStream::from_stream_with_timeouts(tcp, config.timeouts());
 
         let mut crypto = Self::send_init_packet(&mut stream, config).await?;
         if let Some(client_key) = &config.client_key {
@@ -199,7 +206,7 @@ impl AdnlClient {
         } else {
             AdnlHandshake::build_packet(
                 &mut buf,
-                &Ed25519KeyOption::generate()?,
+                &get_key_option_factory().generate()?,
                 &config.server_key,
                 None,
             )?

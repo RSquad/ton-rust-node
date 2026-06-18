@@ -39,7 +39,6 @@ cat <<EOF
   },
   "cells_db_config": {
     "states_db_queue_len": 1000,
-    "prefill_cells_counters": false,
     "cells_cache_size_bytes": 4000000000,
     "counters_cache_size_bytes": 4000000000
   }

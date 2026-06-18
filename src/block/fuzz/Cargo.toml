@@ -1,0 +1,29 @@
+[package]
+name = "ton-block-fuzz"
+version = "0.0.0"
+authors = ["Automatically generated"]
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[dependencies]
+anyhow = "1.0"
+libfuzzer-sys = "0.4.0"
+ton_block = { path = ".." }
+
+[[bin]]
+name = "fuzz_boc_read"
+path = "fuzz_targets/fuzz_boc_read.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_boc_stream_read"
+path = "fuzz_targets/fuzz_boc_stream_read.rs"
+test = false
+doc = false

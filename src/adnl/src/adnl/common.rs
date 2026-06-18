@@ -205,8 +205,10 @@ impl AdnlHandshake {
             version,
         );
         let hdr = if version.is_some() { 100 } else { 96 };
-        let mut shared_secret = local.shared_secret(other.pub_key()?)?;
-        Self::build_packet_cipher(&mut shared_secret, &checksum).apply_keystream(&mut buf[hdr..]);
+        let shared_secret = local.shared_secret(other.pub_key()?)?;
+        let shared_secret_data: &[u8] = &shared_secret.lock()?;
+        Self::build_packet_cipher(shared_secret_data.try_into()?, &checksum)
+            .apply_keystream(&mut buf[hdr..]);
         Ok(())
     }
 
@@ -220,7 +222,7 @@ impl AdnlHandshake {
     ) -> Result<(Option<Arc<KeyId>>, Option<u16>)> {
         fn process(
             buf: &mut Vec<u8>,
-            secret: &mut [u8; 32],
+            secret: &[u8; 32],
             range: &Range<usize>,
             version: &Option<u16>,
         ) -> Result<()> {
@@ -254,18 +256,25 @@ impl AdnlHandshake {
                         &buf[68..100],
                     ) {
                         range.start += 4;
-                        let mut shared_secret = key.val().shared_secret(buf[32..64].try_into()?)?;
                         let mut tmp = Vec::with_capacity(buf.len() - range.end + range.start);
                         tmp.extend_from_slice(&buf[range.start..range.end]);
                         let version = Some(version);
-                        if process(buf, &mut shared_secret, &range, &version).is_ok() {
+                        let shared_secret = key.val().shared_secret(buf[32..64].try_into()?)?;
+                        let guard = shared_secret.lock()?;
+                        let shared_secret_data: &[u8] = &guard;
+                        if process(buf, shared_secret_data.try_into()?, &range, &version).is_ok() {
                             return Ok((Some(key.key().clone()), version));
                         }
+                        drop(guard);
                         buf[range.start..range.end].copy_from_slice(&tmp);
                     }
                 }
-                let mut shared_secret = key.val().shared_secret(buf[32..64].try_into()?)?;
-                process(buf, &mut shared_secret, &range, &None)?;
+
+                let shared_secret = key.val().shared_secret(buf[32..64].try_into()?)?;
+                let guard = shared_secret.lock()?;
+                let shared_secret_data: &[u8] = &guard;
+                process(buf, shared_secret_data.try_into()?, &range, &None)?;
+                drop(guard);
                 return Ok((Some(key.key().clone()), None));
             }
         }
@@ -273,9 +282,8 @@ impl AdnlHandshake {
     }
 
     #[cfg(any(feature = "client", feature = "node", feature = "server"))]
-    fn build_packet_cipher(shared_secret: &mut [u8; 32], checksum: &[u8; 32]) -> AesCtr {
+    fn build_packet_cipher(shared_secret: &[u8; 32], checksum: &[u8; 32]) -> AesCtr {
         let ret = AdnlCryptoUtils::build_cipher_secure(shared_secret, checksum);
-        shared_secret.iter_mut().for_each(|a| *a = 0);
         ret
     }
 }

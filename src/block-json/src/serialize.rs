@@ -1063,6 +1063,9 @@ fn serialize_accelerator(acc: &AcceleratedConsensusConfig) -> Result<Value> {
 
 fn serialize_simplex_config(cfg: &SimplexConfig) -> Result<Value> {
     let mut map = Map::new();
+    if cfg.enable_observers {
+        serialize_field(&mut map, "enable_observers", 1u32);
+    }
     if cfg.use_quic {
         serialize_field(&mut map, "use_quic", 1u32);
     }
@@ -1097,6 +1100,12 @@ fn serialize_simplex_config(cfg: &SimplexConfig) -> Result<Value> {
     serialize_field(&mut map, "max_leader_window_desync", np.max_leader_window_desync);
     serialize_field(&mut map, "bad_signature_ban_duration_ms", np.bad_signature_ban_duration_ms);
     serialize_field(&mut map, "candidate_resolve_rate_limit", np.candidate_resolve_rate_limit);
+    serialize_field(&mut map, "min_block_interval_ms", np.min_block_interval_ms);
+    serialize_field(
+        &mut map,
+        "no_empty_blocks_on_error_timeout_ms",
+        np.no_empty_blocks_on_error_timeout_ms,
+    );
     Ok(map.into())
 }
 
@@ -1679,7 +1688,7 @@ pub fn debug_block_map(block: Block) -> Result<Map<String, Value>> {
     let root_cell = block.serialize()?;
     let set = BlockSerializationSet {
         block,
-        id: root_cell.repr_hash(),
+        id: root_cell.repr_hash().clone(),
         status: BlockProcessingStatus::Finalized,
         boc: Vec::new(),
     };
@@ -1710,7 +1719,7 @@ pub fn debug_block_full(block: &Block) -> Result<String> {
     let root_cell = block.serialize()?;
     let set = BlockSerializationSet {
         block: block.clone(),
-        id: root_cell.repr_hash(),
+        id: root_cell.repr_hash().clone(),
         status: BlockProcessingStatus::Finalized,
         boc: Vec::new(),
     };
@@ -1968,7 +1977,7 @@ pub fn debug_transaction(transaction: Transaction) -> Result<String> {
     let root_cell = transaction.serialize()?;
     let set = TransactionSerializationSetEx {
         transaction: &transaction,
-        id: &root_cell.repr_hash(),
+        id: root_cell.repr_hash(),
         status: TransactionProcessingStatus::Finalized,
         block_id: None,
         workchain_id: None,
@@ -2307,7 +2316,7 @@ pub fn debug_message(message: Message) -> Result<String> {
     let root_cell = message.serialize()?;
     let set = MessageSerializationSet {
         message,
-        id: root_cell.repr_hash(),
+        id: root_cell.repr_hash().clone(),
         block_id: None,
         transaction_id: None,
         transaction_now: None,

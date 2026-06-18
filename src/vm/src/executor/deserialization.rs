@@ -418,12 +418,22 @@ fn sdcut(engine: &mut Engine, bits: u8, refs: u8) -> Status {
         fail!(ExceptionCode::CellUnderflow);
     }
     match refs {
-        DROP | UPTO => slice.shrink_references(..r0),
-        FROM => slice.shrink_references(r0..),
-        FROM_SIZE => slice.shrink_references(r0..r0 + r1),
-        LAST => slice.shrink_references(refs_count - r0..),
-        NOT_LAST => slice.shrink_references(..refs_count - r0),
-        _ => vec![],
+        DROP | UPTO => {
+            slice.shrink_references(..r0)?;
+        }
+        FROM => {
+            slice.shrink_references(r0..)?;
+        }
+        FROM_SIZE => {
+            slice.shrink_references(r0..r0 + r1)?;
+        }
+        LAST => {
+            slice.shrink_references(refs_count - r0..)?;
+        }
+        NOT_LAST => {
+            slice.shrink_references(..refs_count - r0)?;
+        }
+        _ => {}
     };
     match bits {
         FROM => slice.shrink_data(l0..),
@@ -779,9 +789,9 @@ fn split(engine: &mut Engine, name: &'static str, quiet: bool) -> Status {
         }
     }
     let mut slice1 = slice.clone();
-    slice.shrink_references(0..r);
+    slice.shrink_references(0..r)?;
     slice.shrink_data(0..l);
-    slice1.shrink_references(r..);
+    slice1.shrink_references(r..)?;
     slice1.shrink_data(l..);
     engine.cc.stack.push(StackItem::Slice(slice));
     engine.cc.stack.push(StackItem::Slice(slice1));
@@ -830,7 +840,7 @@ fn datasize(engine: &mut Engine, name: &'static str, how: u8) -> Status {
     }
     let result = loop {
         let Some(cell) = cell_stack.pop() else { break true };
-        if visited.insert(cell.repr_hash()) {
+        if visited.insert(cell.repr_hash().clone()) {
             if max == cells {
                 break false;
             }

@@ -189,9 +189,7 @@ pub mod u64_as_str_or_num {
 
     #[cfg(test)]
     mod tests {
-        use serde::{Deserialize, Serialize};
-
-        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
         struct Wrapper {
             #[serde(with = "super")]
             value: u64,

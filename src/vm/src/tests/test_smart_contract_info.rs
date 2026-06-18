@@ -9,7 +9,11 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use super::*;
-use ton_block::{base64_decode, read_single_root_boc, ton_method_id};
+use ton_block::{
+    base64_decode, read_single_root_boc, read_single_root_boc_file, ton_method_id, Coins,
+    ConfigParam18, ConfigParamEnum, CurrencyCollection, Deserializable, InternalMessageHeader,
+    Message, MsgAddressInt, ShardAccount, StoragePrices,
+};
 
 #[test]
 fn test_smart_contract_info_serialization_default() {
@@ -33,16 +37,86 @@ fn test_smart_contract_info() {
 }
 
 #[test]
+fn test_smart_contract_info_internal_message_info_uses_fwd_fee() {
+    let src: MsgAddressInt =
+        "0:cd9c066feaf8e26f56005510b510eebcf0b36e7527343b1cc9ae9286ee018ba7".parse().unwrap();
+    let dst: MsgAddressInt =
+        "0:448f07b4f2867fcf9aba8944ef9f697782d247e3872ef1cdbb72f5442e32bdd8".parse().unwrap();
+    let mut hdr = InternalMessageHeader::with_addresses_and_bounce(
+        src,
+        dst,
+        CurrencyCollection::with_coins(10_000_000),
+        true,
+    );
+    hdr.fwd_fee = Coins::from(1_408_000u64);
+    hdr.created_lt = 68978789000002;
+    hdr.created_at = 1775439477;
+
+    let sci = SmartContractInfo {
+        in_msg: Some(Message::with_int_header(hdr)),
+        incoming_value: CurrencyCollection::with_coins(10_000_000),
+        ..Default::default()
+    };
+
+    let msg_info = sci.get_message_info();
+    let info = msg_info.as_tuple().unwrap();
+    assert_eq!(info[3].as_integer().unwrap().to_str_radix(10), "1408000");
+    assert_eq!(info[6].as_integer().unwrap().to_str_radix(10), "10000000");
+    assert_eq!(info[7].as_integer().unwrap().to_str_radix(10), "10000000");
+}
+
+#[test]
+fn test_unpacked_config_tuple_uses_latest_storage_price_by_utime_since() {
+    let mut config = ConfigParams::default();
+    let mut cp18 = ConfigParam18::default();
+    cp18.insert(&StoragePrices {
+        utime_since: 100,
+        bit_price_ps: 1,
+        cell_price_ps: 2,
+        mc_bit_price_ps: 3,
+        mc_cell_price_ps: 4,
+    })
+    .unwrap();
+    cp18.insert(&StoragePrices {
+        utime_since: 200,
+        bit_price_ps: 10,
+        cell_price_ps: 20,
+        mc_bit_price_ps: 30,
+        mc_cell_price_ps: 40,
+    })
+    .unwrap();
+    config.set_config(ConfigParamEnum::ConfigParam18(cp18)).unwrap();
+
+    let sci = SmartContractInfo { unix_time: 250, config_params: config, ..Default::default() };
+    let tuple = sci.get_unpacked_config_tuple();
+    let storage_price = tuple.tuple_item_ref(0).unwrap().as_slice().unwrap();
+    let mut storage_price = storage_price.clone();
+    let actual = StoragePrices::construct_from(&mut storage_price).unwrap();
+
+    assert_eq!(actual.utime_since, 200);
+    assert_eq!(actual.bit_price_ps, 10);
+}
+
+#[test]
 fn test_run_get_method_seqno_with_config() {
     let mc_state_name = "../block/src/tests/data/free-ton-mc-state-61884";
-    let mc_state_cell = Cell::read_from_file(mc_state_name);
+    let mc_state_cell = read_single_root_boc_file(mc_state_name).unwrap();
     let method_id = ton_method_id("seqno");
     assert_eq!(method_id, 0x14C97);
 
     let mc_state = ShardStateUnsplit::construct_from_cell(mc_state_cell.clone()).unwrap();
     let shard_account = mc_state.read_accounts().unwrap().get(&[0x55; 32].into()).unwrap().unwrap();
-    let result =
-        run_smc_method(&shard_account, mc_state_cell.clone(), method_id, Vec::new()).unwrap();
+    let result = run_smc_method(
+        &shard_account.read_account().unwrap(),
+        mc_state_cell.clone(),
+        method_id,
+        Vec::new(),
+        mc_state.gen_time(),
+        mc_state.gen_lt(),
+    )
+    .unwrap()
+    .into_run_result()
+    .unwrap();
     assert_eq!(result.exit_code, 0);
     assert_eq!(result.gas_used, 869);
     assert_eq!(result.stack.len(), 1);
@@ -52,7 +126,7 @@ fn test_run_get_method_seqno_with_config() {
 #[test]
 fn test_run_get_method_seqno_with_elector() {
     let mc_state_name = "../block/src/tests/data/free-ton-mc-state-61884";
-    let mc_state_cell = Cell::read_from_file(mc_state_name);
+    let mc_state_cell = read_single_root_boc_file(mc_state_name).unwrap();
     let method_id = ton_method_id("seqno");
     assert_eq!(method_id, 0x14C97);
 
@@ -62,8 +136,17 @@ fn test_run_get_method_seqno_with_elector() {
     // let account = base64_decode(account).unwrap();
     // let account = ton_block::Account::construct_from_bytes(&account).unwrap();
     // let shard_account = ShardAccount::with_params(&account, Default::default(), 0).unwrap();
-    let result =
-        run_smc_method(&shard_account, mc_state_cell.clone(), method_id, Vec::new()).unwrap();
+    let result = run_smc_method(
+        &shard_account.read_account().unwrap(),
+        mc_state_cell.clone(),
+        method_id,
+        Vec::new(),
+        mc_state.gen_time(),
+        mc_state.gen_lt(),
+    )
+    .unwrap()
+    .into_run_result()
+    .unwrap();
     assert_eq!(result.exit_code, 11);
     assert_eq!(result.gas_used, 770);
     assert_eq!(result.stack.len(), 1);
@@ -166,7 +249,7 @@ fn load_elector_shard_account() -> ShardAccount {
 
 fn load_mc_state_cell() -> Cell {
     let mc_state_name = "../block/src/tests/data/free-ton-mc-state-61884";
-    Cell::read_from_file(mc_state_name)
+    read_single_root_boc_file(mc_state_name).unwrap()
 }
 
 fn run_elector_method(
@@ -175,8 +258,19 @@ fn run_elector_method(
 ) -> ton_api::ton::smc::runresult::RunResult {
     let shard_account = load_elector_shard_account();
     let mc_state_cell = load_mc_state_cell();
+    let mc_state = ShardStateUnsplit::construct_from_cell(mc_state_cell.clone()).unwrap();
     let method_id = ton_method_id(method);
-    run_smc_method(&shard_account, mc_state_cell, method_id, stack).unwrap()
+    run_smc_method(
+        &shard_account.read_account().unwrap(),
+        mc_state_cell,
+        method_id,
+        stack,
+        mc_state.gen_time(),
+        mc_state.gen_lt(),
+    )
+    .unwrap()
+    .into_run_result()
+    .unwrap()
 }
 
 fn stack_number(value: i64) -> ton_api::ton::tvm::StackEntry {
@@ -207,8 +301,19 @@ fn run_external_elector_method(
 ) -> ton_api::ton::smc::runresult::RunResult {
     let shard_account = load_external_elector_shard_account();
     let mc_state_cell = load_mc_state_cell();
+    let mc_state = ShardStateUnsplit::construct_from_cell(mc_state_cell.clone()).unwrap();
     let method_id = ton_method_id(method);
-    run_smc_method(&shard_account, mc_state_cell, method_id, stack).unwrap()
+    run_smc_method(
+        &shard_account.read_account().unwrap(),
+        mc_state_cell,
+        method_id,
+        stack,
+        mc_state.gen_time(),
+        mc_state.gen_lt(),
+    )
+    .unwrap()
+    .into_run_result()
+    .unwrap()
 }
 
 fn first_external_participant_pubkey_and_wallet() -> (String, String) {
@@ -381,6 +486,50 @@ fn test_convert_stack() {
     let result = convert_ton_stack(&items).unwrap();
     assert_eq!(result.len(), 1);
     assert_eq!(result[0], tuple);
+}
+
+#[test]
+fn test_convert_stack_slice_roundtrip_preserves_msg_addr_bit_len() {
+    let owner: MsgAddressInt = "EQAW-1_rm44ppdD6qzcSSyZDAZH-KwldLeXmb2uTH6-WSkG0".parse().unwrap();
+    let owner_slice = owner.write_to_bitstring().unwrap();
+    assert_eq!(owner_slice.remaining_bits(), 267);
+
+    let items = convert_stack(&[StackItem::slice(owner_slice)]).unwrap();
+    let roundtrip = convert_ton_stack(&items).unwrap();
+
+    assert_eq!(roundtrip.len(), 1);
+
+    let roundtrip_slice = match &roundtrip[0] {
+        StackItem::Slice(s) => s.clone(),
+        other => panic!("expected slice, got {:?}", other),
+    };
+
+    assert_eq!(roundtrip_slice.remaining_bits(), 267);
+
+    let mut slice = roundtrip_slice;
+    let parsed = MsgAddressInt::construct_from(&mut slice).unwrap();
+    assert_eq!(parsed, owner);
+    assert_eq!(slice.remaining_bits(), 0);
+}
+
+#[test]
+fn test_convert_stack_slice_roundtrip_preserves_slice_window() {
+    let mut source = SliceData::from_raw(vec![0b1010_1100, 0b1111_0000], 16);
+    source.move_by(3).unwrap();
+    let slice = source.get_slice(0, 7).unwrap();
+
+    let items = convert_stack(&[StackItem::slice(slice.clone())]).unwrap();
+    let roundtrip = convert_ton_stack(&items).unwrap();
+
+    let roundtrip_slice = match &roundtrip[0] {
+        StackItem::Slice(s) => s.clone(),
+        other => panic!("expected slice, got {:?}", other),
+    };
+
+    assert_eq!(roundtrip_slice.remaining_bits(), slice.remaining_bits());
+    for bit in 0..slice.remaining_bits() {
+        assert_eq!(roundtrip_slice.get_bit(bit).unwrap(), slice.get_bit(bit).unwrap());
+    }
 }
 
 #[test]

@@ -27,7 +27,7 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- if .Values.serviceAccount.enabled }}
+      {{- if or .Values.serviceAccount.enabled .Values.serviceAccount.name }}
       serviceAccountName: {{ include "nodectl.serviceAccountName" . }}
       {{- end }}
       {{- with .Values.nodeSelector }}

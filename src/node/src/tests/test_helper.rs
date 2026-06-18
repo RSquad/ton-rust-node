@@ -28,8 +28,8 @@ use crate::{
     validator::{
         accept_block::create_top_shard_block_description,
         collator::{CollateResult, Collator},
+        state_resolver_cache::StateResolverCache,
         validate_query::ValidateQuery,
-        validator_group::PipelineContext,
         validator_utils::{compute_validator_set_cc, PrevBlockHistory},
         BlockCandidate,
     },
@@ -37,7 +37,6 @@ use crate::{
 #[cfg(feature = "telemetry")]
 use crate::{collator_test_bundle::create_engine_telemetry, engine_traits::EngineTelemetry};
 use std::{
-    collections::HashSet,
     fs::copy,
     future::Future,
     path::Path,
@@ -53,10 +52,10 @@ use ton_block::{
     error, write_boc, Account, AccountId, AccountIdPrefixFull, AccountStorage, BlkMasterInfo,
     Block, BlockIdExt, BlockSignatures, BlockSignaturesVariant, Cell, ConfigParam0, ConfigParam34,
     ConfigParamEnum, ConfigParams, CurrencyCollection, Deserializable, HashmapAugType, HashmapType,
-    InMsgDescr, InRefValue, Libraries, McStateExtra, Message, MsgAddressInt, OutMsgDescr,
-    OutMsgQueue, Serializable, ShardAccount, ShardAccountBlocks, ShardIdent, ShardStateUnsplit,
-    SliceData, StateInit, StorageInfo, TickTock, Transaction, UInt15, UInt256, ValidatorBaseInfo,
-    ValidatorDescr, ValidatorSet,
+    InMsgDescr, InRefValue, Libraries, McStateExtra, Message, MsgAddressInt, OldMcBlocksInfo,
+    OutMsgDescr, OutMsgQueue, Serializable, ShardAccount, ShardAccountBlocks, ShardIdent,
+    ShardStateUnsplit, SliceData, StateInit, StorageInfo, TickTock, Transaction, UInt15, UInt256,
+    ValidatorBaseInfo, ValidatorDescr, ValidatorSet,
 };
 use ton_block_json::*;
 
@@ -344,6 +343,8 @@ pub struct GenMasterStateParams<'a> {
     pub master_state_id: Option<BlockIdExt>,
     pub accounts: &'a [&'a Account],
     pub libraries: Libraries,
+    pub prev_blocks: Option<OldMcBlocksInfo>,
+    pub after_key_block: bool,
 }
 
 impl Default for GenMasterStateParams<'_> {
@@ -354,6 +355,8 @@ impl Default for GenMasterStateParams<'_> {
             master_state_id: None,
             accounts: &[],
             libraries: Libraries::default(),
+            prev_blocks: None,
+            after_key_block: false,
         }
     }
 }
@@ -386,6 +389,10 @@ pub fn gen_master_state(
         ms.config.set_config(ConfigParamEnum::ConfigParam34(param)).unwrap();
     }
 
+    if let Some(prev_blocks) = params.prev_blocks {
+        ms.prev_blocks = prev_blocks;
+    }
+    ms.after_key_block = params.after_key_block;
     if let Some(shard_state_id) = params.shard_state_id {
         ms.shards
             .add_workchain(0, 0, shard_state_id.root_hash.clone(), shard_state_id.file_hash.clone())
@@ -405,7 +412,7 @@ pub fn gen_master_state(
         BlockIdExt::with_params(
             ShardIdent::masterchain(),
             0,
-            cell.repr_hash(),
+            cell.repr_hash().clone(),
             UInt256::calc_file_hash(&bytes),
         )
     });
@@ -470,7 +477,7 @@ pub fn gen_shard_state(
         let shard_state_id = BlockIdExt::with_params(
             ShardIdent::full(0),
             0,
-            cell.repr_hash(),
+            cell.repr_hash().clone(),
             UInt256::calc_file_hash(&bytes),
         );
         let shard_state = ShardStateStuff::deserialize_zerostate(
@@ -519,7 +526,7 @@ pub async fn get_config(
         vec![NodeNetwork::TAG_DHT_KEY, NodeNetwork::TAG_OVERLAY_KEY],
         Some(resolved_ip),
     )?;
-    TonNodeConfig::from_file(config_dir, config_file, Some(adnl_config), default, None)
+    TonNodeConfig::from_file(config_dir, config_file, Some(adnl_config), default, None).await
 }
 
 pub async fn test_async(test: impl Fn() -> Pinned<'static, ()>, done: impl Fn()) {
@@ -565,6 +572,7 @@ impl TestEngine {
                 false,
                 false,
                 false,
+                None,
                 &|| Ok(()),
                 None,
                 Arc::new(AtomicU8::new(0)),
@@ -590,7 +598,7 @@ impl TestEngine {
             db,
             res_path: res_path.map(|s| s.to_string()),
             now: AtomicU32::new(0),
-            ext_messages: Arc::new(MessagesPool::new(0, None)),
+            ext_messages: Arc::new(MessagesPool::new(0, None).0),
             shard_states: Default::default(),
             check_only_transactions: false,
             check_only_masterchain: false,
@@ -803,6 +811,7 @@ impl TestEngine {
             block_stuff.id().shard().clone(),
             min_mc_seqno,
             prev_blocks_ids.clone(),
+            None,
             block_candidate,
             validator_set.clone(),
             self.clone(),
@@ -822,8 +831,8 @@ impl TestEngine {
     ) -> Result<()> {
         let info = block_stuff.block()?.read_info()?;
         let extra = block_stuff.block()?.read_extra()?;
-        let (_, block_id) = info.read_master_id()?.master_block_id();
-        self.save_last_applied_mc_block_id(&block_id)?;
+        let (_, mc_state_id) = info.read_master_id()?.master_block_id();
+        self.save_last_applied_mc_block_id(&mc_state_id)?;
 
         let min_mc_seqno = info.min_ref_mc_seqno() - 1;
 
@@ -844,6 +853,7 @@ impl TestEngine {
             block_stuff.id().shard().clone(),
             min_mc_seqno,
             prev_blocks_ids.clone(),
+            None,
             block_candidate,
             validator_set.clone(),
             self.clone(),
@@ -860,7 +870,7 @@ impl TestEngine {
             block_stuff.id().shard().clone(),
             min_mc_seqno,
             &prev,
-            PipelineContext::new(),
+            Arc::new(tokio::sync::Mutex::new(StateResolverCache::new())),
             validator_set.clone(),
             extra.created_by().clone(),
             self.clone(),
@@ -868,7 +878,7 @@ impl TestEngine {
             Default::default(),
         )?;
 
-        let (block_candidate, new_state) = match collator.collate().await? {
+        let (block_candidate, new_state) = match collator.collate(&mc_state_id).await? {
             CollateResult::Ok { candidate, new_state, .. } => (candidate, new_state),
             CollateResult::Err { err, .. } => return Err(err),
         };
@@ -954,6 +964,7 @@ impl TestEngine {
             block_stuff.id().shard().clone(),
             min_mc_seqno,
             prev_blocks_ids,
+            None,
             block_candidate.clone(),
             validator_set,
             self.clone(),
@@ -1244,8 +1255,8 @@ impl EngineOperations for TestEngine {
     }
     fn complete_external_messages(
         &self,
-        to_delay: Vec<(UInt256, String)>,
-        to_delete: Vec<(UInt256, i32)>,
+        to_delay: &[UInt256],
+        to_delete: &[UInt256],
     ) -> Result<()> {
         self.ext_messages.complete_messages(to_delay, to_delete, self.now())
     }
@@ -1277,7 +1288,7 @@ impl EngineOperations for TestEngine {
         _before_split_block: &BlockIdExt,
         _queue0: OutMsgQueue,
         _queue1: OutMsgQueue,
-        _visited_cells: HashSet<UInt256>,
+        _visited_cells: ahash::AHashSet<UInt256>,
     ) {
     }
 

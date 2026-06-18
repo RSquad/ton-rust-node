@@ -21,8 +21,8 @@ use crate::{
         accept_block::create_top_shard_block_description,
         collator::{CollateResult, Collator},
         out_msg_queue::{OutMsgQueueInfoStuff, StatesManager},
+        state_resolver_cache::StateResolverCache,
         validate_query::ValidateQuery,
-        validator_group::PipelineContext,
         validator_utils::{compute_validator_set_cc, PrevBlockHistory},
         BlockCandidate, CollatorSettings,
     },
@@ -46,9 +46,9 @@ use storage::{
     StorageAlloc,
 };
 use ton_block::{
-    error, fail, read_boc, read_single_root_boc, AccountIdPrefixFull, BlockIdExt, BlockSignatures,
-    BlockSignaturesPure, BlockSignaturesVariant, Cell, CellType, ConfigParam8, ConfigParamEnum,
-    CurrencyCollection, Deserializable, Error, FundamentalSmcAddresses, HashmapAugType,
+    error, fail, read_boc, read_single_root_boc, AccountId, AccountIdPrefixFull, BlockExtra,
+    BlockIdExt, BlockSignatures, BlockSignaturesPure, BlockSignaturesVariant, Cell, CellType,
+    ConfigParam8, ConfigParamEnum, CurrencyCollection, Deserializable, Error, HashmapAugType,
     HashmapType, MerkleProof, Message, OutMsgQueue, Result, Serializable, ShardIdent,
     ShardStateUnsplit, TopBlockDescr, TopBlockDescrSet, UInt256, UsageTree, ValidatorBaseInfo,
     ValidatorSet,
@@ -162,7 +162,7 @@ fn construct_from_file<T: Deserializable>(path: &str) -> Result<(T, UInt256, UIn
     let bytes = std::fs::read(path)?;
     let fh = UInt256::calc_file_hash(&bytes);
     let cell = read_single_root_boc(&bytes)?;
-    let rh = cell.repr_hash();
+    let rh = cell.repr_hash().clone();
     Ok((T::construct_from_cell(cell)?, fh, rh))
 }
 
@@ -197,11 +197,20 @@ pub fn create_engine_telemetry() -> Arc<EngineTelemetry> {
         awaiters: Metric::without_totals("", 1),
         catchain_clients: Metric::without_totals("", 1),
         cells: Metric::without_totals("", 1),
+        cells_mb: Metric::without_totals("", 1),
+        arena_cells: Metric::without_totals("", 1),
+        arena_bytes_mb: Metric::without_totals("", 1),
         shard_states: Metric::without_totals("", 1),
         top_blocks: Metric::without_totals("", 1),
         validator_adnl_keys: Metric::without_totals("", 1),
         validator_peers: Metric::without_totals("", 1),
         validator_sets: Metric::without_totals("", 1),
+        account_state_cache_mb: Metric::without_totals("", 1),
+        storage_dicts_cache_cells: Metric::without_totals("", 1),
+        jemalloc_allocated_mb: Metric::without_totals("", 1),
+        jemalloc_resident_mb: Metric::without_totals("", 1),
+        jemalloc_mapped_mb: Metric::without_totals("", 1),
+        jemalloc_retained_mb: Metric::without_totals("", 1),
     })
 }
 
@@ -215,6 +224,7 @@ pub fn create_engine_allocated() -> Arc<EngineAlloc> {
         validator_adnl_keys: Arc::new(AtomicU64::new(0)),
         validator_peers: Arc::new(AtomicU64::new(0)),
         validator_sets: Arc::new(AtomicU64::new(0)),
+        account_state_cache_bytes: Arc::new(AtomicU64::new(0)),
     })
 }
 
@@ -351,13 +361,12 @@ impl CollatorTestBundle {
                 &allocated,
             )
         } else {
-            ShardStateStuff::deserialize_state_inmem(
+            ShardStateStuff::deserialize_state(
                 ss_id.clone(),
-                Arc::new(data),
+                &data,
                 #[cfg(feature = "telemetry")]
                 &telemetry,
                 &allocated,
-                &|| false,
             )
         }
     }
@@ -433,13 +442,12 @@ impl CollatorTestBundle {
                     &allocated,
                 )?
             } else {
-                ShardStateStuff::deserialize_state_inmem(
+                ShardStateStuff::deserialize_state(
                     ss_id.clone(),
-                    Arc::new(data),
+                    &data,
                     #[cfg(feature = "telemetry")]
                     &telemetry,
                     &allocated,
-                    &|| false,
                 )?
             };
             states.insert(ss_id.clone(), ss);
@@ -582,6 +590,7 @@ impl CollatorTestBundle {
         state_proofs: &mut HashMap<BlockIdExt, MerkleProof>,
         id: &BlockIdExt,
         block_opt: Option<&BlockStuff>,
+        smc_addresses: HashSet<AccountId>,
     ) -> Result<()> {
         Self::add_simplified_state(
             states_manager.get_state(id, None).await?.root_cell(),
@@ -591,11 +600,12 @@ impl CollatorTestBundle {
             None,
             None,
             false,
+            smc_addresses,
         )
     }
-    fn use_extra_cc(cc: &CurrencyCollection, sub_trees: &mut HashSet<UInt256>) {
+    fn use_extra_cc(sub_trees: &mut HashSet<UInt256>, cc: &CurrencyCollection) {
         if let Some(cell) = cc.other.root() {
-            sub_trees.insert(cell.repr_hash());
+            sub_trees.insert(cell.repr_hash().clone());
         }
     }
     fn add_simplified_state(
@@ -606,6 +616,7 @@ impl CollatorTestBundle {
         usage_tree_opt: Option<&UsageTree>,
         min_ref_mc_seqno: Option<u32>,
         include_libs: bool,
+        mut smc_addresses: HashSet<AccountId>,
     ) -> Result<()> {
         if state_proofs.get(id).is_some() {
             assert!(min_ref_mc_seqno.is_none());
@@ -620,11 +631,11 @@ impl CollatorTestBundle {
         let usage_tree = usage_tree_opt.unwrap_or(&usage_tree_local);
         let state_root = usage_tree.use_cell(state_root.clone(), false);
         let state = ShardStateUnsplit::construct_from_cell(state_root.clone())?;
-        let mut sub_trees = HashSet::new();
-        Self::use_extra_cc(state.total_balance(), &mut sub_trees);
-        Self::use_extra_cc(state.total_validator_fees(), &mut sub_trees);
         let accounts = state.read_accounts()?;
-        let mut smc_addresses = FundamentalSmcAddresses::default();
+        let mut sub_trees = HashSet::new();
+        Self::use_extra_cc(&mut sub_trees, state.total_balance());
+        Self::use_extra_cc(&mut sub_trees, state.total_validator_fees());
+        Self::use_extra_cc(&mut sub_trees, accounts.root_extra().balance());
         if let Some(mut custom) = state.read_custom()? {
             if let Some(min_ref_mc_seqno) = min_ref_mc_seqno {
                 for mc_seqno in min_ref_mc_seqno..id.seq_no {
@@ -634,10 +645,15 @@ impl CollatorTestBundle {
                 custom.prev_blocks.set(&id.seq_no, &Default::default(), &Default::default())?;
 
                 // get all system contracts
-                smc_addresses = custom.config().fundamental_smc_addr()?;
-                smc_addresses.add_key(&custom.config().minter_address()?)?;
-                smc_addresses.add_key(&custom.config().config_address()?)?;
-                smc_addresses.add_key(&custom.config().elector_address()?)?;
+                custom.config().fundamental_smc_addr()?.iterate_slices_with_keys(
+                    |account_id, _| {
+                        smc_addresses.insert(account_id);
+                        Ok(true)
+                    },
+                )?;
+                smc_addresses.insert(custom.config().minter_address()?);
+                smc_addresses.insert(custom.config().config_address()?);
+                smc_addresses.insert(custom.config().elector_address()?);
                 ton_vm::SmartContractInfo::with_params(None, None, Some(state_root.clone()))
                     .unwrap()
                     .as_temp_data_item();
@@ -649,7 +665,7 @@ impl CollatorTestBundle {
             for i in 0..cell.references_count() {
                 let child = cell.reference(i)?;
                 for j in 0..child.references_count() {
-                    sub_trees.insert(child.reference(j)?.repr_hash());
+                    sub_trees.insert(child.reference(j)?.repr_hash().clone());
                 }
             }
         }
@@ -657,32 +673,33 @@ impl CollatorTestBundle {
         if let Some(block) = block_opt {
             let extra = block.block()?.read_extra()?;
             extra.read_account_blocks()?.iterate_slices(|account_id, _| {
-                smc_addresses.add_key_serialized(account_id)?;
+                smc_addresses.insert(account_id);
                 Ok(true)
             })?;
             // load all work cells
             // log::trace!("traverse accounts");
             // accounts.len()?;
         }
-        smc_addresses.iterate_slices_with_keys(|account_id, _| {
-            if let (Some(leaf), _) = accounts.clone().set_builder_serialized(
+        // Simulate dict modification (not just read) so usage_tree captures
+        // siblings of the access path needed by put_to_fork during finalize_block.
+        for account_id in smc_addresses {
+            let (leaf, _) = accounts.clone().set_builder_serialized(
                 account_id,
                 &Default::default(),
                 &Default::default(),
-            )? {
-                // if let Some(leaf) = accounts.get_serialized_raw(account_id)? {
-                sub_trees.insert(leaf.cell()?.repr_hash());
+            )?;
+            if let Some(leaf) = leaf {
+                sub_trees.insert(leaf.cell()?.repr_hash().clone());
             }
-            Ok(true)
-        })?;
+        }
 
         // don't prune out_msg_queue_info - it could be very big
-        let hash = state.out_msg_queue_info_cell().repr_hash();
+        let hash = state.out_msg_queue_info_cell().repr_hash().clone();
         sub_trees.insert(hash);
         // TODO: libraries can become too big - then libraries proof should be added instead of full libraries
         if let Some(libs) = state.libraries().root() {
             if include_libs {
-                sub_trees.insert(libs.repr_hash());
+                sub_trees.insert(libs.repr_hash().clone());
             }
         }
         let proof = MerkleProof::create_with_subtrees(
@@ -711,12 +728,13 @@ impl CollatorTestBundle {
         engine: &Arc<dyn EngineOperations>,
         prev_blocks_ids: Vec<BlockIdExt>,
         usage_tree_opt: Option<UsageTree>,
+        mut external_messages: Vec<(Arc<Message>, UInt256)>,
     ) -> Result<Self> {
         log::info!("Building for furure block, prev[0]: {}", prev_blocks_ids[0]);
 
         // TODO: fill caches states
         let mut states_manger =
-            StatesManager::with_collator_data(engine.clone(), PipelineContext::new(), false)?;
+            StatesManager::with_collator_data(engine.clone(), Vec::new(), false)?;
 
         let mut state_proofs = HashMap::new();
         let is_master = prev_blocks_ids[0].shard().is_masterchain();
@@ -731,8 +749,13 @@ impl CollatorTestBundle {
         //
         // last mc state
         //
-        let mc_state = engine.load_last_applied_mc_state().await?;
-        let last_mc_id = mc_state.block_id().clone();
+        let last_mc_id = if is_master {
+            prev_blocks_ids[0].clone()
+        } else {
+            let block = Self::load_block_by_id(engine, &prev_blocks_ids[0]).await?;
+            block.get_master_id()?.master_block_id().1
+        };
+        let mc_state = engine.load_state(&last_mc_id).await?;
 
         //
         // top shard blocks
@@ -744,10 +767,17 @@ impl CollatorTestBundle {
         };
 
         //
+        // additional accounts by accepted external messages
+        //
+        let smc_addresses = external_messages
+            .iter()
+            .filter_map(|(msg, _)| msg.int_dst_account_id().cloned())
+            .collect::<HashSet<_>>();
+
+        //
         // external messages
         //
-        let external_messages =
-            engine.get_external_messages_iterator(shard.clone(), 0).collect::<Vec<_>>();
+        external_messages.extend(engine.get_external_messages_iterator(shard.clone(), 0));
 
         //
         // prev states
@@ -758,9 +788,10 @@ impl CollatorTestBundle {
             // try to collate block
             let result = try_collate(
                 engine.clone(),
+                &last_mc_id,
                 shard.clone(),
                 prev_blocks_ids.clone(),
-                PipelineContext::new(),
+                None,
                 None,
                 None,
                 #[cfg(test)]
@@ -831,6 +862,7 @@ impl CollatorTestBundle {
                 &mut state_proofs,
                 shard.block_id(),
                 None,
+                smc_addresses.clone(),
             )
             .await?;
             neighbors.push(shard.block_id().clone());
@@ -845,8 +877,14 @@ impl CollatorTestBundle {
         for tsb in top_shard_blocks.iter() {
             let id = tsb.proof_for();
             if !state_proofs.contains_key(id) {
-                Self::load_and_simplify_state(&mut states_manger, &mut state_proofs, id, None)
-                    .await?;
+                Self::load_and_simplify_state(
+                    &mut states_manger,
+                    &mut state_proofs,
+                    id,
+                    None,
+                    smc_addresses.clone(),
+                )
+                .await?;
                 neighbors.push(id.clone());
             }
         }
@@ -877,11 +915,19 @@ impl CollatorTestBundle {
             if is_master { Some(&usage_tree) } else { None },
             Some(oldest_mc_seq_no),
             true,
+            smc_addresses.clone(),
         )?;
         let mut mc_states = vec![mc_state.block_id().clone()];
         for mc_seq_no in oldest_mc_seq_no..newest_mc_seq_no {
             let id = mc_state.find_block_id(mc_seq_no)?;
-            Self::load_and_simplify_state(&mut states_manger, &mut state_proofs, &id, None).await?;
+            Self::load_and_simplify_state(
+                &mut states_manger,
+                &mut state_proofs,
+                &id,
+                None,
+                smc_addresses.clone(),
+            )
+            .await?;
             mc_states.push(id);
         }
 
@@ -945,13 +991,18 @@ impl CollatorTestBundle {
             candidate.block_id.clone(),
             Arc::new(candidate.data.clone()),
         )?;
-        let now = block.block()?.read_info()?.gen_utime();
+        let info = block.block()?.read_info()?;
+        let now = info.gen_utime();
 
         //
         // last mc state
         //
-        let mc_state = engine.load_last_applied_mc_state().await?;
-        let last_mc_id = mc_state.block_id().clone();
+        let last_mc_id = if let Some(mc_ref) = info.read_master_ref()? {
+            mc_ref.master.master_block_id().1
+        } else {
+            info.read_prev_ref()?.prev1()?.master_block_id().1
+        };
+        let mc_state = engine.load_state(&last_mc_id).await?;
         states_manger.insert(&mc_state).await?;
 
         //
@@ -966,9 +1017,7 @@ impl CollatorTestBundle {
         //
         // external messages
         //
-        let external_messages = engine
-            .get_external_messages_iterator(candidate.block_id.shard().clone(), u64::MAX)
-            .collect::<Vec<_>>();
+        let external_messages = Self::collect_ext_msgs(&block.block()?.read_extra()?)?;
 
         //
         // prev states
@@ -995,6 +1044,7 @@ impl CollatorTestBundle {
                 Some(&usage_tree),
                 None,
                 false,
+                Default::default(),
             )?;
             Self::add_simplified_state(
                 other.root_cell(),
@@ -1004,6 +1054,7 @@ impl CollatorTestBundle {
                 Some(&usage_tree),
                 None,
                 false,
+                Default::default(),
             )?;
         } else if !is_master {
             Self::load_and_simplify_state(
@@ -1011,6 +1062,7 @@ impl CollatorTestBundle {
                 &mut state_proofs,
                 &prev.get_prevs()[0],
                 Some(&block),
+                Default::default(),
             )
             .await?;
         }
@@ -1050,6 +1102,7 @@ impl CollatorTestBundle {
                 &mut state_proofs,
                 shard.block_id(),
                 None,
+                Default::default(),
             )
             .await?;
             neighbors.push(shard.block_id().clone());
@@ -1064,8 +1117,14 @@ impl CollatorTestBundle {
         for tsb in top_shard_blocks.iter() {
             let id = tsb.proof_for();
             if !state_proofs.contains_key(id) {
-                Self::load_and_simplify_state(&mut states_manger, &mut state_proofs, id, None)
-                    .await?;
+                Self::load_and_simplify_state(
+                    &mut states_manger,
+                    &mut state_proofs,
+                    id,
+                    None,
+                    Default::default(),
+                )
+                .await?;
                 neighbors.push(id.clone());
                 neighbor_blocks.insert(id.clone(), Self::load_block_by_id(engine, id).await?);
             }
@@ -1097,11 +1156,19 @@ impl CollatorTestBundle {
             None,
             Some(oldest_mc_seq_no),
             true,
+            Default::default(),
         )?;
         let mut mc_states = vec![mc_state.block_id().clone()];
         for mc_seq_no in oldest_mc_seq_no..newest_mc_seq_no {
             let id = mc_state.find_block_id(mc_seq_no)?;
-            Self::load_and_simplify_state(&mut states_manger, &mut state_proofs, &id, None).await?;
+            Self::load_and_simplify_state(
+                &mut states_manger,
+                &mut state_proofs,
+                &id,
+                None,
+                Default::default(),
+            )
+            .await?;
             mc_states.push(id);
         }
 
@@ -1160,7 +1227,7 @@ impl CollatorTestBundle {
 
         // TODO: fill caches states
         let mut states_manger =
-            StatesManager::with_collator_data(engine.clone(), PipelineContext::new(), false)?;
+            StatesManager::with_collator_data(engine.clone(), Vec::new(), false)?;
 
         let mut state_proofs = HashMap::new();
         let is_master = block.id().shard().is_masterchain();
@@ -1202,6 +1269,7 @@ impl CollatorTestBundle {
                 Some(&usage_tree),
                 None,
                 false,
+                Default::default(),
             )?;
             Self::add_simplified_state(
                 other.root_cell(),
@@ -1211,6 +1279,7 @@ impl CollatorTestBundle {
                 Some(&usage_tree),
                 None,
                 false,
+                Default::default(),
             )?;
             prev_blocks_ids.push(merge_block_id);
         } else if !is_master {
@@ -1219,6 +1288,7 @@ impl CollatorTestBundle {
                 &mut state_proofs,
                 &prev_blocks_ids[0],
                 Some(&block),
+                Default::default(),
             )
             .await?;
         }
@@ -1265,17 +1335,7 @@ impl CollatorTestBundle {
         //
         // external messages
         //
-        let mut external_messages = vec![];
-        let mut external_messages_ids = vec![];
-        let in_msgs = extra.read_in_msg_descr()?;
-        in_msgs.iterate_with_keys(|key, in_msg| {
-            let msg = in_msg.read_message()?;
-            if msg.is_inbound_external() {
-                external_messages_ids.push(key.clone());
-                external_messages.push((Arc::new(msg), key));
-            }
-            Ok(true)
-        })?;
+        let external_messages = Self::collect_ext_msgs(&extra)?;
 
         //
         // prev blocks
@@ -1298,6 +1358,7 @@ impl CollatorTestBundle {
                 &mut state_proofs,
                 shard.block_id(),
                 None,
+                Default::default(),
             )
             .await?;
             neighbors.push(shard.block_id().clone());
@@ -1333,18 +1394,26 @@ impl CollatorTestBundle {
             None,
             Some(oldest_mc_seq_no),
             true,
+            Default::default(),
         )?;
         let mut mc_states = vec![mc_state.block_id().clone()];
         for mc_seq_no in oldest_mc_seq_no..newest_mc_seq_no {
             let id = mc_state.find_block_id(mc_seq_no)?;
-            Self::load_and_simplify_state(&mut states_manger, &mut state_proofs, &id, None).await?;
+            Self::load_and_simplify_state(
+                &mut states_manger,
+                &mut state_proofs,
+                &id,
+                None,
+                Default::default(),
+            )
+            .await?;
             mc_states.push(id);
         }
 
         let index = CollatorTestBundleIndex {
             id: block.id().clone(),
             top_shard_blocks: top_shard_blocks_ids,
-            external_messages: external_messages_ids,
+            external_messages: external_messages.iter().map(|(_, id)| id.clone()).collect(),
             last_mc_state: last_mc_id,
             min_ref_mc_seqno: info.min_ref_mc_seqno(),
             mc_states,
@@ -1464,9 +1533,22 @@ impl CollatorTestBundle {
         std::path::Path::new(&path).exists()
     }
 
+    pub fn collect_ext_msgs(extra: &BlockExtra) -> Result<Vec<(Arc<Message>, UInt256)>> {
+        let mut external_messages = vec![];
+        let in_msgs = extra.read_in_msg_descr()?;
+        in_msgs.iterate_with_keys(|key, in_msg| {
+            let msg = in_msg.read_message()?;
+            if msg.is_inbound_external() {
+                external_messages.push((Arc::new(msg), key));
+            }
+            Ok(true)
+        })?;
+        Ok(external_messages)
+    }
+
     fn build_filename(prefix: &str, block_id: &BlockIdExt) -> String {
         format!(
-            "{}/{}.{}_{}_{:x}{:x}{:x}{:x}_collator_test_bundle",
+            "{}/{}.{}_{}_{:02x}{:02x}{:02x}{:02x}_collator_test_bundle",
             prefix,
             block_id.shard().workchain_id(),
             block_id.shard().shard_prefix_as_str_with_tag(),
@@ -1531,6 +1613,10 @@ impl EngineOperations for CollatorTestBundle {
             return Ok(b.clone());
         }
         fail!("bundle doesn't contain block {}", handle.id())
+    }
+
+    fn load_last_applied_mc_block_id(&self) -> Result<Option<Arc<BlockIdExt>>> {
+        Ok(Some(Arc::new(self.index.last_mc_state.clone())))
     }
 
     async fn load_last_applied_mc_state(&self) -> Result<Arc<ShardStateStuff>> {
@@ -1600,8 +1686,8 @@ impl EngineOperations for CollatorTestBundle {
 
     fn complete_external_messages(
         &self,
-        _to_delay: Vec<(UInt256, String)>,
-        _to_delete: Vec<(UInt256, i32)>,
+        _to_delay: &[UInt256],
+        _to_delete: &[UInt256],
     ) -> Result<()> {
         Ok(())
     }
@@ -1632,7 +1718,7 @@ impl EngineOperations for CollatorTestBundle {
         before_split_block: &BlockIdExt,
         queue0: OutMsgQueue,
         queue1: OutMsgQueue,
-        visited_cells: HashSet<UInt256>,
+        visited_cells: ahash::AHashSet<UInt256>,
     ) {
         self.split_queues_cache
             .insert(before_split_block.clone(), Some((queue0, queue1, visited_cells)));
@@ -1652,7 +1738,7 @@ impl EngineOperations for CollatorTestBundle {
     }
 
     fn add_account_storage_dict(&self, dict: Cell, _size: u64) {
-        self.storage_dicts.insert(dict.repr_hash(), dict);
+        self.storage_dicts.insert(dict.repr_hash().clone(), dict);
     }
 
     async fn wait_applied_block(
@@ -1674,18 +1760,31 @@ impl EngineOperations for CollatorTestBundle {
     }
 }
 
+/// Detect whether the simplex consensus protocol is enabled, the same way the node does
+/// (`validator_manager::select_consensus_options`): ConfigParam 30 — `get_mc_simplex_config`
+/// for the masterchain, `get_shard_simplex_config` otherwise. Present → simplex, absent → catchain.
+fn detect_simplex(mc_state: &ShardStateStuff, shard: &ShardIdent) -> Result<bool> {
+    let config = mc_state.config_params()?;
+    Ok(if shard.is_masterchain() {
+        config.get_mc_simplex_config()?.is_some()
+    } else {
+        config.get_shard_simplex_config()?.is_some()
+    })
+}
+
 pub async fn try_collate(
     engine: Arc<dyn EngineOperations>,
+    mc_state_id: &BlockIdExt,
     shard: ShardIdent,
     prev_blocks_ids: Vec<BlockIdExt>,
-    pipeline_context: PipelineContext,
+    state_resolver_cache: Option<Arc<tokio::sync::Mutex<StateResolverCache>>>,
     created_by_opt: Option<UInt256>,
     rand_seed_opt: Option<UInt256>,
     #[cfg(test)] is_bundle: bool,
     check_validation: bool,
     lt_compatible: bool,
 ) -> Result<CollateResult> {
-    let mc_state = engine.load_last_applied_mc_state().await?;
+    let mc_state = engine.load_state(mc_state_id).await?;
     let mc_state_extra = mc_state.shard_state_extra()?;
     let prev_blocks_history = PrevBlockHistory::with_prevs(&shard, prev_blocks_ids);
     let mut cc_seqno_with_delta = 0;
@@ -1707,12 +1806,22 @@ pub async fn try_collate(
 
     log::info!("TRY COLLATE block {}", shard);
 
+    // A caller-provided state resolver cache forces the simplex pipeline (used by tests that
+    // collate against a synthetic engine without an on-chain consensus config); otherwise fall
+    // back to detecting simplex from ConfigParam 30, like the node does.
+    let is_simplex = state_resolver_cache.is_some() || detect_simplex(&mc_state, &shard)?;
+    let state_resolver_cache = state_resolver_cache
+        .unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(StateResolverCache::new())));
+
     let min_mc_seqno = if prev_blocks_history.get_prevs()[0].seq_no() == 0 {
         0
-    } else if let Some(prev_state) = pipeline_context.states().iter().last() {
-        prev_state.state()?.min_ref_mc_seqno()
     } else {
-        let state = engine.load_state(&prev_blocks_history.get_prevs()[0]).await?;
+        let prev_id = &prev_blocks_history.get_prevs()[0];
+        let cached_state = state_resolver_cache.lock().await.try_get_state(prev_id);
+        let state = match cached_state {
+            Some(s) => s,
+            None => engine.load_state(prev_id).await?,
+        };
         state.state()?.min_ref_mc_seqno()
     };
 
@@ -1720,20 +1829,21 @@ pub async fn try_collate(
         #[cfg(test)]
         is_bundle,
         lt_compatible,
+        is_simplex,
         ..Default::default()
     };
     let collator = Collator::new(
         shard.clone(),
         min_mc_seqno,
         &prev_blocks_history,
-        pipeline_context,
+        state_resolver_cache,
         validator_set.clone(),
         created_by_opt.unwrap_or_default(),
         engine.clone(),
         rand_seed_opt,
         collator_settings,
     )?;
-    let collate_result = collator.collate().await?;
+    let collate_result = collator.collate(mc_state_id).await?;
     if check_validation {
         if let CollateResult::Ok { candidate, .. } = &collate_result {
             // let new_block = Block::construct_from_bytes(&candidate.data).unwrap();
@@ -1744,12 +1854,13 @@ pub async fn try_collate(
                 shard.clone(),
                 min_mc_seqno,
                 prev_blocks_history.get_prevs().to_vec(),
+                None,
                 candidate.clone(),
                 validator_set.clone(),
                 engine,
                 true,
                 true,
-                false,
+                is_simplex,
             );
             validator_query.try_validate().await?;
         }
@@ -1770,7 +1881,12 @@ pub async fn try_validate(
     let prev_blocks_ids = info.read_prev_ids()?;
     let shard = block_stuff.id().shard().clone();
     let min_mc_seqno = info.min_ref_mc_seqno() - 1;
-    let mc_state = engine.load_last_applied_mc_state().await?;
+    let mc_state_id = if shard.is_masterchain() {
+        prev_blocks_ids[0].clone()
+    } else {
+        info.read_master_id()?.master_block_id().1
+    };
+    let mc_state = engine.load_state(&mc_state_id).await?;
     let mc_state_extra = mc_state.shard_state_extra()?;
     let mut cc_seqno_with_delta = 0;
     let cc_seqno_from_state = if shard.is_masterchain() {
@@ -1787,16 +1903,18 @@ pub async fn try_validate(
     )?;
     let validator_set = ValidatorSet::with_cc_seqno(0, 0, 0, cc_seqno_with_delta, nodes)?;
 
+    let is_simplex = detect_simplex(&mc_state, &shard)?;
     let validator_query = ValidateQuery::new(
         shard,
         min_mc_seqno,
         prev_blocks_ids,
+        None,
         block_candidate,
         validator_set,
         engine,
         true,
         false,
-        false,
+        is_simplex,
     );
     validator_query.try_validate().await
 }

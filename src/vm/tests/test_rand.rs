@@ -64,6 +64,12 @@ fn test_randu_normal_case() {
         TUPLE 10
         SINGLE
         POP C7
+        PUSHPOW2 255
+        SETRAND
+        PUSHPOW2DEC 256
+        SETRAND
+        PUSHINT 1234567890
+        SETRAND
         RANDU256
         PUSHINT 55155587004147699562571990193761432594891582513305377283752159430470838410715
         EQUAL
@@ -80,4 +86,7 @@ fn test_rand_error_flow() {
     expect_exception("NULL ADDRAND", ExceptionCode::TypeCheckError);
     expect_exception("NULL SETRAND", ExceptionCode::TypeCheckError);
     expect_exception("NULL RAND", ExceptionCode::TypeCheckError);
+    expect_exception("PUSHINT -1 SETRAND", ExceptionCode::RangeCheckError);
+    expect_exception("PUSHNEGPOW2 256 SETRAND", ExceptionCode::RangeCheckError);
+    expect_exception("PUSHNAN SETRAND", ExceptionCode::IntegerOverflow);
 }

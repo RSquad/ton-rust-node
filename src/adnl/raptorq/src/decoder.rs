@@ -119,7 +119,7 @@ impl Decoder {
 #[cfg_attr(feature = "serde_support", derive(Serialize, Deserialize))]
 pub struct SourceBlockDecoder {
     source_block_id: u8,
-    symbol_size: u16,
+    symbol_size: u32,
     num_sub_blocks: u16,
     symbol_alignment: u8,
     source_block_symbols: u32,
@@ -137,7 +137,7 @@ impl SourceBlockDecoder {
         note = "Use the new2() function instead. In version 2.0, that function will replace this one"
     )]
     #[cfg(feature = "std")]
-    pub fn new(source_block_id: u8, symbol_size: u16, block_length: u64) -> SourceBlockDecoder {
+    pub fn new(source_block_id: u8, symbol_size: u32, block_length: u64) -> SourceBlockDecoder {
         let config = ObjectTransmissionInformation::new(0, symbol_size, 0, 1, 1);
         SourceBlockDecoder::new2(source_block_id, &config, block_length)
     }
@@ -175,10 +175,8 @@ impl SourceBlockDecoder {
     }
 
     fn unpack_sub_blocks(&self, result: &mut [u8], symbol: &Symbol, symbol_index: usize) {
-        let (tl, ts, nl, ns) = partition(
-            (self.symbol_size / self.symbol_alignment as u16) as u32,
-            self.num_sub_blocks,
-        );
+        let (tl, ts, nl, ns) =
+            partition(self.symbol_size / self.symbol_alignment as u32, self.num_sub_blocks);
 
         let mut symbol_offset = 0;
         let mut sub_block_offset = 0;
@@ -283,7 +281,7 @@ impl SourceBlockDecoder {
 
             let mut encoded_indices = vec![];
             // See section 5.3.3.4.2. There are S + H zero symbols to start the D vector
-            let mut d = vec![Symbol::zero(self.symbol_size); s + h];
+            let mut d = vec![Symbol::zero(self.symbol_size as usize); s + h];
             for (i, source) in self.source_symbols.iter().enumerate() {
                 if let Some(symbol) = source {
                     encoded_indices.push(i as u32);
@@ -294,7 +292,7 @@ impl SourceBlockDecoder {
             // Append the extended padding symbols
             for i in self.source_block_symbols..num_extended_symbols {
                 encoded_indices.push(i);
-                d.push(Symbol::zero(self.symbol_size));
+                d.push(Symbol::zero(self.symbol_size as usize));
             }
 
             for repair_packet in self.repair_packets.iter() {
@@ -328,7 +326,7 @@ impl SourceBlockDecoder {
         sys_index: u32,
         p1: u32,
     ) -> Symbol {
-        let mut rebuilt = Symbol::zero(self.symbol_size);
+        let mut rebuilt = Symbol::zero(self.symbol_size as usize);
         let tuple = intermediate_tuple(source_symbol_id, lt_symbols, sys_index, p1);
 
         for i in enc_indices(tuple, lt_symbols, pi_symbols, p1) {

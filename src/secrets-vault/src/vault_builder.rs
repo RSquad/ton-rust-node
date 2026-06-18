@@ -11,7 +11,7 @@ use crate::storage::file_json::FileJsonStorage;
 #[cfg(feature = "hashicorp-storage")]
 use crate::storage::hashicorp::HashicorpStorage;
 use crate::{
-    crypto::{key_material::KeyMaterial, master_key::MasterKey},
+    crypto::{crypto_trait::Crypto, key_material::KeyMaterial, master_key::MasterKey},
     errors::error::VaultError,
     events::{handler::EventHandler, null_handler::NullEventHandler},
     storage::storage_trait::Storage,
@@ -78,43 +78,56 @@ pub struct SecretVaultBuilder {
 }
 
 impl SecretVaultBuilder {
-    pub async fn from_url_or_env(url: Option<&str>) -> anyhow::Result<Option<Arc<SecretVault>>> {
+    pub async fn from_url_or_env(
+        url: Option<&str>,
+        crypto: Arc<dyn Crypto>,
+    ) -> anyhow::Result<Option<Arc<SecretVault>>> {
         let url_from_env = Self::read_url_from_env()?;
 
         if url_from_env.is_some() && url.is_some() {
-            anyhow::bail!(VaultError::invalid_config_url("Set vault config either in a file or in the ENV variable VAULT_URL, but not both. Currently, both are set."))
+            anyhow::bail!(VaultError::invalid_config_url(
+                "Set vault config either in a file or in the ENV variable VAULT_URL, but not both. Currently, both are set."
+            ))
         }
 
         let Some(url) = url.or(url_from_env.as_deref()) else {
             return Ok(None);
         };
 
-        let vault = SecretVaultBuilder::from_url(url).await?;
+        let vault = SecretVaultBuilder::from_url(url, crypto).await?;
 
         Ok(Some(vault))
     }
 
-    pub async fn from_env() -> anyhow::Result<Arc<SecretVault>> {
-        let vault = Self::from_url_or_env(None).await?.ok_or(VaultError::invalid_config_url(
-            "The VAULT_URL environment variable is not set",
-        ))?;
+    pub async fn from_env(crypto: Arc<dyn Crypto>) -> anyhow::Result<Arc<SecretVault>> {
+        let vault = Self::from_url_or_env(None, crypto).await?.ok_or(
+            VaultError::invalid_config_url("The VAULT_URL environment variable is not set"),
+        )?;
 
         Ok(vault)
     }
 
-    pub async fn from_url(url: &str) -> anyhow::Result<Arc<SecretVault>> {
+    pub async fn from_url(url: &str, crypto: Arc<dyn Crypto>) -> anyhow::Result<Arc<SecretVault>> {
         let parsed = VaultUrl::parse(url)?;
 
         if parsed.storage_name == "file" {
             #[cfg(feature = "file-storage-json")]
             {
-                return Ok(Arc::new(Self::from_url_file(&parsed).await?.build().await?));
+                return Ok(Arc::new(Self::from_url_file(&parsed, crypto).await?.build().await?));
             }
+            #[cfg(not(feature = "file-storage-json"))]
+            anyhow::bail!(VaultError::invalid_config_url(
+                "storage 'file' requires the 'file-storage-json' feature to be enabled"
+            ));
         } else if parsed.storage_name == "hashicorp" {
             #[cfg(feature = "hashicorp-storage")]
             {
-                return Ok(Arc::new(Self::from_url_hashicorp(&parsed).await?.build().await?));
+                return Ok(Arc::new(Self::from_url_hashicorp(&parsed, crypto)?.build().await?));
             }
+            #[cfg(not(feature = "hashicorp-storage"))]
+            anyhow::bail!(VaultError::invalid_config_url(
+                "storage 'hashicorp' requires the 'hashicorp-storage' feature to be enabled"
+            ));
         }
 
         anyhow::bail!(VaultError::invalid_config_url(format!(
@@ -124,38 +137,87 @@ impl SecretVaultBuilder {
     }
 
     #[cfg(feature = "hashicorp-storage")]
-    async fn from_url_hashicorp(parsed: &VaultUrl<'_>) -> anyhow::Result<Self> {
-        use crate::{crypto::factory::AutoCryptoFactory, utils::hex::val_to_pm};
+    fn from_url_hashicorp(parsed: &VaultUrl<'_>, crypto: Arc<dyn Crypto>) -> anyhow::Result<Self> {
+        use crate::{
+            storage::{
+                hashicorp_api::{VaultConfig, DEFAULT_KV_MOUNT, DEFAULT_TRANSIT_MOUNT},
+                hashicorp_token_provider::AuthConfig,
+            },
+            utils::hex::val_to_pm,
+        };
 
         if parsed.path.is_empty() {
             anyhow::bail!(VaultError::invalid_config_url("Missing vault url part"));
         }
 
-        let api_key_val = parsed
-            .query_param("api_key")
-            .ok_or_else(|| VaultError::invalid_config_url("missing parameter `api_key`"))?;
-        let api_key = val_to_pm("api_key", api_key_val).await?;
-        let namespace = parsed.query_param("namespace").map(|s| s.to_string());
+        let auth_method = parsed.query_param("auth");
+        let api_key_val = parsed.query_param("api_key");
+
+        let auth = match (auth_method, api_key_val) {
+            (None | Some("token"), Some(key)) => {
+                AuthConfig::StaticToken(val_to_pm("api_key", key)?)
+            }
+            (Some("k8s"), None) => {
+                let role = parsed.query_param("role").ok_or_else(|| {
+                    VaultError::invalid_config_url("missing parameter `role` for kubernetes auth")
+                })?;
+                AuthConfig::Kubernetes {
+                    role: role.to_string(),
+                    mount_path: parsed
+                        .query_param("auth_mount")
+                        .unwrap_or("kubernetes")
+                        .to_string(),
+                    jwt_path: parsed
+                        .query_param("jwt_path")
+                        .unwrap_or("/var/run/secrets/kubernetes.io/serviceaccount/token")
+                        .to_string(),
+                }
+            }
+            (Some("k8s"), Some(_)) => {
+                anyhow::bail!(VaultError::invalid_config_url(
+                    "cannot specify both `auth=k8s` and `api_key`"
+                ));
+            }
+            (Some(other), _) => {
+                anyhow::bail!(VaultError::invalid_config_url(format!(
+                    "unsupported auth method: '{other}'"
+                )));
+            }
+            (None, None) => {
+                anyhow::bail!(VaultError::invalid_config_url(
+                    "missing authentication: specify `api_key` or `auth=k8s`"
+                ));
+            }
+        };
+
         let prefer_local_crypto = parsed
             .query_param("prefer_local_crypto")
             .is_some_and(|s| s.eq_ignore_ascii_case("true"));
 
-        let storage = Arc::new(
-            HashicorpStorage::new(
-                api_key,
-                parsed.path,
-                namespace.as_deref(),
-                Box::new(AutoCryptoFactory {}),
-                prefer_local_crypto,
-            )
-            .await?,
-        );
+        let config = VaultConfig {
+            namespace: parsed.query_param("namespace").map(|s| s.to_string()),
+            transit_mount: parsed
+                .query_param("transit_mount")
+                .unwrap_or(DEFAULT_TRANSIT_MOUNT)
+                .to_string(),
+            transit_prefix: parsed.query_param("transit_prefix").map(|s| s.to_string()),
+            kv_mount: parsed.query_param("kv_mount").unwrap_or(DEFAULT_KV_MOUNT).to_string(),
+            kv_prefix: parsed.query_param("kv_prefix").map(|s| s.to_string()),
+        };
+
+        let storage = Arc::new(HashicorpStorage::new(
+            auth,
+            parsed.path,
+            prefer_local_crypto,
+            crypto,
+            config,
+        )?);
         Ok(Self::default().with_storage(storage))
     }
 
     #[cfg(feature = "file-storage-json")]
-    async fn from_url_file(parsed: &VaultUrl<'_>) -> anyhow::Result<Self> {
-        use crate::{crypto::factory::AutoCryptoFactory, utils::hex::hex_val_to_pm};
+    async fn from_url_file(parsed: &VaultUrl<'_>, crypto: Arc<dyn Crypto>) -> anyhow::Result<Self> {
+        use crate::utils::hex::hex_val_to_pm;
 
         if parsed.path.is_empty() {
             anyhow::bail!(VaultError::invalid_config_url("Missing path part"));
@@ -164,13 +226,13 @@ impl SecretVaultBuilder {
         let master_key_val = parsed
             .query_param("master_key")
             .ok_or_else(|| VaultError::invalid_config_url("missing parameter `master_key`"))?;
-        let master_key = hex_val_to_pm("master_key", master_key_val).await?;
+        let master_key = hex_val_to_pm("master_key", master_key_val)?;
         let auto_migrate = parsed
             .query_param("auto_migrate")
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(true);
 
-        let master_key_material = KeyMaterial::new_symmetric_key(master_key).await?;
+        let master_key_material = KeyMaterial::new_symmetric_key(master_key)?;
 
         let path_buf = if Path::new(parsed.path).is_absolute() {
             PathBuf::from(parsed.path)
@@ -178,16 +240,9 @@ impl SecretVaultBuilder {
             std::env::current_dir()?.join(parsed.path)
         };
 
-        let master_key = MasterKey::from_key_material(master_key_material).await?;
-        let storage = Arc::new(
-            FileJsonStorage::new(
-                master_key,
-                &path_buf,
-                Box::new(AutoCryptoFactory {}),
-                auto_migrate,
-            )
-            .await?,
-        );
+        let master_key = MasterKey::from_key_material(master_key_material)?;
+        let storage =
+            Arc::new(FileJsonStorage::new(master_key, &path_buf, auto_migrate, crypto).await?);
         Ok(Self::default().with_storage(storage))
     }
 

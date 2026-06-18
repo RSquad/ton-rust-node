@@ -493,7 +493,7 @@ async fn download_start_blocks_and_states(
             let root;
             (root, cells_index) =
                 engine.apply_persistent_state_part(&id, boc_buffer.clone(), cells_index).await?;
-            part_root_hashes.push(root.repr_hash());
+            part_root_hashes.push(root.repr_hash().clone());
         } else {
             if handles.is_empty() {
                 fail!("INTERNAL ERROR: no handle for persistent state {}", id);

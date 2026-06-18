@@ -24,19 +24,22 @@ use std::{
     hash::Hash,
     io::{Read, Write},
 };
-use ton_block::{base64_encode, error, fail, Ed25519KeyOption};
+use ton_block::{base64_encode, error, fail, Ed25519KeyOption, ZeroizingBytes};
 
-const MAX_BYTES_DEBUG_LEN: usize = 4;
+const MAX_DEBUG_BYTES_LEN: usize = 4;
+const MAX_TL_BYTES_LEN: usize = 16 << 20; // 16 MB
+const MAX_TL_VECTOR_LEN: usize = 1 << 20; // 1,048,576
 
 macro_rules! impl_byteslike {
     (@common $ty:ident) => {
 
         impl Debug for $ty {
             fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-                if self.len() <= MAX_BYTES_DEBUG_LEN {
-                    write!(f, "<{}>", Hexlify(&self.0))
+                let $ty(data) = self;
+                if data.len() <= MAX_DEBUG_BYTES_LEN {
+                    write!(f, "<{}>", Hexlify(data))
                 } else {
-                    write!(f, "<{}... {} bytes>", Hexlify(&self.0[..MAX_BYTES_DEBUG_LEN]), self.0.len())
+                    write!(f, "<{}... {} bytes>", Hexlify(&data[..MAX_DEBUG_BYTES_LEN]), data.len())
                 }
             }
         }
@@ -111,8 +114,11 @@ where
     T: BoxedDeserialize,
 {
     fn deserialize_bare(de: &mut Deserializer) -> Result<Self> {
-        let len = de.read_i32::<LittleEndian>()? as usize;
-        let mut buf = vec![0u8; len];
+        let len = de.read_i32::<LittleEndian>()?;
+        if (len < 0) || ((len as usize) > MAX_TL_BYTES_LEN) {
+            fail!("Invalid TL LengthPrefixed length {len}")
+        }
+        let mut buf = vec![0u8; len as usize];
         de.read_exact(&mut buf)?;
         Ok(LengthPrefixed(T::boxed_deserialized_from_bytes(&buf)?))
     }
@@ -214,6 +220,9 @@ pub trait Vectored<T> {
         Self: Sized,
     {
         let count = de.read_i32::<LittleEndian>()?;
+        if (count < 0) || ((count as usize) > MAX_TL_VECTOR_LEN) {
+            fail!("Invalid TL vector length {count}")
+        }
         let mut ret = Vec::new();
         ret.try_reserve_exact(count as usize)
             .map_err(|e| error!("count {} is too big for {}: {}", count, type_name::<Self>(), e))?;
@@ -331,6 +340,9 @@ impl BareDeserialize for bytes {
                 (len, 8)
             }
         };
+        if len > MAX_TL_BYTES_LEN {
+            fail!("Too big length {len} of TL bytes")
+        }
         let mut buf = Vec::new();
         buf.try_reserve_exact(len)
             .map_err(|e| error!("count {} is too big for {}: {}", len, type_name::<Self>(), e))?;
@@ -510,7 +522,11 @@ impl Display for crate::ton::PublicKey {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
             crate::ton::PublicKey::Pub_Ed25519(key) => {
-                write!(f, "{}", Ed25519KeyOption::from_public_key(key.key.as_array()).id())
+                write!(
+                    f,
+                    "{}",
+                    Ed25519KeyOption::<ZeroizingBytes>::from_public_key(key.key.as_array()).id()
+                )
             }
             x => write!(f, "{:?}", x),
         }

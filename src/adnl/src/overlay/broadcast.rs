@@ -13,7 +13,7 @@ use crate::{
     },
     declare_counted,
     node::PeerHistory,
-    overlay::{Overlay, OverlayNode, TARGET, TARGET_BROADCAST},
+    overlay::{Overlay, OverlayNode, OverlayType, TARGET, TARGET_BROADCAST},
     rldp::{RaptorqDecoder, RaptorqEncoder},
 };
 #[cfg(feature = "telemetry")]
@@ -786,6 +786,21 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
         let stats = ctx.overlay.get_per_transfer_stats(bcast_id)?;
         #[cfg(feature = "telemetry")]
         stats.income.fetch_add(1, Ordering::Relaxed);
+        // on_recv check if any runs on first FEC part, before reassembly
+        if ctx.overlay.owned_broadcasts.get(bcast_id).is_none() {
+            if let OverlayType::Private { bcast_check: Some(check), .. } = &ctx.overlay.overlay_type
+            {
+                if let Err(reason) = check.on_recv(bcast.src_key()?.id(), bcast.extra()) {
+                    log::warn!(
+                        target: TARGET,
+                        "precheck rejected broadcast {} in overlay {}: {reason}",
+                        base64_encode(bcast_id),
+                        ctx.overlay.overlay_id
+                    );
+                    return Ok((None, false));
+                }
+            }
+        }
         let bcast_type = Self::broadcast_type();
         let transfer = loop {
             if let Some(transfer) = ctx.overlay.owned_broadcasts.get(bcast_id) {
@@ -1675,8 +1690,6 @@ pub(crate) struct BroadcastTwostepFecProtocol {
 }
 
 impl BroadcastTwostepFecProtocol {
-    const MAX_PART_SIZE: usize = 65536;
-
     pub(crate) fn for_recv() -> Self {
         Self { extra: None, send_ctx: None }
     }
@@ -1690,9 +1703,6 @@ impl BroadcastTwostepFecProtocol {
         }
         let k = ((neighbours as usize) * 2 - 2) / 3;
         let part_size = (data.len() + k - 1) / k;
-        if part_size >= Self::MAX_PART_SIZE {
-            fail!("Too big part size {part_size} in {} broadcast", Self::broadcast_type());
-        }
         let ctx = BroadcastTwostepSendContext { neighbours, part_size };
         Ok(Self { extra: Some(extra), send_ctx: Some(ctx) })
     }
@@ -1763,7 +1773,19 @@ impl BroadcastProtocol<BroadcastTwostepFec> for BroadcastTwostepFecProtocol {
         ctx: &mut BroadcastRecvContext,
         bcast_id: &BroadcastId,
     ) -> Result<(Option<BroadcastRecvInfo>, bool)> {
-        <Self as FecProtocol<BroadcastTwostepFec>>::process_broadcast(bcast, ctx, bcast_id).await
+        let (info, mut resend) =
+            <Self as FecProtocol<BroadcastTwostepFec>>::process_broadcast(bcast, ctx, bcast_id)
+                .await?;
+        if resend {
+            let Some(bcast) = ctx.overlay.owned_broadcasts.get(bcast_id) else {
+                return Ok((info, false));
+            };
+            let Some(transfer) = Self::unwrap_transfer(bcast.val()) else {
+                return Ok((info, false));
+            };
+            resend = ctx.peers.other() == &transfer.src_key_id;
+        }
+        Ok((info, resend))
     }
 
     // Send side
@@ -1819,7 +1841,7 @@ impl BroadcastProtocol<BroadcastTwostepFec> for BroadcastTwostepFecProtocol {
             bcast_id: *bcast_id,
             data_hash: sha256_digest(ctx.data.object),
             date,
-            encoder: RaptorqEncoder::with_data(ctx.data.object, Some(send_ctx.part_size as u16)),
+            encoder: RaptorqEncoder::with_data(ctx.data.object, Some(send_ctx.part_size as u32)),
             extra: self.extra.take().unwrap_or_default(),
             flags: ctx.flags,
             seqno: 0,
@@ -1951,16 +1973,16 @@ impl BroadcastParsed for BroadcastTwostepSimple {
 }
 
 pub(crate) struct BroadcastTwostepSimpleProtocol {
-    big_data: bool,
     extra: Option<Vec<u8>>,
+    reliable: bool,
 }
 
 impl BroadcastTwostepSimpleProtocol {
-    pub(crate) fn for_recv(big_data: bool) -> Self {
-        Self { big_data, extra: None }
+    pub(crate) fn for_recv(reliable: bool) -> Self {
+        Self { reliable, extra: None }
     }
-    pub(crate) fn for_send(big_data: bool, extra: Vec<u8>) -> Self {
-        Self { big_data, extra: Some(extra) }
+    pub(crate) fn for_send(reliable: bool, extra: Vec<u8>) -> Self {
+        Self { reliable, extra: Some(extra) }
     }
     fn calc_to_sign(bcast_id: BroadcastId, data: &[u8]) -> Result<Vec<u8>> {
         let to_sign =
@@ -1997,7 +2019,7 @@ impl BroadcastProtocol<BroadcastTwostepSimple> for BroadcastTwostepSimpleProtoco
     }
 
     fn send_method(&self) -> BroadcastSendMethod {
-        if self.big_data {
+        if self.reliable {
             BroadcastSendMethod::QuicOrRldp
         } else {
             BroadcastSendMethod::Fast
@@ -2054,8 +2076,21 @@ impl BroadcastProtocol<BroadcastTwostepSimple> for BroadcastTwostepSimpleProtoco
         &self,
         bcast: BroadcastTwostepSimple,
         ctx: &mut BroadcastRecvContext,
-        _bcast_id: &BroadcastId,
+        bcast_id: &BroadcastId,
     ) -> Result<(Option<BroadcastRecvInfo>, bool)> {
+        // on_recv check if any runs on simple two-step path too (matches FEC path)
+        if let OverlayType::Private { bcast_check: Some(check), .. } = &ctx.overlay.overlay_type {
+            if let Err(reason) = check.on_recv(bcast.src_key()?.id(), Some(&bcast.extra)) {
+                log::warn!(
+                    target: TARGET,
+                    "precheck rejected twostep-simple broadcast {} in overlay {}: {reason}",
+                    base64_encode(bcast_id),
+                    ctx.overlay.overlay_id
+                );
+                ctx.overlay.owned_broadcasts.remove(bcast_id);
+                return Ok((None, false));
+            }
+        }
         let src_adnl_key_id = KeyId::from_data(*bcast.src_adnl_id.as_slice());
         let resend = ctx.peers.other() == &src_adnl_key_id;
         let info = BroadcastRecvInfo {

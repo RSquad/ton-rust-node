@@ -2,7 +2,7 @@
 build = '../../common/build/build.rs'
 name = "nodectl"
 description = "Tool for managing Rust TON node"
-version = "0.3.0"
+version = "0.5.1"
 edition = "2024"
 license = 'GPL-3.0'
 
@@ -13,3 +13,7 @@ tracing = "0.1"
 anyhow = "1.0"
 common = { path = "../common" }
 commands = { path = "../commands" }
+secrets-vault = { path = '../../secrets-vault', default-features = false, features = [
+    "file-storage-json",
+    "hashicorp-storage",
+] }

@@ -667,6 +667,7 @@ impl StateParser {
     fn parse_simplex_config(p: &PathMap) -> Result<SimplexConfig> {
         let d = NoncriticalParams::default();
         Ok(SimplexConfig {
+            enable_observers: p.get_num32("enable_observers").unwrap_or(0) != 0,
             use_quic: p.get_num32("use_quic").unwrap_or(0) != 0,
             slots_per_leader_window: p.get_num32("slots_per_leader_window")?,
             noncritical_params: NoncriticalParams {
@@ -703,6 +704,12 @@ impl StateParser {
                 candidate_resolve_rate_limit: p
                     .get_num32("candidate_resolve_rate_limit")
                     .unwrap_or(d.candidate_resolve_rate_limit),
+                min_block_interval_ms: p
+                    .get_num32("min_block_interval_ms")
+                    .unwrap_or(d.min_block_interval_ms),
+                no_empty_blocks_on_error_timeout_ms: p
+                    .get_num32("no_empty_blocks_on_error_timeout_ms")
+                    .unwrap_or(d.no_empty_blocks_on_error_timeout_ms),
             },
         })
     }
@@ -1092,7 +1099,7 @@ impl StateParser {
             accounts.iter().try_for_each::<_, Result<()>>(|account| {
                 let account = PathMap::cont(&map_path, "accounts", account)?;
                 let mut account = Account::construct_from_bytes(&account.get_base64("boc")?)?;
-                account.update_storage_stat(
+                account.calc_storage_stat_dict(
                     self.extra.config.size_limits_config()?.acc_state_cells_for_storage_dict,
                 )?;
                 if let Some(account_id) = account.get_id() {
@@ -1169,7 +1176,7 @@ pub fn parse_block_proof(map: &Map<String, Value>, block_file_hash: UInt256) -> 
             block_info.shard().shard_prefix_with_tag(),
         )?,
         block_info.seq_no(),
-        block_virt_root.repr_hash(),
+        block_virt_root.repr_hash().clone(),
         block_file_hash,
     );
 

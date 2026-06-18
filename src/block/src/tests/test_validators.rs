@@ -11,7 +11,8 @@
 use super::*;
 use crate::{
     blocks::Block, config_params::ConfigParamEnum, merkle_proof::MerkleProof,
-    signature::BlockProof, write_read_and_assert, ShardIdent, BASE_WORKCHAIN_ID, MASTERCHAIN_ID,
+    signature::BlockProof, write_read_and_assert, Ed25519KeyOption, ShardIdent, ZeroizingBytes,
+    BASE_WORKCHAIN_ID, MASTERCHAIN_ID,
 };
 
 #[test]
@@ -59,7 +60,7 @@ fn test_validator_desc_new_default() {
 
 #[test]
 fn test_validator_desc_info_new_with() {
-    let keypair = crate::Ed25519KeyOption::generate().unwrap();
+    let keypair = Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap();
     let key = SigPubKey::from_bytes(keypair.pub_key().unwrap()).unwrap();
     let vd = ValidatorDescr::with_params(key.clone(), 2121212121, None);
 
@@ -71,7 +72,7 @@ fn test_validator_desc_info_new_with() {
 fn test_validator_set_serialize() {
     let mut list = vec![];
     for n in 0..20 {
-        let keypair = crate::Ed25519KeyOption::generate().unwrap();
+        let keypair = Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap();
         let key = SigPubKey::from_bytes(keypair.pub_key().unwrap()).unwrap();
         let vd = ValidatorDescr::with_params(key, n, None);
         list.push(vd);

@@ -34,7 +34,7 @@ use std::{
     },
     time::{Duration, SystemTime},
 };
-use ton_block::{fail, Result};
+use ton_block::{fail, BlockIdExt, Result};
 
 /*
     Constants
@@ -386,6 +386,7 @@ impl CatchainOverlayManager for LoopbackOverlayManager {
         overlay_listener: CatchainOverlayListenerPtr,
         _log_replay_listener: CatchainOverlayLogReplayListenerPtr,
         _transport_type: consensus_common::OverlayTransportType,
+        _block_sync_params: Option<consensus_common::BlockSyncOverlayParams>,
     ) -> Result<CatchainOverlayPtr> {
         if let Err(_prev) =
             self.overlay_created.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -440,7 +441,7 @@ pub(crate) struct SessionImpl {
 */
 
 impl consensus_common::Session for SessionImpl {
-    fn start(&self, _initial_block_seqno: u32) {
+    fn start(&self, _prev_blocks: Vec<BlockIdExt>, _min_masterchain_block_id: BlockIdExt) {
         log::trace!("CatchainSession::start() called (no-op for catchain)");
     }
 

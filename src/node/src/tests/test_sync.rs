@@ -225,13 +225,12 @@ async fn test_sync() -> Result<()> {
             if let Some(state) = self.states.get(handle.id().shard()) {
                 Ok((state.val().clone(), cells_index))
             } else {
-                let state = ShardStateStuff::deserialize_state_inmem(
+                let state = ShardStateStuff::deserialize_state(
                     handle.id().clone(),
-                    data,
+                    &data,
                     #[cfg(feature = "telemetry")]
                     &self.telemetry,
                     &self.allocated,
-                    &|| false,
                 )?;
                 self.states.insert(handle.id().shard().clone(), state.clone());
                 Ok((state, cells_index))
@@ -277,7 +276,7 @@ async fn test_sync() -> Result<()> {
             let client = self.get_client(&id.shard_id).await?;
             let mut attempts = 1;
             loop {
-                match client.download_block_full(id).await {
+                match client.download_block_full(id, false).await {
                     Ok(ret) => break Ok(ret),
                     Err(e) => println!("Error downloading block {}: {}", id, e),
                 }

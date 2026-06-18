@@ -10,7 +10,7 @@
  */
 use ton_assembler::compile_code_to_cell;
 use ton_block::{
-    ed25519_generate_private_key, AnycastInfo, BuilderData, Cell, CurrencyCollection,
+    ed25519_generate_private_key, AnycastInfo, BuilderData, Cell, Coins, CurrencyCollection,
     ExceptionCode, HashmapE, HashmapType, IBitstring, InternalMessageHeader, Message, MsgAddress,
     MsgAddressInt, Result, Serializable, Sha256, SliceData, StateInit, StorageUsageCalc,
     ACTION_CHANGE_LIB, ACTION_RESERVE, ACTION_SEND_MSG, ACTION_SET_CODE, ED25519_PUBLIC_KEY_LENGTH,
@@ -157,6 +157,34 @@ fn test_chksignu_always() {
     ")
     .with_behavior_modifiers(modifiers)
     .expect_stack(Stack::new().push(int!(-1)));
+}
+
+#[test]
+fn test_chksig_identity_pubkey_rejected() {
+    let forged_identity_signature = concat!(
+        "0100000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+    );
+
+    test_case(format!(
+        "
+        ZERO
+        PUSHSLICE x{forged_identity_signature}
+        PUSHPOW2 248
+        CHKSIGNU
+    "
+    ))
+    .expect_int_stack(&[0]);
+
+    test_case(format!(
+        "
+        PUSHSLICE xaf82
+        PUSHSLICE x{forged_identity_signature}
+        PUSHPOW2 248
+        CHKSIGNS
+    "
+    ))
+    .expect_int_stack(&[0]);
 }
 
 #[test]
@@ -579,18 +607,18 @@ fn test_send_msg() {
             // cpp bug representation:
             // base body and init with hdr
             // but then body and init in refs (but ref could be with hdr)
-            // old agorithm try to calculate storage used for serialization as is
-            // then put init to ref if it has two at least two refs
-            // then put body to ref if it has two at least two refs
+            // old algorithm try to calculate storage used for serialization as is
+            // then put init to ref if it has at least two refs
+            // then put body to ref if it has at least two refs
             // new algorithm in SENDMSG primitive doesn't try to calculate as is
             // it put init to ref if body and init don't fit in hdr
             msg.set_src_address(Default::default());
-            let body = msg.body().unwrap().clone().into_builder().unwrap();
-            let init = msg.state_init().unwrap().clone().write_to_new_cell().unwrap();
+            let body = msg.body().unwrap().clone().into_cell().unwrap();
+            let init = msg.state_init().unwrap().clone().serialize().unwrap();
             let (_, body_to_ref, init_to_ref) = msg.serialize_as_is().unwrap();
             let mut sstat = StorageUsageCalc::with_limits(0, 0);
-            sstat.append_builder(&body, body_to_ref, &mut 0).unwrap();
-            sstat.append_builder(&init, init_to_ref, &mut 0).unwrap();
+            sstat.append_cell(&body, body_to_ref, &mut 0).unwrap();
+            sstat.append_cell(&init, init_to_ref, &mut 0).unwrap();
             assert_eq!(sstat.cells(), 5);
             assert_eq!(sstat.bits(), 412 + len as u64);
         }
@@ -651,6 +679,143 @@ fn test_send_msg() {
             .with_message_cell(msg_cell.clone())
             .expect_int_stack(&[len, fee, fee, fee]);
     }
+}
+
+#[test]
+fn test_send_msg_ignores_user_fwd_fee_lower_bound_in_v14() {
+    let dst = MsgAddressInt::standard(0, [0x22; 32]);
+    let header = InternalMessageHeader {
+        ihr_disabled: true,
+        dst,
+        value: CurrencyCollection::with_coins(6789),
+        ..Default::default()
+    };
+    let msg_cell = Message::with_int_header(header.clone()).serialize().unwrap();
+
+    let mut inflated_header = header;
+    inflated_header.fwd_fee = Coins::from(1_000_000_000_000_000u64);
+    let inflated_msg_cell = Message::with_int_header(inflated_header).serialize().unwrap();
+
+    let estimate_fee = |msg_cell: Cell, block_version| {
+        test_case_with_ref("PUSHREF PUSHINT 1024 SENDMSG", msg_cell)
+            .with_mc_state(MC_STATE_ROOT.clone())
+            .with_account(SHARD_ACCOUNT.clone())
+            .with_block_version(block_version)
+            .stack()
+            .get(0)
+            .unwrap()
+            .as_integer_value(0..=u64::MAX)
+            .unwrap()
+    };
+
+    let normal_fee_v14 = estimate_fee(msg_cell.clone(), 14);
+    assert_eq!(estimate_fee(inflated_msg_cell.clone(), 14), normal_fee_v14);
+
+    let normal_fee_v13 = estimate_fee(msg_cell, 13);
+    let inflated_fee_v13 = estimate_fee(inflated_msg_cell, 13);
+    assert!(
+        inflated_fee_v13 > normal_fee_v13,
+        "legacy SENDMSG should still include user fwd_fee in the estimate path"
+    );
+}
+
+#[test]
+fn test_send_msg_with_same_cells() {
+    let mut params = Vec::new();
+
+    // body cell is present in state_init both are not in refs
+    let body = BuilderData::with_raw(vec![1, 2, 3], 24).unwrap().into_cell().unwrap();
+    let init =
+        StateInit::with_code_and_data(compile_code_to_cell("PUSHINT 1").unwrap(), body.clone());
+    params.push((body, init, 892, 1232000));
+
+    // body has same cell as state_init
+    let init = StateInit::with_code_and_data(
+        compile_code_to_cell("PUSHINT 1").unwrap(),
+        BuilderData::with_raw(vec![1, 2, 3], 24).unwrap().into_cell().unwrap(),
+    );
+    let cell = init.serialize().unwrap();
+    let body =
+        BuilderData::with_raw_and_refs(vec![1, 2, 3], 24, [cell]).unwrap().into_cell().unwrap();
+    params.push((body, init, 992, 1337000));
+
+    for (body, init, gas, expected_fee) in params {
+        let src = MsgAddressInt::standard(0, [0x11; 32]);
+        let dst = MsgAddressInt::standard(0, [0x22; 32]);
+        let h =
+            InternalMessageHeader::with_addresses(src, dst, CurrencyCollection::with_coins(6789));
+        let body = SliceData::load_cell(body).unwrap();
+        let mut msg = Message::with_int_header_and_body(h, body);
+        msg.set_state_init(init);
+        test_case_with_ref("PUSHREF ZERO SENDMSG", msg.serialize().unwrap())
+            .with_mc_state(MC_STATE_ROOT.clone())
+            .with_account(SHARD_ACCOUNT.clone())
+            .expect_gas_used(gas)
+            .expect_int_stack(&[expected_fee]);
+    }
+}
+
+#[test]
+fn test_send_msg_inline_vs_ref_body_gas_accounting() {
+    use ton_block::Deserializable;
+
+    // Header has empty src (1 bit) — body fits inline. After SENDMSG sets
+    // src to my_addr (~268 bits), the envelope no longer fits, and
+    // recalc_serialization_params decides to put body in a ref. This is
+    // exactly the layout transition that triggered the original bug:
+    //   parsed body_to_ref = Some(false) (inline in source cell)
+    //   recalc body_to_ref = true        (body must go to a ref now)
+    // Our fix uses parsed flag, not recalc, to decide whether the body
+    // cell is real (charge gas) or synthesized (don't charge gas).
+    let dst = MsgAddressInt::standard(0, [0x22; 32]);
+    // src = AddrNone (~2 bits) so that the source envelope is small enough
+    // to keep a moderately-sized body inline. SENDMSG later replaces src
+    // with my_addr (AddrStd, ~268 bits) which makes the envelope overflow
+    // and forces body into a ref via recalc_serialization_params.
+    let h = InternalMessageHeader {
+        ihr_disabled: true,
+        src: ton_block::MsgAddressIntOrNone::None,
+        dst,
+        value: CurrencyCollection::with_coins(6789),
+        ..Default::default()
+    };
+
+    // ~400-bit body: fits inline with empty-src header but must move to ref
+    // after SENDMSG sets src to a 267-bit AddrStd.
+    let body_inline_then_recalc_ref = SliceData::from_raw(vec![0xAA; 64], 500);
+    let msg_a = Message::with_int_header_and_body(h.clone(), body_inline_then_recalc_ref);
+    let cell_a = msg_a.serialize().unwrap();
+    let parsed_a = Message::construct_from_cell(cell_a.clone()).unwrap();
+    assert_eq!(
+        parsed_a.body_to_ref(),
+        Some(false),
+        "test setup: body must be inline in source envelope",
+    );
+
+    // Same logical message but with body forcibly placed in a ref by using
+    // a body so large that even the empty-src envelope can't hold it inline.
+    let body_always_ref = SliceData::from_raw(vec![0xAA; 128], 1000);
+    let msg_b = Message::with_int_header_and_body(h, body_always_ref);
+    let cell_b = msg_b.serialize().unwrap();
+    let parsed_b = Message::construct_from_cell(cell_b.clone()).unwrap();
+    assert_eq!(
+        parsed_b.body_to_ref(),
+        Some(true),
+        "test setup: body must already be in ref in source envelope",
+    );
+
+    // Inline body in source → SENDMSG must NOT charge root-cell load gas
+    // for the body cell, even though recalc puts the body in a ref.
+    test_case_with_ref("PUSHREF ZERO SENDMSG", cell_a)
+        .with_mc_state(MC_STATE_ROOT.clone())
+        .with_account(SHARD_ACCOUNT.clone())
+        .expect_gas_used(692);
+
+    // Body originally in ref → SENDMSG must charge a root-cell load.
+    test_case_with_ref("PUSHREF ZERO SENDMSG", cell_b)
+        .with_mc_state(MC_STATE_ROOT.clone())
+        .with_account(SHARD_ACCOUNT.clone())
+        .expect_gas_used(792);
 }
 
 #[test]
@@ -1469,6 +1634,12 @@ fn test_store_opt_std_address() {
     expect_exception("NEWC ZERO STOPTSTDADDRQ", ExceptionCode::TypeCheckError);
     test_case("NEWC NEWC STOPTSTDADDRQ").expect_stack(
         Stack::new()
+            .push_builder(Default::default())
+            .push_builder(Default::default())
+            .push_bool(true),
+    );
+    test_case("NEWC NEWC STOPTSTDADDRQ").with_block_version(13).expect_stack(
+        Stack::new()
             .push_slice(Default::default())
             .push_builder(Default::default())
             .push_bool(true),
@@ -1514,7 +1685,7 @@ fn test_store_opt_std_address() {
         );
 
     // standard address without anycast
-    let addr = MsgAddressInt::with_standart(None, 0, [0x33; 32].into()).unwrap();
+    let addr = MsgAddressInt::standard(0, [0x33; 32]);
     let builder = addr.write_to_new_cell().unwrap();
     let cell = builder.clone().into_cell().unwrap();
     test_case_with_ref("PUSHREFSLICE NEWC STSTDADDR", cell.clone())
@@ -1687,6 +1858,33 @@ mod secp256k1 {
             .push(int!(parse "90884071343725393946073044816555309859522368395601566415999734440459367428202"))
             .push(boolean!(true))
         );
+
+        test_case("
+            PUSHINT 22331814027392488307105736075480205742348666473969333634173732071459215699411
+            PUSHINT 28
+            PUSHINT 72188030107017171866617227647805629756021428596569046199967415849707266278927
+            PUSHINT 13282575217854591023620411938469150084981210273956175544447397945087449567053
+            ECRECOVER
+        ")
+        .expect_stack(
+            Stack::new()
+            .push(int!(4))
+            .push(int!(parse "21072357408343070128712378251742180313787053800286652796374427952533996402375"))
+            .push(int!(parse "90884071343725393946073044816555309859522368395601566415999734440459367428202"))
+            .push(boolean!(true))
+        );
+
+        test_case(
+            "
+            PUSHINT 22331814027392488307105736075480205742348666473969333634173732071459215699411
+            PUSHINT 28
+            PUSHINT 72188030107017171866617227647805629756021428596569046199967415849707266278927
+            PUSHINT 13282575217854591023620411938469150084981210273956175544447397945087449567053
+            ECRECOVER
+        ",
+        )
+        .with_block_version(13)
+        .expect_int_stack(&[0]);
 
         test_case(
             "
@@ -1903,6 +2101,7 @@ mod ristretto {
         expect_exception("NULL ZERO RIST255_MUL", ExceptionCode::TypeCheckError);
         expect_exception("ZERO NULL RIST255_MUL", ExceptionCode::TypeCheckError);
         expect_exception("ONE ONE RIST255_MUL", ExceptionCode::RangeCheckError);
+        expect_exception("ONE ZERO RIST255_MUL", ExceptionCode::RangeCheckError);
 
         expect_exception("RIST255_QMUL", ExceptionCode::StackUnderflow);
         expect_exception("ZERO RIST255_QMUL", ExceptionCode::StackUnderflow);
@@ -1913,6 +2112,27 @@ mod ristretto {
 
     #[test]
     fn test_mul_good() {
+        test_case("ZERO ZERO RIST255_MUL").expect_int_stack(&[0]);
+        test_case("ZERO ZERO RIST255_QMUL").expect_int_stack(&[0, -1]);
+        test_case("ZERO ONE RIST255_MUL").expect_int_stack(&[0]);
+        test_case("ZERO ONE RIST255_QMUL").expect_int_stack(&[0, -1]);
+        test_case("ONE ZERO RIST255_QMUL").expect_int_stack(&[0]);
+        test_case("ONE ZERO RIST255_MUL").with_block_version(13).expect_int_stack(&[0]);
+        test_case("ONE ZERO RIST255_QMUL").with_block_version(13).expect_int_stack(&[0, -1]);
+
+        test_case("
+            PUSHINT 106766070510617938807695755472512202883645982493097127265543572015867144473941
+            PUSHINT 14474011154664524427946373126085988481714232718759815212003901876570908501978 ; 2 * L
+            RIST255_MUL
+        ")
+        .expect_int_stack(&[0]);
+        test_case("
+            PUSHINT 106766070510617938807695755472512202883645982493097127265543572015867144473941
+            PUSHINT 14474011154664524427946373126085988481714232718759815212003901876570908501978 ; 2 * L
+            RIST255_QMUL
+        ")
+        .expect_int_stack(&[0, -1]);
+
         test_case("
             PUSHINT 106766070510617938807695755472512202883645982493097127265543572015867144473941
             TWO
@@ -1932,6 +2152,70 @@ mod ristretto {
             Stack::new()
             .push(int!(parse "109551166387579915578826152533938171977715400613154730820483154358912285137228"))
             .push(boolean!(true))
+        );
+
+        test_case("
+            PUSHINT 106766070510617938807695755472512202883645982493097127265543572015867144473941
+            PUSHINT -3
+            RIST255_MUL
+        ")
+        .expect_stack(
+            Stack::new()
+            .push(int!(parse "70838297563108016895068575279100853725524557933406618307909737784497950323992"))
+        );
+
+        test_case("
+            PUSHINT 106766070510617938807695755472512202883645982493097127265543572015867144473941
+            PUSHINT -3
+            RIST255_QMUL
+        ")
+        .expect_stack(
+            Stack::new()
+            .push(int!(parse "70838297563108016895068575279100853725524557933406618307909737784497950323992"))
+            .push_bool(true)
+        );
+
+        test_case("
+            PUSHINT 106766070510617938807695755472512202883645982493097127265543572015867144473941
+            PUSHNEGPOW2 256
+            RIST255_MUL
+        ")
+        .expect_stack(
+            Stack::new()
+            .push(int!(parse "103562405402860809727243904750418670115401098931158097999552807435669242439015"))
+        );
+
+        test_case("
+            PUSHINT 106766070510617938807695755472512202883645982493097127265543572015867144473941
+            PUSHNEGPOW2 256
+            RIST255_QMUL
+        ")
+        .expect_stack(
+            Stack::new()
+            .push(int!(parse "103562405402860809727243904750418670115401098931158097999552807435669242439015"))
+            .push_bool(true)
+        );
+
+        test_case("
+            PUSHINT 106766070510617938807695755472512202883645982493097127265543572015867144473941
+            PUSHPOW2DEC 256
+            RIST255_MUL
+        ")
+        .expect_stack(
+            Stack::new()
+            .push(int!(parse "112546989381982399565385874119518646456281745798787731253025841649422233982071"))
+        );
+
+        test_case("
+            PUSHINT 106766070510617938807695755472512202883645982493097127265543572015867144473941
+            PUSHPOW2DEC 256
+            RIST255_QMUL
+        ")
+        .expect_stack(
+            Stack::new()
+            .push(int!(parse "112546989381982399565385874119518646456281745798787731253025841649422233982071"))
+            .push_bool(true)
+
         );
 
         test_case("ONE ONE RIST255_QMUL").expect_int_stack(&[0]);
@@ -1983,6 +2267,64 @@ mod ristretto {
             Stack::new()
             .push(int!(parse "102651481954198948695408991041606107487729423467545670950322577403614277217654"))
             .push(boolean!(true))
+        );
+
+        test_case(
+            "
+            PUSHINT -3
+            RIST255_MULBASE
+        ",
+        )
+        .expect_stack(Stack::new().push(int!(parse "29252689391869424727426096547591634084410498890890037679788795972193144695609")));
+
+        test_case(
+            "
+            PUSHINT -3
+            RIST255_QMULBASE
+        ",
+        )
+        .expect_stack(
+            Stack::new()
+                .push(int!(parse "29252689391869424727426096547591634084410498890890037679788795972193144695609"))
+                .push_bool(true)
+        );
+
+        test_case("
+            PUSHNEGPOW2 256
+            RIST255_MULBASE
+        ")
+        .expect_stack(
+            Stack::new()
+            .push(int!(parse "39870916147903089882178756680075224799528733839904447181476189009419774597926"))
+        );
+
+        test_case("
+            PUSHNEGPOW2 256
+            RIST255_QMULBASE
+        ")
+        .expect_stack(
+            Stack::new()
+            .push(int!(parse "39870916147903089882178756680075224799528733839904447181476189009419774597926"))
+            .push_bool(true)
+        );
+
+        test_case("
+            PUSHPOW2DEC 256
+            RIST255_MULBASE
+        ")
+        .expect_stack(
+            Stack::new()
+            .push(int!(parse "70867249709668113701859708843504143590571735776637176809986960869074620068374"))
+        );
+
+        test_case("
+            PUSHPOW2DEC 256
+            RIST255_QMULBASE
+        ")
+        .expect_stack(
+            Stack::new()
+            .push(int!(parse "70867249709668113701859708843504143590571735776637176809986960869074620068374"))
+            .push_bool(true)
         );
     }
 }

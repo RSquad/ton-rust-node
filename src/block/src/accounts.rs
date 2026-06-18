@@ -19,8 +19,8 @@ use crate::{
     shard_accounts::DepthBalanceInfo,
     types::{AddSub, ChildCell, Coins, CurrencyCollection, Number5, VarUInteger7},
     AccountId, AccountStorageStat, BuilderData, Cell, ConfigParams, Deserializable, GasConsumer,
-    GetRepresentationHash, HashmapType, IBitstring, Serializable, SliceData, UInt256, UsageTree,
-    DICT_HASH_MIN_CELLS,
+    GetRepresentationHash, HashmapType, IBitstring, Serializable, SliceData, StorageRoots, UInt256,
+    UsageTree, DICT_HASH_MIN_CELLS,
 };
 use std::{collections::HashSet, fmt};
 
@@ -176,7 +176,7 @@ impl StorageUsageCalc {
         gas_consumer: &mut impl GasConsumer,
     ) -> Result<u32> {
         if add_root
-            && (!self.hashes.insert(cell.repr_hash())
+            && (!self.hashes.insert(cell.repr_hash().clone())
                 || !self.add_checked(1, cell.bit_length() as u64))
         {
             return Ok(0);
@@ -185,7 +185,11 @@ impl StorageUsageCalc {
             return Ok(0);
         }
         let mut max_merkle_depth = 0;
-        let slice = gas_consumer.load_cell(cell.clone())?;
+        let slice = if add_root {
+            gas_consumer.load_cell(cell.clone())?
+        } else {
+            SliceData::load_cell(cell.clone())?
+        };
         for i in 0..slice.remaining_references() {
             let merkle_depth = self.append_cell(&slice.reference(i)?, true, gas_consumer)?;
             max_merkle_depth = max_merkle_depth.max(merkle_depth);
@@ -197,19 +201,26 @@ impl StorageUsageCalc {
         Ok(max_merkle_depth)
     }
 
-    pub fn append_builder(
+    /// Variant of `append_cell` where the root cell is loaded WITHOUT gas
+    /// (e.g. when the root is synthesized locally and isn't part of the
+    /// source cell tree) but still counted in the storage stat. Recursive
+    /// sub-references are loaded WITH gas through `gas_consumer`. Matches
+    /// cpp behavior for outbound message storage calculation in SENDMSG,
+    /// where envelope refs are walked with gas charging but a body cell
+    /// synthesized from inline body bits isn't separately loaded.
+    pub fn append_cell_no_root_gas(
         &mut self,
-        root: &BuilderData,
+        cell: &Cell,
         add_root: bool,
         gas_consumer: &mut impl GasConsumer,
-    ) -> Result<()> {
-        if add_root && !self.add_checked(1, root.bits_used() as u64) {
-            return Ok(());
+    ) -> Result<u32> {
+        if add_root
+            && (!self.hashes.insert(cell.repr_hash().clone())
+                || !self.add_checked(1, cell.bit_length() as u64))
+        {
+            return Ok(0);
         }
-        for cell in root.references() {
-            self.append_cell(cell, true, gas_consumer)?;
-        }
-        Ok(())
+        self.append_cell(cell, false, gas_consumer)
     }
 
     pub fn storage_used(&self) -> Result<StorageUsed> {
@@ -529,12 +540,19 @@ impl fmt::Display for AccountState {
     }
 }
 
+///////////////////////////////////////////////////////////////////////////////
+/// 4.1.6. Account description.
+///
+/// account_none$0 = Account;
+/// account$1 addr:MsgAddressInt storage_info:StorageInfo
+/// storage:AccountStorage = Account;
 #[derive(Clone, Default)]
 struct AccountStuff {
     addr: MsgAddressInt,
     storage_info: StorageInfo,
     storage: AccountStorage,
 
+    // not serialized, storage stat calculation cache and dict builder
     storage_stat: AccountStorageStat,
 }
 
@@ -559,14 +577,14 @@ impl AccountStuff {
             _ => None,
         }
     }
-    fn update_storage_stat(&mut self, dict_hash_min_cells: u32) -> Result<Option<Cell>> {
-        self.storage_info.used = self.storage_stat.update(&self.storage)?;
+    fn calc_storage_stat_dict(&mut self, dict_hash_min_cells: u32) -> Result<Option<Cell>> {
+        self.storage_info.used = self.storage_stat.calc_stat(&self.storage)?;
         if self.storage_info.used.cells.as_u64() >= dict_hash_min_cells as u64
             && !self.addr.is_masterchain()
         {
-            let dict_root = self.storage_stat.dict_root()?;
+            let dict_root = self.storage_stat.calc_dict()?;
             self.storage_info.storage_extra.dict_hash =
-                Some(dict_root.map_or_else(Default::default, Cell::repr_hash));
+                Some(dict_root.map_or_else(UInt256::default, |c| c.repr_hash().clone()));
             Ok(dict_root.cloned())
         } else {
             self.storage_info.storage_extra.dict_hash = None;
@@ -574,10 +592,13 @@ impl AccountStuff {
         }
     }
 
-    fn init_storage_stat(&mut self, dict_hash_min_cells: u32) -> Result<Option<Cell>> {
+    fn calc_and_check_storage_stat_dict(
+        &mut self,
+        dict_hash_min_cells: u32,
+    ) -> Result<Option<Cell>> {
         let dict_hash = self.storage_info.dict_hash().cloned();
         let used = self.storage_info.used.clone();
-        let result = self.update_storage_stat(dict_hash_min_cells)?;
+        let result = self.calc_storage_stat_dict(dict_hash_min_cells)?;
         if dict_hash.as_ref() != self.storage_info.dict_hash() {
             fail!(
                 "Storage stat dict hash mismatch, expected {:?}, got {:?}",
@@ -600,7 +621,7 @@ impl AccountStuff {
             .storage_info
             .dict_hash()
             .ok_or_else(|| error!("Cannot import storage stat dict: dict_hash is None"))?;
-        if &dict.repr_hash() != dict_hash {
+        if dict.repr_hash() != dict_hash {
             fail!(
                 "Cannot import storage stat dict: hash mismatch, expected {:x}, got {:x}",
                 dict_hash,
@@ -610,6 +631,11 @@ impl AccountStuff {
         self.storage_stat =
             AccountStorageStat::try_from_dict(dict, &self.storage, &self.storage_info.used)?;
         Ok(())
+    }
+
+    fn precalc_storage_stat(&mut self) -> Result<&AccountStorageStat> {
+        self.storage_info.used = self.storage_stat.calc_stat(&self.storage)?;
+        Ok(&self.storage_stat)
     }
 }
 
@@ -648,7 +674,6 @@ impl Account {
         Account { stuff: None }
     }
     const fn with_stuff(stuff: AccountStuff) -> Self {
-        debug_assert!(stuff.addr.rewrite_pfx().is_none());
         Self { stuff: Some(stuff) }
     }
 
@@ -660,13 +685,12 @@ impl Account {
         state_init: StateInit,
         dict_hash_min_cells: u32,
     ) -> Result<Self> {
-        let mut account = Account::with_stuff(AccountStuff {
-            addr,
-            storage_info: StorageInfo::with_values(last_paid, None),
-            storage: AccountStorage::active(last_trans_lt, balance, state_init),
-            storage_stat: AccountStorageStat::new(),
-        });
-        account.update_storage_stat(dict_hash_min_cells)?;
+        let storage_info = StorageInfo::with_values(last_paid, None);
+        let storage = AccountStorage::active(last_trans_lt, balance, state_init);
+        let storage_stat = AccountStorageStat::new(&storage, &storage_info.used);
+        let mut account =
+            Account::with_stuff(AccountStuff { addr, storage_info, storage, storage_stat });
+        account.calc_storage_stat_dict(dict_hash_min_cells)?;
         Ok(account)
     }
 
@@ -692,11 +716,14 @@ impl Account {
     /// create unintialized account, only with address and balance
     ///
     pub fn with_address_and_ballance(addr: &MsgAddressInt, balance: &CurrencyCollection) -> Self {
+        let storage_info = StorageInfo::default();
+        let storage = AccountStorage::with_balance(balance.clone());
+        let storage_stat = AccountStorageStat::new(&storage, &storage_info.used);
         Account::with_stuff(AccountStuff {
             addr: addr.clone(),
-            storage_info: StorageInfo::default(),
-            storage: AccountStorage::with_balance(balance.clone()),
-            storage_stat: AccountStorageStat::new(),
+            storage_info,
+            storage,
+            storage_stat,
         })
     }
 
@@ -704,12 +731,10 @@ impl Account {
     /// Create unintialize account with zero balance
     ///
     pub fn with_address(addr: MsgAddressInt) -> Self {
-        Account::with_stuff(AccountStuff {
-            addr,
-            storage_info: StorageInfo::new(),
-            storage: AccountStorage::new(),
-            storage_stat: AccountStorageStat::new(),
-        })
+        let storage_info = StorageInfo::new();
+        let storage = AccountStorage::new();
+        let storage_stat = AccountStorageStat::new(&storage, &storage_info.used);
+        Account::with_stuff(AccountStuff { addr, storage_info, storage, storage_stat })
     }
 
     ///
@@ -727,11 +752,13 @@ impl Account {
         } else if hdr.bounce {
             return None;
         }
+        let storage_info = StorageInfo::new();
+        let storage_stat = AccountStorageStat::new(&storage, &storage_info.used);
         let account = Account::with_stuff(AccountStuff {
             addr: hdr.dst.clone(),
-            storage_info: StorageInfo::new(),
+            storage_info,
             storage,
-            storage_stat: AccountStorageStat::new(),
+            storage_stat,
         });
         Some(account)
     }
@@ -773,7 +800,7 @@ impl Account {
             last_paid,
             due_payment,
         };
-        let storage_stat = AccountStorageStat::new();
+        let storage_stat = AccountStorageStat::new(&storage, &storage_info.used);
         let stuff = AccountStuff { addr, storage_info, storage, storage_stat };
         Account::with_stuff(stuff)
     }
@@ -811,7 +838,7 @@ impl Account {
             last_paid,
             due_payment: None,
         };
-        let storage_stat = AccountStorageStat::new();
+        let storage_stat = AccountStorageStat::new(&storage, &storage_info.used);
         let stuff = AccountStuff { addr, storage_info, storage, storage_stat };
         Account::with_stuff(stuff)
     }
@@ -836,11 +863,12 @@ impl Account {
         storage_info: &StorageInfo,
         storage: &AccountStorage,
     ) -> Self {
+        let storage_stat = AccountStorageStat::new(storage, &storage_info.used);
         Account::with_stuff(AccountStuff {
             addr: addr.clone(),
             storage_info: storage_info.clone(),
             storage: storage.clone(),
-            storage_stat: AccountStorageStat::new(),
+            storage_stat,
         })
     }
 
@@ -887,16 +915,19 @@ impl Account {
         self.stuff().and_then(|s| s.storage_info.dict_hash())
     }
 
-    pub fn update_storage_stat(&mut self, dict_hash_min_cells: u32) -> Result<Option<Cell>> {
+    pub fn calc_storage_stat_dict(&mut self, dict_hash_min_cells: u32) -> Result<Option<Cell>> {
         match self.stuff_mut() {
-            Some(stuff) => stuff.update_storage_stat(dict_hash_min_cells),
+            Some(stuff) => stuff.calc_storage_stat_dict(dict_hash_min_cells),
             None => Ok(None),
         }
     }
 
-    pub fn init_storage_stat(&mut self, dict_hash_min_cells: u32) -> Result<Option<Cell>> {
+    pub fn calc_and_check_storage_stat_dict(
+        &mut self,
+        dict_hash_min_cells: u32,
+    ) -> Result<Option<Cell>> {
         match self.stuff_mut() {
-            Some(stuff) => stuff.init_storage_stat(dict_hash_min_cells),
+            Some(stuff) => stuff.calc_and_check_storage_stat_dict(dict_hash_min_cells),
             None => Ok(None),
         }
     }
@@ -909,8 +940,11 @@ impl Account {
         }
     }
 
-    pub fn storage_stat(&self) -> Option<&AccountStorageStat> {
-        self.stuff().map(|stuff| &stuff.storage_stat)
+    pub fn precalc_storage_stat(&mut self) -> Result<Option<&AccountStorageStat>> {
+        match self.stuff_mut() {
+            Some(stuff) => stuff.precalc_storage_stat().map(Some),
+            None => Ok(None),
+        }
     }
 
     pub fn del_storage_stat(&mut self) {
@@ -951,6 +985,11 @@ impl Account {
         }
     }
 
+    /// Storage roots (code/data/library) counted by the storage stat.
+    pub fn storage_roots(&self) -> StorageRoots {
+        AccountStorageStat::get_roots(self.state_init())
+    }
+
     pub fn state_init_mut(&mut self) -> Option<&mut StateInit> {
         self.stuff_mut().and_then(|stuff| stuff.state_init_mut())
     }
@@ -981,7 +1020,7 @@ impl Account {
 
     /// getting the hash of the root of the cell with Code of Smart Contract
     pub fn get_code_hash(&self) -> Option<UInt256> {
-        Some(self.state_init()?.code.as_ref()?.repr_hash())
+        Some(self.state_init()?.code.as_ref()?.repr_hash().clone())
     }
 
     /// getting the root of the cell with persistent Data of Smart Contract
@@ -996,7 +1035,7 @@ impl Account {
 
     /// getting hash of the root of the cell with persistent Data of Smart Contract
     pub fn get_data_hash(&self) -> Option<UInt256> {
-        Some(self.state_init()?.data.as_ref()?.repr_hash())
+        Some(self.state_init()?.data.as_ref()?.repr_hash().clone())
     }
 
     /// save persistent data of smart contract
@@ -1191,23 +1230,23 @@ impl Account {
 
     fn read_original_format(slice: &mut SliceData) -> Result<Self> {
         let addr = Deserializable::construct_from(slice)?;
-        let storage_info = Deserializable::construct_from(slice)?;
+        let storage_info: StorageInfo = Deserializable::construct_from(slice)?;
         let last_trans_lt = Deserializable::construct_from(slice)?; //last_trans_lt:uint64
         let balance = Deserializable::construct_from(slice)?; //balance:CurrencyCollection
         let state = Deserializable::construct_from(slice)?; //state:AccountState
         let storage = AccountStorage { last_trans_lt, balance, state };
-        let storage_stat = AccountStorageStat::new();
+        let storage_stat = AccountStorageStat::new(&storage, &storage_info.used);
         Ok(Account::with_stuff(AccountStuff { addr, storage_info, storage, storage_stat }))
     }
 
     fn read_version(slice: &mut SliceData, _version: u32) -> Result<Self> {
         let addr = Deserializable::construct_from(slice)?;
-        let storage_info = Deserializable::construct_from(slice)?;
+        let storage_info: StorageInfo = Deserializable::construct_from(slice)?;
         let last_trans_lt = Deserializable::construct_from(slice)?; //last_trans_lt:uint64
         let balance = CurrencyCollection::construct_from(slice)?; //balance:CurrencyCollection
         let state = Deserializable::construct_from(slice)?; //state:AccountState
         let storage = AccountStorage { last_trans_lt, balance, state };
-        let storage_stat = AccountStorageStat::new();
+        let storage_stat = AccountStorageStat::new(&storage, &storage_info.used);
         let stuff = AccountStuff { addr, storage_info, storage, storage_stat };
         Ok(Account::with_stuff(stuff))
     }
@@ -1249,10 +1288,9 @@ impl Augmentation<DepthBalanceInfo> for Account {
         if let Some(balance) = self.balance() {
             info.set_balance(balance.clone());
         }
-        if let Some(state_init) = self.state_init() {
-            if let Some(fixed_prefix_length) = state_init.fixed_prefix_length {
-                info.set_split_depth(fixed_prefix_length);
-            }
+        // split_depth from anycast
+        if let Some(anycast) = self.get_addr().and_then(|a| a.rewrite_pfx()) {
+            info.set_split_depth(anycast.depth.as_u32())?;
         }
         Ok(info)
     }

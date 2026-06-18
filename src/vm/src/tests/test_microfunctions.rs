@@ -14,7 +14,10 @@ use crate::{
         microcode::{CTRL, SAVELIST, VAR},
         Engine,
     },
-    stack::{continuation::ContinuationData, StackItem},
+    stack::{
+        continuation::{ContinuationData, ContinuationType},
+        StackItem,
+    },
 };
 use ton_block::{Cell, ExceptionCode, SliceData};
 
@@ -56,14 +59,19 @@ fn test_swap_with_none() {
         crate::error::tvm_exception_code(&swap(&mut engine, var!(1), ctrl!(4)).unwrap_err()),
         Some(ExceptionCode::TypeCheckError)
     );
-    // try to put NULL to c2 - Ok
+    // try to put NULL to c2 - Type Check Error
     assert!(!engine.ctrl(2).unwrap().is_null());
-    swap(&mut engine, var!(1), ctrl!(2)).unwrap();
-    assert_eq!(engine.ctrl(2).unwrap(), &StackItem::None);
+    assert_eq!(
+        crate::error::tvm_exception_code(&swap(&mut engine, var!(1), ctrl!(2)).unwrap_err()),
+        Some(ExceptionCode::TypeCheckError)
+    );
+    assert_ne!(engine.ctrl(2).unwrap(), &StackItem::None);
     // try to put CONT to c2 - Ok
+    let c2_before = engine.ctrl(2).unwrap().clone();
+    assert_eq!(c2_before.as_continuation().unwrap().type_of, ContinuationType::ExcQuit);
     engine.cmd.vars[0] = StackItem::continuation(ContinuationData::new_empty());
     swap(&mut engine, var!(0), ctrl!(2)).unwrap();
-    assert_eq!(engine.cmd.var(0), &StackItem::None);
+    assert_eq!(engine.cmd.var(0), &c2_before);
 }
 
 #[test]

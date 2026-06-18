@@ -51,7 +51,7 @@ pub mod utils {
     }
 
     fn count_tree_unique_cells_recursive(cell: Cell, unique_cells: &mut FnvHashSet<UInt256>) {
-        if unique_cells.insert(cell.repr_hash()) {
+        if unique_cells.insert(cell.repr_hash().clone()) {
             for i in 0..cell.references_count() {
                 count_tree_unique_cells_recursive(cell.reference(i).unwrap(), unique_cells);
             }

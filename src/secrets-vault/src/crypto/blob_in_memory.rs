@@ -6,6 +6,7 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+
 use crate::{
     memory::protected_memory::ProtectedMemory,
     types::{metadata::Metadata, secret::Blob, secret_id::SecretId},
@@ -22,7 +23,6 @@ impl BlobInMemory {
     }
 }
 
-#[async_trait::async_trait]
 impl Blob for BlobInMemory {
     fn id(&self) -> Option<&SecretId> {
         self.metadata.secret_id.as_ref()
@@ -32,7 +32,11 @@ impl Blob for BlobInMemory {
         &self.metadata
     }
 
-    async fn data(&self) -> anyhow::Result<ProtectedMemory> {
-        self.data.clone().await
+    fn metadata_mut(&mut self) -> &mut Metadata {
+        &mut self.metadata
+    }
+
+    fn data(&self) -> &ProtectedMemory {
+        &self.data
     }
 }

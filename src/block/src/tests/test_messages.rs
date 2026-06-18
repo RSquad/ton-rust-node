@@ -375,7 +375,7 @@ fn test_external_inbound_message_normalize() {
     let mut msg = Message::with_ext_in_header_and_body(h, body);
     println!("msg: {}", msg.write_to_base64().unwrap());
 
-    let hash = msg.serialize().unwrap().repr_hash();
+    let hash = msg.serialize().unwrap().repr_hash().clone();
     let hash = crate::base64_encode(&hash);
     assert_eq!(hash, "ZaaNsPLNFFGwWHZJCBM/LHiSyjbbPDBtpjS/ccx96vY=");
 

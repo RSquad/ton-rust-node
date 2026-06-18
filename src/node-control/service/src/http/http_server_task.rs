@@ -6,7 +6,22 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use super::login_rate_limiter::{LoginRateLimiter, login_limiter_key};
+use super::{
+    config_handlers::{
+        BindingDto, BindingElectionStatusDto, BindingsResponse, ElectionsSettingsDto,
+        ElectionsSettingsResponse, LogDto, LogResponse, MasterWalletDto, MasterWalletResponse,
+        NodeDto, NodesResponse, PoolDto, PoolsResponse, StaticAdnlDto, StaticAdnlResponse,
+        TonCorePoolSlotDataSource, TonCorePoolSlotDto, VotingConfigDto, VotingConfigResponse,
+        VotingProposalAddRequest, VotingProposalDetailDto, VotingProposalDetailResponse,
+        VotingProposalRowDto, VotingProposalsListResponse, WalletDto, WalletsResponse,
+        v1_bindings_handler, v1_contracts_automation_settings_handler,
+        v1_elections_settings_handler, v1_log_handler, v1_master_wallet_handler, v1_nodes_handler,
+        v1_pools_handler, v1_voting_config_handler, v1_voting_proposals_add_handler,
+        v1_voting_proposals_inspect_handler, v1_voting_proposals_list_handler,
+        v1_voting_proposals_rm_handler, v1_wallets_handler,
+    },
+    login_rate_limiter::{LoginRateLimiter, login_limiter_key},
+};
 use crate::{
     auth::{
         Claims,
@@ -18,7 +33,6 @@ use crate::{
     task::task_manager::{TaskController, TaskStatus},
 };
 use common::{
-    app_config::StakePolicy,
     snapshot::{
         ElectionsSnapshot, ElectionsStatus, OurElectionParticipant, SnapshotStore, TimeRange,
         ValidatorsSnapshot,
@@ -36,6 +50,9 @@ pub struct AppState {
     pub jwt_auth: Arc<JwtAuth>,
     pub user_store: Arc<UserStore>,
     pub(crate) login_rate_limiter: Arc<tokio::sync::Mutex<LoginRateLimiter>>,
+    /// Signalled by mutation handlers after structural config changes
+    /// (entity CRUD, ton-http-api) so the service loop can rebuild caches.
+    pub config_changed: Arc<tokio::sync::Notify>,
 }
 
 pub async fn run(
@@ -43,6 +60,7 @@ pub async fn run(
     store: Arc<SnapshotStore>,
     runtime_cfg: Arc<RuntimeConfigStore>,
     tasks: HashMap<&'static str, Arc<TaskController>>,
+    config_changed: Arc<tokio::sync::Notify>,
 ) {
     tracing::info!("http-server task started");
 
@@ -92,8 +110,15 @@ pub async fn run(
     let elections_task = tasks.get("elections").cloned().expect("elections task is not registered");
 
     let login_rate_limiter = Arc::new(tokio::sync::Mutex::new(LoginRateLimiter::default()));
-    let state =
-        AppState { store, runtime_cfg, elections_task, jwt_auth, user_store, login_rate_limiter };
+    let state = AppState {
+        store,
+        runtime_cfg,
+        elections_task,
+        jwt_auth,
+        user_store,
+        login_rate_limiter,
+        config_changed,
+    };
     let app = routes(enable_swagger, state);
 
     let listener = match tokio::net::TcpListener::bind(bind_addr).await {
@@ -135,7 +160,24 @@ pub(crate) fn routes(enable_swagger: bool, state: AppState) -> axum::Router {
     // request and passes through when `http.auth` is not configured.
     let authenticated = axum::Router::new()
         .route("/v1/elections", axum::routing::get(v1_elections_handler))
+        .route("/v1/elections/settings", axum::routing::get(v1_elections_settings_handler))
         .route("/v1/validators", axum::routing::get(v1_validators_handler))
+        .route("/v1/nodes", axum::routing::get(v1_nodes_handler))
+        .route("/v1/wallets", axum::routing::get(v1_wallets_handler))
+        .route("/v1/pools", axum::routing::get(v1_pools_handler))
+        .route("/v1/bindings", axum::routing::get(v1_bindings_handler))
+        .route(
+            "/v1/automation/settings",
+            axum::routing::get(v1_contracts_automation_settings_handler),
+        )
+        .route("/v1/log", axum::routing::get(v1_log_handler))
+        .route("/v1/voting/config", axum::routing::get(v1_voting_config_handler))
+        .route("/v1/voting/proposals", axum::routing::get(v1_voting_proposals_list_handler))
+        .route(
+            "/v1/voting/proposals/{hash}",
+            axum::routing::get(v1_voting_proposals_inspect_handler),
+        )
+        .route("/v1/master-wallet", axum::routing::get(v1_master_wallet_handler))
         .route("/auth/me", axum::routing::get(me_handler))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -145,8 +187,56 @@ pub(crate) fn routes(enable_swagger: bool, state: AppState) -> axum::Router {
     let operator_only = axum::Router::new()
         .route("/v1/elections/exclude", axum::routing::post(v1_elections_exclude_handler))
         .route("/v1/elections/include", axum::routing::post(v1_elections_include_handler))
-        .route("/v1/stake_strategy", axum::routing::post(v1_stake_strategy_handler))
+        .route(
+            "/v1/elections/settings",
+            axum::routing::post(super::config_handlers::v1_elections_settings_update_handler),
+        )
+        .route(
+            "/v1/automation/settings",
+            axum::routing::post(
+                super::config_handlers::v1_contracts_automation_settings_update_handler,
+            ),
+        )
+        .route(
+            "/v1/elections/static-adnl",
+            axum::routing::post(super::config_handlers::v1_elections_static_adnl_handler),
+        )
+        .route(
+            "/v1/elections/static-adnl/{node}",
+            axum::routing::delete(super::config_handlers::v1_elections_static_adnl_disable_handler),
+        )
+        .route("/v1/voting/proposals", axum::routing::post(v1_voting_proposals_add_handler))
+        .route("/v1/voting/proposals/{hash}", axum::routing::delete(v1_voting_proposals_rm_handler))
         .route("/v1/task/elections", axum::routing::post(v1_task_elections_handler))
+        .route("/v1/nodes", axum::routing::post(super::config_handlers::v1_nodes_add_handler))
+        .route(
+            "/v1/nodes/{name}",
+            axum::routing::delete(super::config_handlers::v1_nodes_rm_handler),
+        )
+        .route("/v1/wallets", axum::routing::post(super::config_handlers::v1_wallets_add_handler))
+        .route(
+            "/v1/wallets/{name}",
+            axum::routing::delete(super::config_handlers::v1_wallets_rm_handler),
+        )
+        .route("/v1/pools", axum::routing::post(super::config_handlers::v1_pools_add_handler))
+        .route(
+            "/v1/pools/core",
+            axum::routing::post(super::config_handlers::v1_pools_add_core_handler),
+        )
+        .route(
+            "/v1/pools/{name}",
+            axum::routing::delete(super::config_handlers::v1_pools_rm_handler),
+        )
+        .route("/v1/bindings", axum::routing::post(super::config_handlers::v1_bindings_add_handler))
+        .route(
+            "/v1/bindings/{node}",
+            axum::routing::delete(super::config_handlers::v1_bindings_rm_handler),
+        )
+        .route(
+            "/v1/ton-http-api",
+            axum::routing::post(super::config_handlers::v1_ton_http_api_handler),
+        )
+        .route("/v1/log", axum::routing::post(super::config_handlers::v1_log_set_handler))
         .route("/auth/users", axum::routing::get(list_users_handler))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -182,7 +272,7 @@ pub struct AppError {
 }
 
 impl AppError {
-    fn bad_request(message: impl Into<String>) -> Self {
+    pub(crate) fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: axum::http::StatusCode::BAD_REQUEST,
             body: ApiErrorBody { code: 400, message: message.into() },
@@ -203,18 +293,26 @@ impl AppError {
         }
     }
 
-    #[allow(dead_code)]
-    fn not_found(message: impl Into<String>) -> Self {
+    pub(crate) fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: axum::http::StatusCode::NOT_FOUND,
             body: ApiErrorBody { code: 404, message: message.into() },
         }
     }
 
-    fn internal(message: impl Into<String>) -> Self {
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self {
             status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             body: ApiErrorBody { code: 500, message: message.into() },
+        }
+    }
+
+    /// `503 Service Unavailable` — for upstream dependencies that are down
+    /// (e.g. ton-http-api unreachable).
+    pub(crate) fn service_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            body: ApiErrorBody { code: 503, message: message.into() },
         }
     }
 }
@@ -253,30 +351,6 @@ pub struct ElectionsQuery {
 pub struct ValidatorsResponse {
     pub ok: bool,
     pub result: ValidatorsSnapshot,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
-pub struct StakePolicyRequest {
-    pub policy: StakePolicy,
-    /// If set, the policy is applied as a per-node override.
-    /// If omitted, it sets the default policy for all nodes.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub node: Option<String>,
-}
-
-#[derive(Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
-pub struct StakePolicyApplied {
-    pub policy: StakePolicy,
-    /// If set, the policy was applied to this specific node only.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub node: Option<String>,
-    pub applied_at: u64,
-}
-
-#[derive(Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
-pub struct StakePolicyResponse {
-    pub ok: bool,
-    pub result: StakePolicyApplied,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
@@ -439,7 +513,7 @@ pub async fn v1_elections_exclude_handler(
     let to_exclude = req.nodes.clone();
     state
         .runtime_cfg
-        .update_with(|cfg| {
+        .update_and_save(|cfg| {
             for node_id in &to_exclude {
                 if let Some(binding) = cfg.bindings.get_mut(node_id) {
                     binding.enable = false;
@@ -490,7 +564,7 @@ pub async fn v1_elections_include_handler(
     let to_include = req.nodes.clone();
     state
         .runtime_cfg
-        .update_with(|cfg| {
+        .update_and_save(|cfg| {
             for node_id in &to_include {
                 if let Some(binding) = cfg.bindings.get_mut(node_id) {
                     binding.enable = true;
@@ -533,57 +607,6 @@ pub async fn v1_validators_handler(
 ) -> axum::Json<ValidatorsResponse> {
     let snapshot = state.store.get();
     axum::Json(ValidatorsResponse { ok: true, result: snapshot.validators })
-}
-
-#[utoipa::path(
-    post,
-    path = "/v1/stake_strategy",
-    request_body = StakePolicyRequest,
-    responses(
-        (status = 200, description = "Applied stake policy", body = StakePolicyResponse),
-        (status = 400, description = "Invalid request", body = ApiErrorResponse),
-        (status = 401, description = "Not authenticated", body = ApiErrorResponse),
-        (status = 500, description = "Internal error", body = ApiErrorResponse)
-    ),
-    security(("bearerAuth" = []))
-)]
-pub async fn v1_stake_strategy_handler(
-    state: axum::extract::State<AppState>,
-    req: axum::Json<StakePolicyRequest>,
-) -> Result<axum::Json<StakePolicyResponse>, AppError> {
-    if matches!(req.policy, StakePolicy::Fixed(0)) {
-        return Err(AppError::bad_request("fixed stake must be > 0"));
-    }
-    if state.runtime_cfg.get().elections.is_none() {
-        return Err(AppError::bad_request("elections are not configured"));
-    }
-
-    let policy = req.policy.clone();
-    let node_id = req.node.clone();
-    state
-        .runtime_cfg
-        .update_with(|cfg| {
-            if let Some(elections) = &mut cfg.elections {
-                if let Some(node_id) = node_id {
-                    elections.policy_overrides.insert(node_id, policy);
-                } else {
-                    elections.policy = policy;
-                }
-            }
-        })
-        .map_err(|e| AppError::internal(e.to_string()))?;
-
-    let task = state.elections_task.clone();
-    tokio::spawn(async move {
-        let _ = task.restart().await;
-    });
-
-    let applied = StakePolicyApplied {
-        policy: req.policy.clone(),
-        node: req.node.clone(),
-        applied_at: state.runtime_cfg.updated_at(),
-    };
-    Ok(axum::Json(StakePolicyResponse { ok: true, result: applied }))
 }
 
 #[utoipa::path(
@@ -850,8 +873,36 @@ impl utoipa::Modify for BearerAuthAddon {
         v1_elections_exclude_handler,
         v1_elections_include_handler,
         v1_validators_handler,
-        v1_stake_strategy_handler,
         v1_task_elections_handler,
+        super::config_handlers::v1_elections_settings_update_handler,
+        super::config_handlers::v1_contracts_automation_settings_handler,
+        super::config_handlers::v1_contracts_automation_settings_update_handler,
+        super::config_handlers::v1_elections_static_adnl_handler,
+        super::config_handlers::v1_elections_static_adnl_disable_handler,
+        // It won't compile without full names
+        super::config_handlers::v1_nodes_handler,
+        super::config_handlers::v1_nodes_add_handler,
+        super::config_handlers::v1_nodes_rm_handler,
+        super::config_handlers::v1_wallets_handler,
+        super::config_handlers::v1_wallets_add_handler,
+        super::config_handlers::v1_wallets_rm_handler,
+        super::config_handlers::v1_pools_handler,
+        super::config_handlers::v1_pools_add_handler,
+        super::config_handlers::v1_pools_add_core_handler,
+        super::config_handlers::v1_pools_rm_handler,
+        super::config_handlers::v1_bindings_handler,
+        super::config_handlers::v1_bindings_add_handler,
+        super::config_handlers::v1_bindings_rm_handler,
+        super::config_handlers::v1_ton_http_api_handler,
+        super::config_handlers::v1_log_set_handler,
+        super::config_handlers::v1_elections_settings_handler,
+        super::config_handlers::v1_log_handler,
+        super::config_handlers::v1_voting_config_handler,
+        super::config_handlers::v1_voting_proposals_list_handler,
+        super::config_handlers::v1_voting_proposals_inspect_handler,
+        super::config_handlers::v1_voting_proposals_add_handler,
+        super::config_handlers::v1_voting_proposals_rm_handler,
+        super::config_handlers::v1_master_wallet_handler,
         login_handler,
         me_handler,
         list_users_handler
@@ -865,9 +916,17 @@ impl utoipa::Modify for BearerAuthAddon {
         ValidatorsResponse,
         common::app_config::StakePolicy,
         common::app_config::BindingStatus,
-        StakePolicyRequest,
-        StakePolicyApplied,
-        StakePolicyResponse,
+        common::app_config::LogRotation,
+        common::app_config::LogOutput,
+        common::app_config::TonCoreDeployMode,
+        super::config_handlers::ContractsAutomationSettingsResponse,
+        super::config_handlers::ContractsAutomationSettingsUpdateRequest,
+        super::config_handlers::ElectionsSettingsUpdateRequest,
+        super::config_handlers::WalletAmountsPatch,
+        super::config_handlers::PoolAmountsPatch,
+        common::app_config::ContractsAutomationConfig,
+        common::app_config::WalletAmounts,
+        common::app_config::PoolAmounts,
         ElectionsTaskAction,
         ElectionsTaskControlRequest,
         TaskStatusDto,
@@ -875,6 +934,45 @@ impl utoipa::Modify for BearerAuthAddon {
         ElectionsTaskControlResponse,
         ElectionsExcludeResult,
         ElectionsExcludeResponse,
+        NodeDto,
+        NodesResponse,
+        WalletDto,
+        WalletsResponse,
+        PoolDto,
+        PoolsResponse,
+        TonCorePoolSlotDataSource,
+        TonCorePoolSlotDto,
+        BindingDto,
+        BindingsResponse,
+        super::config_handlers::NodeAddRequest,
+        super::config_handlers::WalletAddRequest,
+        super::config_handlers::PoolAddRequest,
+        super::config_handlers::PoolAddCoreRequest,
+        super::config_handlers::BindingAddRequest,
+        super::config_handlers::EntityRefDto,
+        super::config_handlers::EntityRefResponse,
+        super::config_handlers::OkResponse,
+        super::config_handlers::StaticAdnlRequest,
+        StaticAdnlDto,
+        StaticAdnlResponse,
+        super::config_handlers::TonHttpApiRequest,
+        super::config_handlers::TonHttpApiResult,
+        super::config_handlers::TonHttpApiResponse,
+        super::config_handlers::LogSetRequest,
+        BindingElectionStatusDto,
+        ElectionsSettingsDto,
+        ElectionsSettingsResponse,
+        LogDto,
+        LogResponse,
+        VotingConfigDto,
+        VotingConfigResponse,
+        VotingProposalAddRequest,
+        VotingProposalRowDto,
+        VotingProposalsListResponse,
+        VotingProposalDetailDto,
+        VotingProposalDetailResponse,
+        MasterWalletDto,
+        MasterWalletResponse,
         LoginRequest,
         LoginResponse,
         MeResponse,
@@ -959,6 +1057,7 @@ mod tests {
             jwt_auth: test_jwt_auth().await,
             user_store,
             login_rate_limiter: Arc::new(tokio::sync::Mutex::new(LoginRateLimiter::default())),
+            config_changed: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -981,6 +1080,7 @@ mod tests {
             voting: None,
             master_wallet: None,
             tick_interval: 30,
+            automation: Default::default(),
             log: Some(LogConfig::default()),
         })
     }
@@ -997,6 +1097,7 @@ mod tests {
             voting: None,
             master_wallet: None,
             tick_interval: 30,
+            automation: Default::default(),
             log: Some(LogConfig::default()),
         })
     }
@@ -1051,8 +1152,8 @@ mod tests {
 
         let resp = app
             .oneshot(post_json(
-                "/v1/stake_strategy",
-                &StakePolicyRequest { policy: StakePolicy::Fixed(0), node: None },
+                "/v1/elections/settings",
+                &serde_json::json!({ "policy": { "fixed": 0 } }),
             ))
             .await
             .unwrap();
@@ -1074,8 +1175,8 @@ mod tests {
 
         let resp = app
             .oneshot(post_json(
-                "/v1/stake_strategy",
-                &StakePolicyRequest { policy: StakePolicy::Fixed(123), node: None },
+                "/v1/elections/settings",
+                &serde_json::json!({ "policy": { "fixed": 123 } }),
             ))
             .await
             .unwrap();
@@ -1083,8 +1184,7 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let v = body_json(resp).await;
         assert_eq!(v["ok"], true);
-        assert_eq!(v["result"]["policy"]["fixed"], 123);
-        assert!(v["result"]["applied_at"].as_u64().unwrap_or(0) > 0);
+        assert_eq!(v["result"]["stake_policy"]["fixed"], 123);
     }
 
     #[tokio::test]
@@ -1099,11 +1199,8 @@ mod tests {
 
         let resp = app
             .oneshot(post_json(
-                "/v1/stake_strategy",
-                &StakePolicyRequest {
-                    policy: StakePolicy::Fixed(500),
-                    node: Some("node1".to_string()),
-                },
+                "/v1/elections/settings",
+                &serde_json::json!({ "policy": { "fixed": 500 }, "node": "node1" }),
             ))
             .await
             .unwrap();
@@ -1111,13 +1208,224 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let v = body_json(resp).await;
         assert_eq!(v["ok"], true);
-        assert_eq!(v["result"]["policy"]["fixed"], 500);
-        assert_eq!(v["result"]["node"], "node1");
 
         let cfg = runtime_cfg.get();
         let elections = cfg.elections.as_ref().unwrap();
         assert!(matches!(elections.policy, StakePolicy::Minimum));
         assert!(matches!(elections.policy_overrides.get("node1"), Some(StakePolicy::Fixed(500))));
+    }
+
+    #[tokio::test]
+    async fn elections_settings_adaptive_timing_invalid_returns_400() {
+        let store = Arc::new(SnapshotStore::new());
+        let runtime_cfg =
+            Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
+        let elections_task = test_elections_task();
+        let app = routes(false, test_state(store, runtime_cfg, elections_task).await);
+
+        let resp = app
+            .oneshot(post_json(
+                "/v1/elections/settings",
+                &serde_json::json!({ "sleep_period_pct": 0.9, "waiting_period_pct": 0.2 }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 400);
+        let v = body_json(resp).await;
+        assert_eq!(v["ok"], false);
+    }
+
+    #[tokio::test]
+    async fn elections_settings_adaptive_timing_update_returns_200() {
+        let store = Arc::new(SnapshotStore::new());
+        let runtime_cfg =
+            Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
+        let elections_task = test_elections_task();
+        let state = test_state(store, runtime_cfg.clone(), elections_task).await;
+        let app = routes(false, state);
+
+        let resp = app
+            .clone()
+            .oneshot(post_json(
+                "/v1/elections/settings",
+                &serde_json::json!({ "sleep_period_pct": 0.25, "waiting_period_pct": 0.75 }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["result"]["sleep_period_pct"], 0.25);
+        assert_eq!(v["result"]["waiting_period_pct"], 0.75);
+
+        let cfg = runtime_cfg.get();
+        let elections = cfg.elections.as_ref().unwrap();
+        assert_eq!(elections.sleep_period_pct, 0.25);
+        assert_eq!(elections.waiting_period_pct, 0.75);
+
+        let resp = app.oneshot(get_request("/v1/elections/settings")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        assert_eq!(v["result"]["sleep_period_pct"], 0.25);
+        assert_eq!(v["result"]["waiting_period_pct"], 0.75);
+    }
+
+    #[tokio::test]
+    async fn contracts_automation_settings_get_returns_defaults() {
+        let store = Arc::new(SnapshotStore::new());
+        let runtime_cfg =
+            Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
+        let elections_task = test_elections_task();
+        let app = routes(false, test_state(store, runtime_cfg, elections_task).await);
+
+        let resp = app.oneshot(get_request("/v1/automation/settings")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["result"]["tick_interval_sec"], 40);
+        assert_eq!(v["result"]["auto_deploy"], true);
+        assert_eq!(v["result"]["auto_topup"], true);
+    }
+
+    #[tokio::test]
+    async fn contracts_automation_settings_post_updates_tick() {
+        let store = Arc::new(SnapshotStore::new());
+        let runtime_cfg =
+            Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
+        let elections_task = test_elections_task();
+        let app = routes(false, test_state(store, runtime_cfg.clone(), elections_task).await);
+
+        let resp = app
+            .oneshot(post_json(
+                "/v1/automation/settings",
+                &serde_json::json!({ "tick_interval_sec": 60 }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["result"]["tick_interval_sec"], 60);
+        assert_eq!(runtime_cfg.get().automation.tick_interval_sec, 60);
+    }
+
+    #[tokio::test]
+    async fn contracts_automation_settings_post_empty_body_400() {
+        let store = Arc::new(SnapshotStore::new());
+        let runtime_cfg =
+            Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
+        let elections_task = test_elections_task();
+        let app = routes(false, test_state(store, runtime_cfg, elections_task).await);
+
+        let resp = app
+            .oneshot(post_json("/v1/automation/settings", &serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn contracts_automation_settings_post_invalid_tick_400() {
+        let store = Arc::new(SnapshotStore::new());
+        let runtime_cfg =
+            Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
+        let elections_task = test_elections_task();
+        let app = routes(false, test_state(store, runtime_cfg, elections_task).await);
+
+        let resp = app
+            .oneshot(post_json(
+                "/v1/automation/settings",
+                &serde_json::json!({ "tick_interval_sec": 0 }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn contracts_automation_settings_post_merges_wallet_deploy_and_toggles() {
+        let store = Arc::new(SnapshotStore::new());
+        let runtime_cfg =
+            Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
+        let elections_task = test_elections_task();
+        let app = routes(false, test_state(store, runtime_cfg.clone(), elections_task).await);
+
+        let resp = app
+            .oneshot(post_json(
+                "/v1/automation/settings",
+                &serde_json::json!({
+                    "wallet": { "deploy": 2_000_000_000u64 },
+                    "auto_deploy": false,
+                    "auto_topup": false,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["result"]["wallet"]["deploy"].as_u64().unwrap(), 2_000_000_000);
+        assert_eq!(v["result"]["auto_deploy"], false);
+        assert_eq!(v["result"]["auto_topup"], false);
+
+        let cfg = runtime_cfg.get();
+        assert_eq!(cfg.automation.wallet.deploy, 2_000_000_000);
+        assert!(!cfg.automation.auto_deploy);
+        assert!(!cfg.automation.auto_topup);
+    }
+
+    #[tokio::test]
+    async fn contracts_automation_settings_post_partial_pool_deploy_preserves_snp() {
+        let store = Arc::new(SnapshotStore::new());
+        let runtime_cfg =
+            Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
+        let elections_task = test_elections_task();
+        let app = routes(false, test_state(store, runtime_cfg.clone(), elections_task).await);
+
+        let snp_before = runtime_cfg.get().automation.pool.snp;
+
+        let resp = app
+            .oneshot(post_json(
+                "/v1/automation/settings",
+                &serde_json::json!({
+                    "pool": { "ton_core": 3_000_000_000u64 },
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["result"]["pool"]["snp"].as_u64().unwrap(), snp_before);
+        assert_eq!(v["result"]["pool"]["ton_core"].as_u64().unwrap(), 3_000_000_000u64);
+
+        let cfg = runtime_cfg.get();
+        assert_eq!(cfg.automation.pool.snp, snp_before);
+        assert_eq!(cfg.automation.pool.ton_core, 3_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn contracts_automation_settings_post_updates_wallet_topup() {
+        let store = Arc::new(SnapshotStore::new());
+        let runtime_cfg =
+            Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
+        let elections_task = test_elections_task();
+        let app = routes(false, test_state(store, runtime_cfg.clone(), elections_task).await);
+
+        let resp = app
+            .oneshot(post_json(
+                "/v1/automation/settings",
+                &serde_json::json!({ "wallet": { "topup": 9_500_000_000u64 } }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["result"]["wallet"]["topup"].as_u64().unwrap(), 9_500_000_000u64);
+
+        assert_eq!(runtime_cfg.get().automation.wallet.topup, 9_500_000_000);
     }
 
     #[tokio::test]
@@ -1417,6 +1725,10 @@ mod tests {
         assert!(v["paths"].as_object().unwrap().contains_key("/health"));
         assert!(v["paths"].as_object().unwrap().contains_key("/v1/elections"));
         assert!(v["paths"].as_object().unwrap().contains_key("/v1/validators"));
+        assert!(v["paths"].as_object().unwrap().contains_key("/v1/automation/settings"));
+        assert!(v["paths"].as_object().unwrap().contains_key("/v1/voting/config"));
+        assert!(v["paths"].as_object().unwrap().contains_key("/v1/voting/proposals"));
+        assert!(v["paths"].as_object().unwrap().contains_key("/v1/voting/proposals/{hash}"));
         let schemas = v["components"]["schemas"].as_object().unwrap();
         assert!(schemas.contains_key("ElectionsStatus"));
         assert!(schemas.contains_key("NodeListRequest"));

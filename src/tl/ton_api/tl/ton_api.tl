@@ -697,7 +697,7 @@ engine.validator.config out_port:int addrs:(vector engine.Addr) adnl:(vector eng
 
 engine.validator.customOverlayNode adnl_id:int256 msg_sender:Bool msg_sender_priority:int block_sender:Bool = engine.validator.CustomOverlayNode;
 engine.validator.customOverlay name:string nodes:(vector engine.validator.customOverlayNode) sender_shards:(vector tonNode.shardId)
-    skip_public_msg_send:Bool = engine.validator.CustomOverlay;
+    skip_public_msg_send:Bool use_quic:Bool = engine.validator.CustomOverlay;
 engine.validator.customOverlaysConfig overlays:(vector engine.validator.customOverlay) = engine.validator.CustomOverlaysConfig;
 
 engine.validator.collatorOptions
@@ -1077,6 +1077,7 @@ quic.answer data:bytes = quic.Response;
 //
 // Overlay and session identification
 consensus.overlayId session_id:int256 nodes:(vector int256) = consensus.OverlayId;
+consensus.blockSyncOverlayId session_id:int256 = consensus.BlockOverlayId;
 consensus.dataToSign session_id:int256 data:bytes = consensus.DataToSign;
 
 // Candidate identification (slot + hash pair)
@@ -1113,9 +1114,10 @@ consensus.simplex.candidateAndCert candidate:bytes notar:bytes = consensus.simpl
 
 // Vote storage (for bootstrap/restart recovery)
 // C++ parity: db.cpp stores votes with monotonic seqno for replay ordering.
-// Reference: C++ consensus.simplex.db.ourVote vote:UnsignedVote seqno:long
+// Reference: C++ consensus.simplex.db.{ourVote,cert} under key.vote
 consensus.simplex.db.key.vote vote_hash:int256 = consensus.simplex.db.key.Vote;
 consensus.simplex.db.vote data:bytes node_idx:int seqno:long = consensus.simplex.db.Vote;
+consensus.simplex.db.cert cert:consensus.simplex.certificate = consensus.simplex.db.Vote;
 
 // Pool state (first non-announced window for restart)
 consensus.simplex.db.key.poolState = consensus.simplex.db.key.PoolState;

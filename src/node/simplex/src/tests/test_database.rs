@@ -12,7 +12,7 @@ use super::*;
 use crate::{
     block::{RawCandidateId, SlotIndex, ValidatorIndex},
     certificate::{Certificate, VoteSignature},
-    simplex_state::NotarizeVote,
+    simplex_state::{FinalizeVote, NotarizeVote, SkipVote},
 };
 use consensus_common::SessionId;
 use std::{
@@ -124,6 +124,31 @@ fn create_notar_cert(slot: u32, block_hash: &UInt256, num_signatures: usize) -> 
     }
 }
 
+fn create_final_cert(slot: u32, block_hash: &UInt256, num_signatures: usize) -> FinalCert {
+    let signatures: Vec<VoteSignature> = (0..num_signatures)
+        .map(|i| VoteSignature {
+            validator_idx: ValidatorIndex::new(i as u32),
+            signature: vec![i as u8; 64],
+        })
+        .collect();
+
+    Certificate {
+        vote: FinalizeVote { slot: SlotIndex::new(slot), block_hash: block_hash.clone() },
+        signatures,
+    }
+}
+
+fn create_skip_cert(slot: u32, num_signatures: usize) -> SkipCert {
+    let signatures: Vec<VoteSignature> = (0..num_signatures)
+        .map(|i| VoteSignature {
+            validator_idx: ValidatorIndex::new(i as u32),
+            signature: vec![i as u8; 64],
+        })
+        .collect();
+
+    Certificate { vote: SkipVote { slot: SlotIndex::new(slot) }, signatures }
+}
+
 // ============================================================================
 // Finalized Block Tests
 // ============================================================================
@@ -194,6 +219,49 @@ fn test_save_finalized_block_with_parent() {
     assert_eq!(parent.slot, parent_id.slot);
     assert_eq!(parent.hash, parent_id.hash);
     assert!(!records[1].is_final);
+
+    db.mark_for_destroy();
+}
+
+#[test]
+fn test_load_finalized_blocks_keeps_empty_mc_immediate_parent_chain() {
+    let (_db_root, db) = create_test_db("test_load_finalized_blocks_keeps_empty_mc_chain");
+
+    let c1 = create_candidate_id(1, 0xA1);
+    let c2 = create_candidate_id(2, 0xA2);
+    let c3 = create_candidate_id(3, 0xA3);
+
+    db.save_finalized_block(&FinalizedBlockRecord {
+        candidate_id: c1.clone(),
+        block_id: create_block_id(1000),
+        parent: None,
+        is_final: true,
+    })
+    .unwrap();
+    db.save_finalized_block(&FinalizedBlockRecord {
+        candidate_id: c2.clone(),
+        block_id: create_block_id(1000),
+        parent: Some(c1.clone()),
+        is_final: true,
+    })
+    .unwrap();
+    db.save_finalized_block(&FinalizedBlockRecord {
+        candidate_id: c3.clone(),
+        block_id: create_block_id(1001),
+        parent: Some(c2.clone()),
+        is_final: true,
+    })
+    .unwrap();
+
+    db.sync(Some(Duration::from_secs(5))).unwrap();
+
+    let records = db.load_finalized_blocks().unwrap();
+    assert_eq!(records.len(), 3);
+    assert!(records[0].parent.is_none());
+    assert_eq!(records[1].parent.as_ref(), Some(&c1));
+    assert_eq!(records[1].block_id.seq_no, 1000);
+    assert_eq!(records[2].parent.as_ref(), Some(&c2));
+    assert_eq!(records[2].block_id.seq_no, 1001);
 
     db.mark_for_destroy();
 }
@@ -315,6 +383,76 @@ fn test_load_multiple_notar_certs() {
 
     let records = db.load_notar_certs().unwrap();
     assert_eq!(records.len(), 3);
+
+    db.mark_for_destroy();
+}
+
+#[test]
+fn test_save_and_load_final_cert() {
+    let (_db_root, db) = create_test_db("test_save_and_load_final_cert");
+
+    let candidate_id = create_candidate_id(7, 0xAB);
+    let cert = create_final_cert(7, &candidate_id.hash, 3);
+    db.save_final_cert(&candidate_id, &cert).unwrap();
+    db.sync(Some(Duration::from_secs(5))).unwrap();
+
+    let records = db.load_final_certs().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].candidate_id, candidate_id);
+    assert!(!records[0].cert_bytes.is_empty());
+
+    let loaded = db
+        .load_final_cert_by_id(&candidate_id, Duration::from_secs(5))
+        .unwrap()
+        .expect("final cert must be readable by candidate id");
+    assert_eq!(loaded.candidate_id, candidate_id);
+    assert!(!loaded.cert_bytes.is_empty());
+
+    db.mark_for_destroy();
+}
+
+#[test]
+fn test_save_and_load_skip_cert() {
+    let (_db_root, db) = create_test_db("test_save_and_load_skip_cert");
+
+    let slot = SlotIndex::new(13);
+    let cert = create_skip_cert(slot.value(), 3);
+    db.save_skip_cert(slot, &cert).unwrap();
+    db.sync(Some(Duration::from_secs(5))).unwrap();
+
+    let records = db.load_skip_certs().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].slot, slot);
+    assert!(!records[0].cert_bytes.is_empty());
+
+    let loaded = db
+        .load_skip_cert_by_slot(slot, Duration::from_secs(5))
+        .unwrap()
+        .expect("skip cert must be readable by slot");
+    assert_eq!(loaded.slot, slot);
+    assert!(!loaded.cert_bytes.is_empty());
+
+    db.mark_for_destroy();
+}
+
+#[test]
+fn test_bootstrap_includes_final_and_skip_certs() {
+    let (_db_root, db) = create_test_db("test_bootstrap_includes_final_and_skip_certs");
+
+    let candidate_id = create_candidate_id(5, 0xBC);
+    let final_cert = create_final_cert(5, &candidate_id.hash, 3);
+    let skip_slot = SlotIndex::new(6);
+    let skip_cert = create_skip_cert(skip_slot.value(), 3);
+
+    db.save_final_cert(&candidate_id, &final_cert).unwrap();
+    db.save_skip_cert(skip_slot, &skip_cert).unwrap();
+    db.sync(Some(Duration::from_secs(5))).unwrap();
+
+    let bootstrap = db.load_bootstrap().unwrap();
+    assert_eq!(bootstrap.final_certs.len(), 1);
+    assert_eq!(bootstrap.final_certs[0].candidate_id, candidate_id);
+    assert_eq!(bootstrap.skip_certs.len(), 1);
+    assert_eq!(bootstrap.skip_certs[0].slot, skip_slot);
 
     db.mark_for_destroy();
 }

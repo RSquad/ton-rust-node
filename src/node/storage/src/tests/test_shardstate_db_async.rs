@@ -61,7 +61,6 @@ async fn test_shardstate_db_async() -> Result<()> {
         "shardstate_db",
         "cells",
         "counters",
-        DB_NAME,
         CellsDbConfig::default(),
         #[cfg(feature = "telemetry")]
         Arc::new(StorageTelemetry::default()),
@@ -76,7 +75,7 @@ async fn test_shardstate_db_async() -> Result<()> {
         let block_id_ext = BlockIdExt::with_params(
             ShardIdent::with_tagged_prefix(-1, 0x8000_0000_0000_0000)?,
             i,
-            root_cell.repr_hash(),
+            root_cell.repr_hash().clone(),
             UInt256::default(),
         );
         ss_db.put(&block_id_ext, root_cell.clone(), None).await?;
@@ -89,7 +88,7 @@ async fn test_shardstate_db_async() -> Result<()> {
         let block_id_ext = BlockIdExt::with_params(
             ShardIdent::with_tagged_prefix(-1, 0x8000_0000_0000_0000)?,
             i,
-            root_cell.repr_hash(),
+            root_cell.repr_hash().clone(),
             UInt256::default(),
         );
         let res = ss_db.get(&block_id_ext);

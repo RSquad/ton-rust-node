@@ -12,11 +12,12 @@ use crate::collator_test_bundle::create_engine_telemetry;
 use crate::{
     collator_test_bundle::create_engine_allocated,
     config::{JsonRpcServerConfig, JsonRpcServerConfigJson},
+    confirmed_blocks::{ConfirmedBlockEvent, ConfirmedBlockEvents, ConfirmedBlockSource},
     engine_traits::{EngineOperations, Stoppable},
     internal_db::state_gc_resolver::AllowStateGcSmartResolver,
     rpc_server::{
-        jsonrpc_handler, rest_ok, wallets::WalletLibrary, Ctx, JsonRpcRequest, RpcRegistry,
-        RpcServer,
+        confirmed_block_events_handler, jsonrpc_handler, rest_ok, wallets::WalletLibrary,
+        ConfirmedBlockEventsQuery, Ctx, JsonRpcRequest, RpcRegistry, RpcServer,
     },
     shard_state::ShardStateStuff,
     shard_states_keeper::PinnedShardStateGuard,
@@ -25,9 +26,9 @@ use crate::{
 use http_body_util::BodyExt;
 use std::{collections::HashMap, sync::Arc};
 use ton_block::{
-    base64_encode, error, Account, AccountIdPrefixFull, BlockIdExt, BuilderData, ConfigParam8,
-    ConfigParamEnum, ConfigParams, GlobalVersion, LibDescr, Libraries, MsgAddressInt, Result,
-    ShardIdent, UInt256,
+    base64_decode, base64_encode, error, read_single_root_boc, Account, AccountIdPrefixFull,
+    BlockIdExt, BuilderData, ConfigParam8, ConfigParamEnum, ConfigParams, Deserializable,
+    GlobalVersion, HashmapE, LibDescr, Libraries, MsgAddressInt, Result, ShardIdent, UInt256,
 };
 use warp::Reply;
 
@@ -36,6 +37,7 @@ struct MockEngine {
     zerostate_id: BlockIdExt,
     states: HashMap<BlockIdExt, Arc<ShardStateStuff>>,
     lookup_by_seqno: HashMap<(AccountIdPrefixFull, u32), (BlockIdExt, Vec<u8>)>,
+    confirmed_block_events: ConfirmedBlockEvents,
     gc_resolver: Arc<AllowStateGcSmartResolver>,
 }
 
@@ -52,6 +54,7 @@ impl MockEngine {
             zerostate_id: last_state_id,
             states: state_map,
             lookup_by_seqno: HashMap::new(),
+            confirmed_block_events: ConfirmedBlockEvents::new(),
             gc_resolver: Arc::new(AllowStateGcSmartResolver::new(u64::MAX)),
         }
     }
@@ -72,6 +75,10 @@ impl MockEngine {
             .get(block_id)
             .cloned()
             .ok_or_else(|| error!("state {block_id} not found in mock engine"))
+    }
+
+    fn confirmed_block_events(&self) -> ConfirmedBlockEvents {
+        self.confirmed_block_events.clone()
     }
 }
 
@@ -120,6 +127,10 @@ impl EngineOperations for MockEngine {
     ) -> Result<Option<(BlockIdExt, Vec<u8>)>> {
         Ok(self.lookup_by_seqno.get(&(prefix.clone(), seqno)).cloned())
     }
+
+    fn confirmed_block_events(&self) -> Option<ConfirmedBlockEvents> {
+        Some(self.confirmed_block_events())
+    }
 }
 
 fn ctx_with_engine(engine: Arc<dyn EngineOperations>) -> Ctx {
@@ -134,11 +145,11 @@ fn make_master_state(account: &Account) -> Arc<ShardStateStuff> {
     let publisher = account.get_id().unwrap().clone();
     let mut libraries = Libraries::new();
     let code = BuilderData::with_raw(vec![0x77], 1).unwrap().into_cell().unwrap(); // PUSHINT 1
-    let key = code.repr_hash();
+    let key = code.repr_hash().clone();
     println!("key1: {}", serialize_uint256(&key));
     libraries.set(&key, &LibDescr::from_lib_data_by_publisher(code, publisher.clone())).unwrap();
     let code = BuilderData::with_raw(vec![0x78], 2).unwrap().into_cell().unwrap(); // PUSHINT 2
-    let key = code.repr_hash();
+    let key = code.repr_hash().clone();
     println!("key2: {}", serialize_uint256(&key));
     libraries.set(&key, &LibDescr::from_lib_data_by_publisher(code, publisher.clone())).unwrap();
 
@@ -201,7 +212,13 @@ async fn get_masterchain_info_returns_state_metadata() {
 
     pretty_assertions::assert_eq!(response["@type"], "blocks.masterchainInfo");
     pretty_assertions::assert_eq!(response["last"], serialize_block_id(master_state.block_id()));
-    pretty_assertions::assert_eq!(response["init"], serialize_block_id(master_state.block_id()));
+    // init mirrors zerostate id but with shard rendered as the literal "0" (toncenter parity)
+    let mut expected_init = serialize_block_id(master_state.block_id());
+    expected_init
+        .as_object_mut()
+        .unwrap()
+        .insert("shard".to_string(), serde_json::Value::String("0".to_string()));
+    pretty_assertions::assert_eq!(response["init"], expected_init);
     pretty_assertions::assert_eq!(
         response["state_root_hash"],
         serialize_uint256(&master_state.root_cell().repr_hash())
@@ -254,7 +271,7 @@ async fn rest_get_address_information() {
     pretty_assertions::assert_eq!(result["state"], serde_json::json!("active"));
     pretty_assertions::assert_eq!(result["block_id"], serialize_block_id(&master_state.block_id()));
     assert!(result["balance"].as_str().is_some());
-    assert!(result["@extra"].as_str().is_some());
+    assert!(body["@extra"].as_str().is_some());
     assert!(result["last_transaction_id"].is_object());
 }
 
@@ -270,14 +287,12 @@ async fn jsonrpc_get_address_information() {
     )
     .await;
 
-    pretty_assertions::assert_eq!(response["jsonrpc"], serde_json::json!("2.0"));
-    pretty_assertions::assert_eq!(response["id"], serde_json::json!(1));
     pretty_assertions::assert_eq!(response["ok"], serde_json::Value::Bool(true));
+    assert!(response["@extra"].as_str().is_some());
     let result = &response["result"];
     pretty_assertions::assert_eq!(result["@type"], serde_json::json!("raw.fullAccountState"));
     pretty_assertions::assert_eq!(result["block_id"], serialize_block_id(master_state.block_id()));
     assert!(result["balance"].as_str().is_some());
-    assert!(result["@extra"].as_str().is_some());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -289,8 +304,6 @@ async fn jsonrpc_get_account_returns_boc() {
     let response =
         call_jsonrpc(&registry, "getAccount", serde_json::json!({ "address": address })).await;
 
-    pretty_assertions::assert_eq!(response["jsonrpc"], serde_json::json!("2.0"));
-    pretty_assertions::assert_eq!(response["id"], serde_json::json!(1));
     pretty_assertions::assert_eq!(response["ok"], serde_json::Value::Bool(true));
     let expected = get_account(
         GetAddressInformationParams { address: account_address(&account), seqno: None },
@@ -372,12 +385,10 @@ async fn jsonrpc_send_boc() {
     let response =
         call_jsonrpc(&registry, "sendBoc", serde_json::json!({ "boc": "aGVsbG8=" })).await;
 
-    pretty_assertions::assert_eq!(response["jsonrpc"], serde_json::json!("2.0"));
-    pretty_assertions::assert_eq!(response["id"], serde_json::json!(1));
     pretty_assertions::assert_eq!(response["ok"], serde_json::Value::Bool(true));
+    assert!(response["@extra"].as_str().is_some());
     let result = &response["result"];
     pretty_assertions::assert_eq!(result["@type"], serde_json::json!("ok"));
-    assert!(result["@extra"].as_str().is_some());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -503,6 +514,137 @@ async fn http_test_jsonrpc() {
     server.shutdown().await;
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn confirmed_block_events_handler_streams_block_data() {
+    let account = gen_test_account();
+    let master_state = make_master_state(&account);
+    let engine = MockEngine::new(vec![master_state]);
+    let events = engine.confirmed_block_events();
+    let block_id = BlockIdExt::with_params(
+        ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap(),
+        77,
+        UInt256::from([2; 32]),
+        UInt256::from([3; 32]),
+    );
+    let block_data = vec![9, 8, 7];
+    let block_id_2 = BlockIdExt::with_params(
+        ShardIdent::with_tagged_prefix(0, 0xc000_0000_0000_0000).unwrap(),
+        78,
+        UInt256::from([4; 32]),
+        UInt256::from([5; 32]),
+    );
+    let block_data_2 = vec![6, 5, 4];
+    let engine: Arc<dyn EngineOperations> = Arc::new(engine);
+    let ctx = ctx_with_engine(engine);
+    let response = confirmed_block_events_handler(
+        ConfirmedBlockEventsQuery { include_data: None, limit: Some(2) },
+        ctx,
+    )
+    .await
+    .expect("SSE handler failed");
+
+    events.notify(ConfirmedBlockEvent {
+        id: block_id.clone(),
+        data: Arc::new(block_data.clone()),
+        source: ConfirmedBlockSource::PRE_APPLIED,
+    });
+    events.notify(ConfirmedBlockEvent {
+        id: block_id_2.clone(),
+        data: Arc::new(block_data_2.clone()),
+        source: ConfirmedBlockSource::PRE_APPLIED,
+    });
+
+    let body = read_sse_response_body(response).await;
+    assert!(body.contains("confirmed_block"));
+    let payloads = sse_payloads(&body);
+    pretty_assertions::assert_eq!(payloads.len(), 2);
+
+    pretty_assertions::assert_eq!(payloads[0]["status"], serde_json::json!("confirmed"));
+    pretty_assertions::assert_eq!(
+        payloads[0]["block"]["@type"],
+        serde_json::json!("liteServer.blockData")
+    );
+    pretty_assertions::assert_eq!(payloads[0]["block"]["id"], serialize_block_id(&block_id));
+    pretty_assertions::assert_eq!(
+        payloads[0]["block"]["data"],
+        serde_json::json!(base64_encode(&block_data))
+    );
+    pretty_assertions::assert_eq!(payloads[1]["block"]["id"], serialize_block_id(&block_id_2));
+    pretty_assertions::assert_eq!(
+        payloads[1]["block"]["data"],
+        serde_json::json!(base64_encode(&block_data_2))
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn confirmed_block_events_handler_can_omit_block_data() {
+    let account = gen_test_account();
+    let master_state = make_master_state(&account);
+    let engine = MockEngine::new(vec![master_state]);
+    let events = engine.confirmed_block_events();
+    let block_id = BlockIdExt::with_params(
+        ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap(),
+        79,
+        UInt256::from([6; 32]),
+        UInt256::from([7; 32]),
+    );
+    let engine: Arc<dyn EngineOperations> = Arc::new(engine);
+    let ctx = ctx_with_engine(engine);
+    let response = confirmed_block_events_handler(
+        ConfirmedBlockEventsQuery { include_data: Some(false), limit: Some(1) },
+        ctx,
+    )
+    .await
+    .expect("SSE handler failed");
+
+    events.notify(ConfirmedBlockEvent {
+        id: block_id.clone(),
+        data: Arc::new(Vec::new()),
+        source: ConfirmedBlockSource::PRE_APPLIED,
+    });
+
+    let body = read_sse_response_body(response).await;
+    let payloads = sse_payloads(&body);
+    pretty_assertions::assert_eq!(payloads.len(), 1);
+    pretty_assertions::assert_eq!(payloads[0]["status"], serde_json::json!("confirmed"));
+    pretty_assertions::assert_eq!(payloads[0]["block"]["id"], serialize_block_id(&block_id));
+    assert!(payloads[0]["block"].get("data").is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn confirmed_block_events_handler_rejects_zero_limit() {
+    let account = gen_test_account();
+    let master_state = make_master_state(&account);
+    let engine: Arc<dyn EngineOperations> = Arc::new(MockEngine::new(vec![master_state]));
+    let ctx = ctx_with_engine(engine);
+
+    let response = confirmed_block_events_handler(
+        ConfirmedBlockEventsQuery { include_data: None, limit: Some(0) },
+        ctx,
+    )
+    .await
+    .expect("SSE handler failed");
+
+    pretty_assertions::assert_eq!(response.status(), warp::http::StatusCode::BAD_REQUEST);
+}
+
+async fn read_sse_response_body(response: warp::reply::Response) -> String {
+    let collected =
+        tokio::time::timeout(std::time::Duration::from_secs(3), response.into_body().collect())
+            .await
+            .expect("SSE response timed out")
+            .expect("SSE response failed");
+    String::from_utf8(collected.to_bytes().to_vec()).expect("SSE body must be UTF-8")
+}
+
+fn sse_payloads(body: &str) -> Vec<serde_json::Value> {
+    body.lines()
+        .filter(|line| line.starts_with("data:"))
+        .map(|line| line.trim_start_matches("data:").trim_start())
+        .map(|data| serde_json::from_str(data).expect("SSE data must be JSON"))
+        .collect()
+}
+
 async fn http_server_test_client_jsonrpc(address: std::net::SocketAddr, _account: MsgAddressInt) {
     //wait a little while rpc_server gets ready
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -526,11 +668,7 @@ async fn http_server_test_client_jsonrpc(address: std::net::SocketAddr, _account
         .await
         .unwrap();
     let response: serde_json::Value = serde_json::from_str(&res.text().await.unwrap()).unwrap();
-    pretty_assertions::assert_eq!(
-        response["jsonrpc"],
-        serde_json::Value::String("2.0".to_string())
-    );
-    pretty_assertions::assert_eq!(response["id"], serde_json::json!(1));
+    pretty_assertions::assert_eq!(response["ok"], serde_json::Value::Bool(true));
     let response = &response["result"];
     pretty_assertions::assert_eq!(response["@type"], serde_json::json!("blocks.masterchainInfo"));
     println!("JSONRPC response {:?}", response);
@@ -656,6 +794,40 @@ async fn test_get_libraries() {
 }
 
 #[tokio::test]
+async fn test_get_libraries_ext() {
+    let account = gen_test_account();
+    let (registry, master_state) = build_registry(&account);
+
+    let response = call_jsonrpc(&registry, "getLibrariesExt", serde_json::json!({})).await;
+    pretty_assertions::assert_eq!(response["ok"], serde_json::Value::Bool(true));
+    assert!(response["@extra"].as_str().is_some());
+
+    let result = response["result"].clone();
+    pretty_assertions::assert_eq!(result["@type"], serde_json::json!("smc.libraryResultExt"));
+    pretty_assertions::assert_eq!(result["block_id"], serialize_block_id(master_state.block_id()));
+    pretty_assertions::assert_eq!(result["libraries_count"], serde_json::json!(2));
+
+    let dict_boc = result["dict_boc"].as_str().unwrap();
+    assert!(!dict_boc.is_empty());
+
+    let root = read_single_root_boc(base64_decode(dict_boc).unwrap()).unwrap();
+    let raw_libraries = HashmapE::with_hashmap(256, Some(root));
+    let source_libraries = master_state.state().unwrap().libraries();
+
+    source_libraries
+        .iterate_slices_with_keys(|mut key, mut value| -> Result<bool> {
+            let hash = UInt256::construct_from(&mut key)?;
+            let descr = LibDescr::construct_from(&mut value)?;
+            let bucket = raw_libraries.get(hash.clone().into())?.expect("library entry must exist");
+            let lib = bucket.reference(0).expect("raw dict value must point to code");
+            pretty_assertions::assert_eq!(*lib.repr_hash(), hash);
+            pretty_assertions::assert_eq!(lib, descr.lib().clone());
+            Ok(true)
+        })
+        .unwrap();
+}
+
+#[tokio::test]
 async fn test_parse_int() {
     let p: IntOrStr = serde_json::from_str("-9223372036854775808").unwrap();
     pretty_assertions::assert_eq!(p.as_i64().unwrap(), -9223372036854775808);
@@ -739,8 +911,8 @@ async fn test_boc_hash() {
     let boc2_b64 = "te6ccgEBAQEAcQAA3v8AIN0gggFMl7ohggEznLqxn3Gw7UTQ0x/THzHXC//jBOCk8mCDCNcYINMf0x/TH/gjE7vyY+1E0NMf0x/T/9FRMrryoVFEuvKiBPkBVBBV+RDyo/gAkyDXSpbTB9QC+wDo0QGkyMsfyx/L/8ntVA==";
     let boc1 = read_single_root_boc(base64_decode(boc1_b64).unwrap()).unwrap();
     let boc2 = read_single_root_boc(base64_decode(boc2_b64).unwrap()).unwrap();
-    let hash1: UInt256 = boc1.repr_hash();
-    let hash2 = boc2.repr_hash();
+    let hash1 = boc1.repr_hash().clone();
+    let hash2 = boc2.repr_hash().clone();
     println!("Hash1 {:?}", hash1);
     println!("Hash2 {:?}", hash2);
     pretty_assertions::assert_eq!(hash1, hash2);

@@ -35,7 +35,7 @@ fn generate_sample_frozen_account() -> AccountSerializationSet {
     let mut account = generate_test_account(true, AccountTestOptions::with_default_setup(true));
     let cloned_account = account.clone();
     account.try_freeze().unwrap();
-    account.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+    account.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
     let boc = account.write_to_bytes().unwrap();
     AccountSerializationSet {
         account,
@@ -396,8 +396,8 @@ fn test_frozen_account_into_json_q() {
 #[test]
 fn test_pruned_account_into_json_0() {
     let account = generate_test_account(true, AccountTestOptions::with_default_setup(true));
-    let code = account.get_code().map(|cell| cell.repr_hash());
-    let libs = account.libraries().root().map(|cell| cell.repr_hash());
+    let code = account.get_code().map(|cell| cell.repr_hash().clone());
+    let libs = account.libraries().root().map(|cell| cell.repr_hash().clone());
     let cell = account.serialize().unwrap();
     let proof = MerkleProof::create(&cell, |hash| {
         Some(hash) != code.as_ref() && Some(hash) != libs.as_ref()
@@ -1211,6 +1211,41 @@ fn test_block_proof_serialize_deserialize_roundtrip_ordinary() {
 }
 
 #[test]
+fn test_serialize_new_consensus_config_all_includes_new_timing_fields() {
+    use ton_block::{NewConsensusConfigAll, NoncriticalParams, SimplexConfig};
+
+    let cfg = NewConsensusConfigAll {
+        mc: Some(SimplexConfig {
+            use_quic: true,
+            slots_per_leader_window: 4,
+            noncritical_params: NoncriticalParams {
+                min_block_interval_ms: 111,
+                no_empty_blocks_on_error_timeout_ms: 21_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        shard: Some(SimplexConfig {
+            use_quic: false,
+            slots_per_leader_window: 8,
+            noncritical_params: NoncriticalParams {
+                min_block_interval_ms: 222,
+                no_empty_blocks_on_error_timeout_ms: 22_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+    };
+
+    let json = serialize_new_consensus_config_all(&cfg).unwrap();
+
+    assert_eq!(json["mc"]["min_block_interval_ms"], 111);
+    assert_eq!(json["mc"]["no_empty_blocks_on_error_timeout_ms"], 21_000);
+    assert_eq!(json["shard"]["min_block_interval_ms"], 222);
+    assert_eq!(json["shard"]["no_empty_blocks_on_error_timeout_ms"], 22_000);
+}
+
+#[test]
 fn test_db_serialize_block_proof_simplex() {
     use ton_block::{
         BlockProof, BlockSignaturesPure, BlockSignaturesSimplex, BlockSignaturesVariant,
@@ -1361,7 +1396,7 @@ fn check_transaction_field(
 ) {
     let boc = std::fs::read(Path::new("src/tests/data/transactions").join(file)).unwrap();
     let cell = read_single_root_boc(&boc).expect("Error deserializing single root BOC");
-    let id = cell.repr_hash();
+    let id = cell.repr_hash().clone();
     let tr = Transaction::construct_from_cell(cell).unwrap();
     let set = TransactionSerializationSet {
         block_id: None,

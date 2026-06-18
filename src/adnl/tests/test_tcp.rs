@@ -24,25 +24,25 @@ use std::{thread::sleep, time::Duration};
 use ton_block::Result;
 
 #[cfg(feature = "client")]
-const ADNL_CLIENT_CONFIG: &str = "{
-    \"server_address\": \"127.0.0.1:4924\",
-    \"server_key\": {
-        \"type_id\": 1209251014,
-        \"pub_key\": \"BBKmgGAxz4ZofRgMO2qhYt+K1bGlGeowukPONVAkOcU=\"
+const ADNL_CLIENT_CONFIG: &str = r#"{
+    "server_address": "127.0.0.1:4924",
+    "server_key": {
+        "type_id": 1209251014,
+        "pub_key": "BBKmgGAxz4ZofRgMO2qhYt+K1bGlGeowukPONVAkOcU="
     }
-}";
+}"#;
 
 #[cfg(feature = "server")]
-const ADNL_SERVER_CONFIG: &str = "{
-    \"address\": \"0.0.0.0:4924\", 
-    \"clients\": {
-        \"any\": null
+const ADNL_SERVER_CONFIG: &str = r#"{
+    "address": "0.0.0.0:4924", 
+    "clients": {
+        "any": null
     },
-    \"server_key\": {
-        \"type_id\": 1209251014,
-        \"pvt_key\": \"3CFeiTSlGkJf3D8w3ZXS4QS+6/0p+MFZGuv0XYMvMRo=\"
+    "server_key": {
+        "type_id": 1209251014,
+        "pvt_key": "3CFeiTSlGkJf3D8w3ZXS4QS+6/0p+MFZGuv0XYMvMRo="
     }
-}";
+}"#;
 
 #[cfg(all(feature = "client", feature = "server"))]
 async fn request_server(client: &mut AdnlClient) -> Result<()> {

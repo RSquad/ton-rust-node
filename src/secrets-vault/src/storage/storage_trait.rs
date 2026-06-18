@@ -6,12 +6,9 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::{
-    memory::protected_memory::ProtectedMemory,
-    types::{
-        metadata::Metadata, secret::Secret, secret_id::SecretId, secret_spec::SecretSpec,
-        store_mode::StoreMode,
-    },
+use crate::types::{
+    metadata::Metadata, secret::Secret, secret_id::SecretId, secret_spec::SecretSpec,
+    store_mode::StoreMode,
 };
 
 #[async_trait::async_trait]
@@ -22,16 +19,23 @@ pub trait Storage: Send + Sync + downcast_rs::Downcast {
         spec: &SecretSpec,
         secret_id: &SecretId,
     ) -> anyhow::Result<Secret>;
-    async fn store(&self, secret: &Secret, mode: StoreMode) -> anyhow::Result<()>;
-    async fn store_vec(
+    async fn store(
         &self,
-        secrets: Vec<(ProtectedMemory, Metadata, StoreMode)>,
+        secret: &Secret,
+        mode: StoreMode,
+        override_extractable: Option<bool>,
     ) -> anyhow::Result<()>;
     async fn load(&self, secret_id: &SecretId) -> anyhow::Result<Secret>;
     async fn load_metadata(&self, secret_id: &SecretId) -> anyhow::Result<Option<Metadata>>;
     async fn list_metadata(&self) -> anyhow::Result<Vec<Metadata>>;
     async fn delete(&self, secret_id: &SecretId) -> anyhow::Result<()>;
     fn format_version(&self) -> anyhow::Result<u32>;
+
+    #[cfg(test)]
+    async fn clear(&self) -> anyhow::Result<()>;
+
+    #[cfg(test)]
+    async fn is_empty(&self) -> anyhow::Result<bool>;
 }
 
 downcast_rs::impl_downcast!(Storage);
