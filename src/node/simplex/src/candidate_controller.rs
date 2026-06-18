@@ -1185,6 +1185,9 @@ impl CandidateController {
                         &session_id.to_hex_string()[..8],
                         &block_hash.to_hex_string()[..8],
                     );
+                    // We have everything; drop the throttle entry now rather than waiting for
+                    // later slot-level cleanup (matches the skip-cert branch above).
+                    c.requested_candidates.remove(&candidate_id);
                     return;
                 }
 
@@ -1450,22 +1453,15 @@ impl CandidateController {
         candidate_id: &RawCandidateId,
         candidate_info: &CandidateInfoRecord,
     ) -> Result<Vec<u8>> {
-        let parent_id = match &candidate_info.candidate_hash_data {
+        let (parent_id, block_id) = match &candidate_info.candidate_hash_data {
             CandidateHashData::Consensus_CandidateHashDataEmpty(empty) => {
-                let slot = SlotIndex(empty.parent.slot as u32);
-                let hash = empty.parent.hash.clone();
-                (slot, hash)
+                let parent = (SlotIndex(empty.parent.slot as u32), empty.parent.hash.clone());
+                // The empty candidate embeds its own block id (`block:tonNode.blockIdExt`), so
+                // reconstruction works from DB metadata alone -- no in-memory CandidateBook entry
+                // is required (e.g. when serving a repair query after a restart).
+                (parent, empty.block.clone())
             }
             _ => return Err(error!("Expected empty hash data")),
-        };
-
-        let block_id = if let Some(rc) = self.book.received(candidate_id) {
-            rc.block_id.clone()
-        } else {
-            return Err(error!(
-                "Cannot reconstruct empty block: no block_id available for slot={}",
-                candidate_id.slot
-            ));
         };
 
         let parent =

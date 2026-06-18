@@ -32,12 +32,15 @@
 
 use super::*;
 use crate::{
+    certificate::{Certificate, NotarCertPtr, VoteSignature},
     controller_queue::{ControllerQueue, ControllerTask},
     receiver::ReceiverHealthCounters,
+    simplex_state::NotarizeVote,
     MetricsHandle, SessionNode, SessionOptions,
 };
-use consensus_common::ResolverPurpose;
+use consensus_common::{ConsensusCommonFactory, ResolverPurpose};
 use std::{cell::RefCell, sync::Mutex};
+use ton_api::{deserialize_boxed, ton::consensus::candidatehashdata::CandidateHashDataEmpty};
 use ton_block::{Ed25519KeyOption, ShardIdent, ZeroizingBytes};
 
 /*
@@ -411,5 +414,192 @@ fn prune_requested_below_drops_stale_slots() {
     assert!(
         ctrl.requested_candidates().contains_key(&RawCandidateId { slot: high, hash: high_hash }),
         "entries at or above the cursor must be retained"
+    );
+}
+
+/*
+    --------------------------------------------------------------------
+    serve_query_fallback empty-block reconstruction
+    --------------------------------------------------------------------
+*/
+
+/// Build a `CandidateInfoRecord` for an empty block that embeds its own
+/// `BlockIdExt` (the `consensus.candidateHashDataEmpty.block` field), exactly as
+/// `persist_candidate_info` stores it.
+fn make_empty_candidate_info(
+    candidate_id: &RawCandidateId,
+    parent: &RawCandidateId,
+    block_id: BlockIdExt,
+) -> CandidateInfoRecord {
+    let hash_data = CandidateHashDataEmpty {
+        block: block_id,
+        parent: CandidateId { slot: parent.slot.value() as i32, hash: parent.hash.clone() },
+    };
+    CandidateInfoRecord {
+        candidate_id: candidate_id.clone(),
+        leader_idx: 0,
+        candidate_hash_data: CandidateHashData::Consensus_CandidateHashDataEmpty(hash_data),
+        signature: vec![0xA1, 0xB2, 0xC3],
+    }
+}
+
+#[test]
+fn reconstruct_empty_candidate_data_works_from_db_metadata_without_book_entry() {
+    // The RequestCandidate fallback DB path must reconstruct an empty block from
+    // the `CandidateInfoRecord` alone -- e.g. when a peer requests repair after
+    // this node restarted and its in-memory `CandidateBook` is empty. The block id
+    // is embedded in the metadata, so no book entry is required.
+    let (ctrl, _desc, _queue) = mk_ctrl(4);
+
+    let candidate_id = make_candidate_id(15, 0xDE);
+    let parent_id = make_candidate_id(14, 0xCA);
+    let block_id = make_block_id(150, 0xAB);
+    let info = make_empty_candidate_info(&candidate_id, &parent_id, block_id.clone());
+
+    // Precondition: the in-memory book has no entry for this candidate.
+    assert!(
+        ctrl.book.received(&candidate_id).is_none(),
+        "fixture must exercise the empty-book (post-restart) path"
+    );
+
+    let bytes = ctrl
+        .reconstruct_empty_candidate_data_from_info(&candidate_id, &info)
+        .expect("empty block must reconstruct from DB metadata alone");
+
+    let decoded = deserialize_boxed(&bytes)
+        .expect("reconstructed bytes must deserialize")
+        .downcast::<CandidateData>()
+        .expect("reconstructed payload must be CandidateData");
+    match decoded {
+        CandidateData::Consensus_Empty(empty) => {
+            assert_eq!(empty.slot, candidate_id.slot.value() as i32, "slot must round-trip");
+            assert_eq!(
+                empty.block, block_id,
+                "reconstructed block id must come from the embedded metadata, not the book"
+            );
+        }
+        other => panic!("expected CandidateData::Consensus_Empty, got {other:?}"),
+    }
+}
+
+/*
+    --------------------------------------------------------------------
+    delayed request_candidate throttle cleanup
+    --------------------------------------------------------------------
+*/
+
+/// Capturing queue that retains posted delayed tasks so the test can replay the
+/// `request_candidate` deferred closure against a `&mut CandidateController` plus
+/// a backend view (mirrors `tests/test_controller_queue.rs`). The default
+/// `RecordingQueue` above intentionally drops task bodies; this one keeps them.
+#[derive(Default)]
+struct ReplayQueue {
+    delayed: Mutex<Vec<ControllerTask<CandidateController>>>,
+}
+
+impl ControllerQueue<CandidateController> for ReplayQueue {
+    fn post_boxed(&self, _task: ControllerTask<CandidateController>) {}
+
+    fn post_delayed_boxed(&self, _at: SystemTime, task: ControllerTask<CandidateController>) {
+        self.delayed.lock().unwrap().push(task);
+    }
+}
+
+impl ReplayQueue {
+    fn take_delayed(&self) -> Vec<ControllerTask<CandidateController>> {
+        std::mem::take(&mut *self.delayed.lock().unwrap())
+    }
+}
+
+/// Controller bound to a [`ReplayQueue`] so the delayed task can be replayed.
+fn mk_ctrl_replay(
+    node_count: u32,
+) -> (CandidateController, Arc<SessionDescription>, Arc<ReplayQueue>) {
+    let description = Arc::new(make_description(node_count));
+    let telemetry = make_telemetry(&description);
+    let queue = Arc::new(ReplayQueue::default());
+    let ctrl = CandidateController::new(
+        description.clone(),
+        telemetry,
+        queue.clone() as ControllerQueuePtr<CandidateController>,
+        None,
+    );
+    (ctrl, description, queue)
+}
+
+/// Build a real (non-stub) `ReceivedCandidate` so `has_real_body` returns `true`.
+fn make_real_body(slot: SlotIndex, block_id: BlockIdExt) -> ReceivedCandidate {
+    ReceivedCandidate {
+        slot,
+        source_idx: ValidatorIndex::new(0),
+        candidate_hash_data_bytes: vec![0xAB, 0xCD, 0xEF],
+        block_id,
+        root_hash: UInt256::from([2u8; 32]),
+        file_hash: UInt256::from([3u8; 32]),
+        data: ConsensusCommonFactory::create_block_payload(vec![]),
+        collated_data: ConsensusCommonFactory::create_block_payload(vec![]),
+        gen_utime_ms: Some(1_700_000_000_000),
+        receive_time: SystemTime::now(),
+        is_empty: false,
+        parent_id: None,
+    }
+}
+
+#[test]
+fn delayed_request_candidate_clears_throttle_when_already_satisfied() {
+    // When the delayed repair task finds the body and notar cert already present,
+    // it must drop the (slot,hash) throttle entry instead of leaving it behind for
+    // later slot-level cleanup.
+    let (mut ctrl, desc, queue) = mk_ctrl_replay(4);
+    let base = base_time();
+    desc.set_time(base);
+
+    let slot = SlotIndex::new(7);
+    let block_hash = UInt256::from([0x11; 32]);
+    let candidate_id = RawCandidateId { slot, hash: block_hash.clone() };
+    let mut backend = FakeCandidateBackend::new(&desc);
+
+    // Schedule a delayed repair: arms the throttle and captures exactly one task.
+    ctrl.request_candidate(
+        slot,
+        block_hash.clone(),
+        Some(Duration::from_millis(250)),
+        &mut backend,
+    );
+    assert!(
+        ctrl.requested_candidates().contains_key(&candidate_id),
+        "scheduling a delayed request must arm the throttle"
+    );
+    let tasks = queue.take_delayed();
+    assert_eq!(tasks.len(), 1, "a non-zero delay must post exactly one deferred task");
+
+    // Before the deferred task fires, the body and the notar cert both arrive.
+    ctrl.book.insert_received(candidate_id.clone(), make_real_body(slot, make_block_id(70, 0x70)));
+    let cert: NotarCertPtr = Arc::new(Certificate::new(
+        NotarizeVote { slot, block_hash: block_hash.clone() },
+        vec![VoteSignature::new(ValidatorIndex::new(0), vec![0u8; 8])],
+    ));
+    backend
+        .simplex_state
+        .set_notarize_certificate(&desc, slot, &block_hash, cert)
+        .expect("storing a fresh notar cert must succeed");
+    assert!(ctrl.book.has_real_body(&candidate_id), "fixture must present a real body");
+    assert!(
+        backend.simplex_state.get_notarize_certificate(slot, &block_hash).is_some(),
+        "fixture must present a notar cert"
+    );
+
+    // Replay the deferred task: it must take the "already have what we need" path.
+    for task in tasks {
+        task(&mut ctrl, &mut backend);
+    }
+
+    assert!(
+        !ctrl.requested_candidates().contains_key(&candidate_id),
+        "an already-satisfied delayed request must clear its throttle entry"
+    );
+    assert!(
+        backend.requested().is_empty(),
+        "no peer request may be sent once body+notar are already present"
     );
 }
