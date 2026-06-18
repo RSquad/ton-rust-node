@@ -89,6 +89,16 @@
 // Collation-domain types live on `CollationController`; the session processor only
 // references `CollationResult` from the consolidated `#[cfg(test)] impl
 // SessionProcessor` block at the end of this file.
+// Candidate-domain symbols now live on `CandidateController`; the
+// `#[path]`-included unit tests (via `super::*`) and the consolidated
+// `#[cfg(test)] impl SessionProcessor` still name them directly.
+#[cfg(test)]
+use crate::candidate_book::ReceivedCandidate;
+#[cfg(test)]
+use crate::candidate_controller::{
+    CANDIDATE_REQUEST_RETRY_INTERVAL, RESOLVER_AVAILABILITY_MAX_RETRIES,
+    RESOLVER_AVAILABILITY_RETRY_DELAY,
+};
 #[cfg(test)]
 use crate::collation_controller::CollationResult;
 // `BlockFinalizedEvent` is named only by the consolidated `#[cfg(test)] impl
@@ -102,14 +112,9 @@ use crate::simplex_state::BlockFinalizedEvent;
 #[cfg(test)]
 use crate::task_queue::TaskPtr;
 use crate::{
-    block::{
-        CandidateId as BlockCandidateId, RawCandidate, RawCandidateId, SlotIndex, ValidatorIndex,
-        WindowIndex,
-    },
-    candidate_book::{
-        CandidateBook, ParentTipResolution, ReceivedCandidate, EMPTY_CHAIN_WARN_DEPTH,
-        MAX_CHAIN_DEPTH,
-    },
+    block::{RawCandidateId, SlotIndex, ValidatorIndex, WindowIndex},
+    candidate_book::{CandidateBook, ParentTipResolution},
+    candidate_controller::{CandidateBackend, CandidateController, IngressOutcome},
     collation_controller::{CollationBackend, CollationController},
     consensus_controller::{ConsensusBackend, ConsensusController},
     controller_queue::{ControllerQueue, ControllerQueuePtr, ControllerTask},
@@ -131,13 +136,12 @@ use crate::{
     startup_recovery::StartupRecoveryBackend,
     task_queue::TaskQueuePtr,
     trace_collector::TraceCollector,
-    utils::extract_consensus_gen_utime_ms,
     validation_controller::{ValidationBackend, ValidationController},
     MetricsHandle, RawVoteData, SessionId, ValidatorWeight,
 };
 use consensus_common::{
-    check_execution_time, instrument, CandidateObservedFlags, EnsureCandidateAvailabilityOptions,
-    StorageAsyncResultPtr, StorageResultAlreadyTaken,
+    check_execution_time, instrument, EnsureCandidateAvailabilityOptions, StorageAsyncResultPtr,
+    StorageResultAlreadyTaken,
 };
 use std::{
     collections::HashMap,
@@ -147,13 +151,11 @@ use std::{
 use ton_api::{
     deserialize_boxed, serialize_boxed,
     ton::consensus::{
-        candidatedata::Empty as CandidateDataEmpty,
-        candidateid::CandidateId,
         simplex::{
-            candidateandcert::CandidateAndCert, vote::Vote as TlVote, Certificate,
-            Vote as TlVoteBoxed, VoteSignatureSet as VoteSignatureSetBoxed,
+            vote::Vote as TlVote, Certificate, Vote as TlVoteBoxed,
+            VoteSignatureSet as VoteSignatureSetBoxed,
         },
-        CandidateData, CandidateHashData,
+        CandidateData,
     },
     IntoBoxed,
 };
@@ -170,23 +172,6 @@ pub(crate) const ROUND_DEBUG_PERIOD: Duration = Duration::from_secs(15);
 /// Maximum history slots to keep in candidate/certificate caches
 /// Old entries are cleaned up when slot is finalized
 const MAX_HISTORY_SLOTS: u32 = 1024;
-
-/// Delay before requesting a missing candidate from peers
-/// This allows time for the broadcast to arrive naturally before triggering a query
-const CANDIDATE_REQUEST_DELAY: Duration = Duration::from_secs(1);
-
-/// Minimum interval between repeated `requestCandidate` attempts for the same (slot,hash).
-///
-/// Under network partitions, a single request may time out; we must retry, but not spam.
-const CANDIDATE_REQUEST_RETRY_INTERVAL: Duration = Duration::from_secs(2);
-
-/// Delay between deferred retries of `ensure_candidate_available` when the
-/// `BlockIdExt → RawCandidateId` mapping is not yet known.
-const RESOLVER_AVAILABILITY_RETRY_DELAY: Duration = Duration::from_millis(500);
-
-/// Maximum number of deferred retries before giving up on resolving a
-/// `BlockIdExt` to `RawCandidateId` for the resolver.
-const RESOLVER_AVAILABILITY_MAX_RETRIES: u32 = 6;
 
 /// Polling cadence for the SXMAIN pending-async-DB-results registry.
 ///
@@ -265,14 +250,6 @@ pub(crate) struct SessionProcessor {
     /// durability-wait shell (it crosses the `DatabaseController` async-DB registry).
     consensus: ConsensusController,
 
-    /// Candidate-request throttle map: `RawCandidateId(slot, hash)` → next allowed
-    /// request time. Used for block repair — avoids duplicate `requestCandidate`s
-    /// and implements delayed-request logic (wait for the broadcast to arrive
-    /// before querying peers). Populated when a `BlockFinalized` event arrives for
-    /// a still-missing candidate; a delayed action then re-checks `candidate_book`
-    /// and calls `receiver.request_candidate()` only if it is still missing.
-    requested_candidates: HashMap<RawCandidateId, SystemTime>,
-
     /// Per-session telemetry aspect (see [`crate::session_telemetry`]).
     ///
     /// Held as an `Arc` so the same instance can be shared with the
@@ -302,11 +279,16 @@ pub(crate) struct SessionProcessor {
     /// `notify_block_finalized`).
     callbacks: Arc<SessionCallbacks>,
 
-    /// Per-session in-memory candidate store (see
-    /// [`crate::candidate_book`]). Owns `received_candidates`, the
-    /// `candidate_data_cache` TL-bytes lookup, and the
-    /// `seen_broadcast_candidates` slot-dedup map.
-    candidate_book: CandidateBook,
+    /// Per-session candidate-phase controller (see
+    /// [`crate::candidate_controller`]). Owns the in-memory candidate store
+    /// ([`crate::candidate_book::CandidateBook`]: received candidates, the
+    /// `candidate_data_cache` TL-bytes lookup, the per-slot broadcast-dedup map)
+    /// and the `requested_candidates` repair throttle, plus the candidate ingress
+    /// core ([`CandidateController::receive_candidate`]), outbound repair, and the
+    /// SXRCV query-fallback serving. Driven via `with_candidate_backend` and the
+    /// `self.candidate.*` accessors; other controllers source the book through
+    /// [`CandidateController::book`] / [`CandidateController::book_mut`].
+    candidate: CandidateController,
 
     /// Per-session persistence-ordering controller (see
     /// [`crate::database_controller`]). Owns the `db: SimplexDbPtr` handle, the
@@ -495,6 +477,7 @@ impl SessionProcessor {
         let collation_trace_collector = trace_collector.clone();
         let validation_trace_collector = trace_collector.clone();
         let consensus_trace_collector = trace_collector.clone();
+        let candidate_trace_collector = trace_collector.clone();
         // Generic deferred-work handle for the validation controller. The
         // adapter projects `&mut SessionProcessor -> &mut p.validation`, so the
         // controller can post follow-up / async work without naming this type.
@@ -508,6 +491,19 @@ impl SessionProcessor {
         // struct below.
         let collation_queue: ControllerQueuePtr<CollationController> =
             Arc::new(CollationQueueAdapter { task_queue: task_queue.clone() });
+        // Shared description / telemetry handles for the candidate controller,
+        // cloned before the originals are moved into `SessionRuntime` / `telemetry`
+        // below. The controller reads session id / leader / keys / shard / timing
+        // off the description and records ingress / precheck-drop / generated-miss
+        // telemetry directly, so it needs no backend hop for those.
+        let candidate_description = description.clone();
+        let candidate_telemetry = telemetry.clone();
+        // Generic deferred-work handle for the candidate controller. The adapter
+        // projects `&mut SessionProcessor -> &mut p.candidate`, so the controller
+        // can post the repair delayed retries without naming this type. Cloned
+        // from `task_queue` before it is moved into the struct below.
+        let candidate_queue: ControllerQueuePtr<CandidateController> =
+            Arc::new(CandidateQueueAdapter { task_queue: task_queue.clone() });
 
         let processor = Self {
             task_queue,
@@ -532,8 +528,6 @@ impl SessionProcessor {
                 initial_block_seqno.saturating_sub(1),
                 consensus_trace_collector,
             ),
-            // Candidate request tracking
-            requested_candidates: HashMap::new(),
             telemetry,
             runtime: SessionRuntime::new(
                 now,
@@ -543,7 +537,12 @@ impl SessionProcessor {
                 stop_flag,
             ),
             callbacks,
-            candidate_book: CandidateBook::new(),
+            candidate: CandidateController::new(
+                candidate_description,
+                candidate_telemetry,
+                candidate_queue,
+                candidate_trace_collector,
+            ),
             database: DatabaseController::new(db, first_nonannounced_window),
             collation: CollationController::new(
                 collation_queue,
@@ -716,7 +715,7 @@ impl SessionProcessor {
         // Prune CandidateBook auxiliary maps in sync. received_candidates
         // GC is intentionally deferred; see CandidateBook::prune_below /
         // CandidateBook::retain_received.
-        self.candidate_book.prune_below(up_to_slot);
+        self.candidate.book_mut().prune_below(up_to_slot);
 
         // Prune the consensus finalization journal for old slots. Single fan-out
         // into the controller: it prunes the transient `finalized_pending_body`
@@ -731,7 +730,7 @@ impl SessionProcessor {
         self.telemetry.prune_missing_body_log_below(up_to_slot.value());
 
         // Remove pending candidate requests for slots < up_to_slot
-        self.requested_candidates.retain(|id, _| id.slot >= up_to_slot);
+        self.candidate.prune_requested_below(up_to_slot);
 
         self.runtime.clear_runtimes_below(up_to_slot);
 
@@ -1016,20 +1015,6 @@ impl SessionProcessor {
         self.runtime.reset_next_awake_time(now);
     }
 
-    /// Post a delayed action to be executed at a future time.
-    ///
-    /// The handler runs when `expiration_time` is reached during
-    /// `check_all()`. Storage and drain ordering live on `SessionRuntime`;
-    /// this wrapper boxes the handler, pushes it onto the queue, and lowers
-    /// the wake horizon to `expiration_time`.
-    fn post_delayed_action<F>(&mut self, expiration_time: SystemTime, handler: F)
-    where
-        F: FnOnce(&mut SessionProcessor) + Send + 'static,
-    {
-        self.runtime.post_delayed_action(expiration_time, Box::new(handler));
-        self.runtime.set_next_awake_time(expiration_time);
-    }
-
     /// Process all expired delayed actions.
     ///
     /// Drains due actions via the runtime and invokes each handler against
@@ -1089,18 +1074,24 @@ impl SessionProcessor {
 // Candidates (ingress, repair & serving)
 // ======================================================================
 //
-// Inbound candidate reception (`on_candidate_received`), outbound block-repair
-// request scheduling / resolver availability, and the SXRCV-side query fallback
-// that answers peers' `RequestCandidate`.
+// Thin composition-root shell over [`CandidateController`]: the candidate domain
+// (ingress core, outbound repair, SXRCV serving) lives on the controller behind
+// the narrow [`CandidateBackend`]. `on_candidate_received` runs the controller's
+// ingress core and then fans the resulting [`IngressOutcome`] out across the
+// other controllers synchronously (historical order); the other entry points
+// delegate verbatim.
 
 impl SessionProcessor {
     /* Ingress (candidate reception) */
 
-    /// Handle incoming block candidate (from broadcast or query response)
+    /// Handle incoming block candidate (from broadcast or query response).
     ///
-    /// Called by ReceiverListenerImpl when a block candidate is received,
-    /// either via broadcast or from a requestCandidate query response.
-    /// See [`ValidationController`] module docs for the full validation pipeline.
+    /// Runs [`CandidateController::receive_candidate`] for the candidate-domain
+    /// core, then performs the cross-controller fan-out (before-split insert,
+    /// observe callback, consensus retry, optional notar-cert ingest, validation
+    /// registration, `check_all`) synchronously in the historical order. Called
+    /// by `ReceiverListenerImpl` when a candidate is received via broadcast or a
+    /// `requestCandidate` query response.
     ///
     /// # Arguments
     /// * `source_idx` - Validator index of the sender
@@ -1115,1006 +1106,99 @@ impl SessionProcessor {
         candidate: CandidateData,
         notar_cert: Option<Vec<u8>>,
     ) {
-        check_execution_time!(20_000);
-
-        // Extract slot and parent info from CandidateData variant.
-        // TL uses i32 for slots; reject negative values at the boundary.
-        let (slot, tl_parent_str) = match &candidate {
-            CandidateData::Consensus_Block(block) => {
-                if block.slot < 0 {
-                    log::warn!(
-                        "Session {} on_candidate_received: REJECTED - negative slot {} in Block",
-                        self.session_id().to_hex_string(),
-                        block.slot
-                    );
-                    return;
-                }
-                let parent_str = match block.parent.id() {
-                    None => "genesis".to_string(),
-                    Some(id) => {
-                        if *id.slot() < 0 {
-                            log::warn!(
-                                "Session {} on_candidate_received: REJECTED - \
-                                negative parent slot {} in Block",
-                                self.session_id().to_hex_string(),
-                                id.slot()
-                            );
-                            return;
-                        }
-                        format!("s{}:{}", id.slot(), &hex::encode(id.hash().as_slice())[..8])
-                    }
-                };
-                (block.slot as u32, parent_str)
-            }
-            CandidateData::Consensus_Empty(empty) => {
-                if empty.slot < 0 {
-                    log::warn!(
-                        "Session {} on_candidate_received: REJECTED - negative slot {} in Empty",
-                        self.session_id().to_hex_string(),
-                        empty.slot
-                    );
-                    return;
-                }
-                if *empty.parent.slot() < 0 {
-                    log::warn!(
-                        "Session {} on_candidate_received: REJECTED - \
-                        negative parent slot {} in Empty",
-                        self.session_id().to_hex_string(),
-                        empty.parent.slot()
-                    );
-                    return;
-                }
-                let id_slot = *empty.parent.slot();
-                let id_hash = empty.parent.hash();
-                let parent_str = format!("s{}:{}", id_slot, &hex::encode(id_hash.as_slice())[..8]);
-                (empty.slot as u32, parent_str)
-            }
-        };
-
-        let sender_idx = ValidatorIndex::new(source_idx);
-        let slot = SlotIndex::new(slot);
-        let is_broadcast_candidate = notar_cert.is_none();
-        let is_local_self_candidate =
-            is_broadcast_candidate && sender_idx == self.runtime.description().get_self_idx();
-        self.record_candidate_ingress(sender_idx, is_broadcast_candidate);
-
-        // Reject far-future slots (DoS protection) — before any signature verification
-        if self.simplex_state.is_slot_too_far_ahead(slot) {
-            if is_broadcast_candidate {
-                self.telemetry.candidate_precheck_future_slot_drop_counter.increment(1);
-            }
-            if is_local_self_candidate {
-                self.note_generated_candidate_validation_missed_for_slot(
-                    slot,
-                    format!(
-                        "candidate_precheck_too_far_ahead max_acceptable_slot={}",
-                        self.simplex_state.max_acceptable_slot()
-                    ),
-                );
-            }
-            log::warn!(
-                "Session {} on_candidate_received: REJECTED precheck_drop_reason=too_far_ahead \
-                slot={} max={} origin={}",
-                &self.session_id().to_hex_string()[..8],
+        let outcome = self.with_candidate_backend(|c, b| {
+            c.receive_candidate(source_idx, candidate, notar_cert, b)
+        });
+        match outcome {
+            IngressOutcome::Stored {
+                raw_candidate,
                 slot,
-                self.simplex_state.max_acceptable_slot(),
-                if is_broadcast_candidate { "broadcast" } else { "query" },
-            );
-            return;
-        }
-
-        // Candidate signatures are always created by the slot leader (not by the relay / query responder).
-        // For requestCandidate responses, `sender_idx` is the responder, which can differ from the leader.
-        let leader_idx = self.runtime.description().get_leader(slot);
-
-        if log::log_enabled!(log::Level::Trace) {
-            log::trace!(
-                "Session {} on_candidate_received: \
-                sender_idx={sender_idx}, leader_idx={leader_idx}, \
-                slot={slot}, tl_parent={tl_parent_str}",
-                &self.session_id().to_hex_string()[..8],
-            );
-        }
-
-        // 1. Check sender_idx is valid
-        if !self.is_valid_source(sender_idx) {
-            log::warn!(
-                "Session {} on_candidate_received: unknown sender_idx={} (max={})",
-                self.session_id().to_hex_string(),
-                sender_idx,
-                self.runtime.description().get_total_nodes()
-            );
-            return;
-        }
-
-        // NOTE: A broadcast candidate (no attached notar cert) is authenticated
-        // by the slot leader's signature, which is verified against `leader_key` in
-        // `RawCandidate::from_tl(...)` below. The delivering peer (`sender_idx`) may be a
-        // relay / gossip hop rather than the leader itself. Dropping a relayed broadcast
-        // here strands any node that missed the leader's direct delivery: it can never
-        // notarize the slot, is forced to skip, and a single such node is enough to wedge
-        // finalization on a notarized slot.
-        //
-        // C++ parity: overlay broadcasts carry the leader as their signed source (preserved
-        // across relays), and `consensus.cpp handle(CandidateReceived)` applies no
-        // sender==leader gate; the resolver also serves candidate bodies with no
-        // leader-source restriction. We therefore accept relayed broadcasts and let the
-        // leader-signature verification below authenticate the body.
-        if is_broadcast_candidate && sender_idx != leader_idx {
-            self.telemetry.candidate_relayed_broadcast_counter.increment(1);
-            log::debug!(
-                "Session {} on_candidate_received: received relayed broadcast candidate \
-                slot={} leader={} sender={} (leader-signature verification pending below)",
-                &self.session_id().to_hex_string()[..8],
-                slot,
+                hash,
                 leader_idx,
-                sender_idx
-            );
-        }
-
-        // Broadcast path must reject stale slots eagerly to avoid stale-body/db churn.
-        let fsm_first_non_finalized_slot = self.simplex_state.get_first_non_finalized_slot();
-        if slot < fsm_first_non_finalized_slot {
-            if is_broadcast_candidate {
-                self.telemetry.candidate_precheck_old_slot_drop_counter.increment(1);
-                if is_local_self_candidate {
-                    self.note_generated_candidate_validation_missed_for_slot(
-                        slot,
-                        format!(
-                            "candidate_precheck_old_slot first_non_finalized_slot={fsm_first_non_finalized_slot}"
-                        ),
+                receive_time,
+                before_split,
+                observed,
+                notar_cert,
+            } => {
+                if let Some((block_id, before_split)) = before_split {
+                    self.consensus.insert_before_split(block_id, before_split);
+                }
+                if let Some(observed) = observed {
+                    self.callbacks.notify_candidate_observed(
+                        observed.block_id,
+                        observed.data,
+                        observed.collated_data,
+                        observed.flags,
                     );
                 }
-                log::warn!(
-                    "Session {} on_candidate_received: REJECTED precheck_drop_reason=old_slot \
-                    slot={} first_non_finalized={} origin=broadcast",
-                    &self.session_id().to_hex_string()[..8],
+                // Candidate arrival can unblock deferred recursive finalization chains.
+                self.with_consensus_backend(|consensus, backend| {
+                    consensus.retry_pending_recursive_finalization(backend)
+                });
+                // Notar-cert (only carried by query responses) is ingested after
+                // the body is stored, regardless of parent-metadata availability.
+                if let Some(ref cert_bytes) = notar_cert {
+                    self.process_received_notar_cert(slot, &hash, cert_bytes);
+                }
+                let now = self.now();
+                self.validation.register_candidate_for_validation(
+                    raw_candidate,
                     slot,
-                    fsm_first_non_finalized_slot
-                );
-                return;
-            }
-
-            log::trace!(
-                "Session {} on_candidate_received: old slot received {} (current={}) origin=query",
-                self.session_id().to_hex_string(),
-                slot,
-                fsm_first_non_finalized_slot,
-            );
-        }
-
-        // Get leader public key for signature verification
-        let leader_key = self.runtime.description().get_source_public_key(leader_idx).clone();
-
-        // 2. Create RawCandidate directly from TL (no serialization needed)
-        // Note: max_size check is done in receiver
-        let max_size = self.runtime.description().opts().max_block_size
-            + self.runtime.description().opts().max_collated_data_size;
-
-        let raw_candidate = match RawCandidate::from_tl(
-            &candidate,
-            &self.session_id(),
-            &leader_key,
-            leader_idx,
-            self.runtime.description().get_shard(),
-            max_size,
-            self.runtime.description().opts().proto_version,
-        ) {
-            Ok(c) => c,
-            Err(e) => {
-                if is_local_self_candidate {
-                    self.note_generated_candidate_validation_missed_for_slot(
-                        slot,
-                        format!("candidate_deserialization_failed error={e}"),
-                    );
-                }
-                log::warn!(
-                    "Session {} on_candidate_received: failed to deserialize candidate from \
-                    sender={}, leader={}, slot={}: {}",
-                    self.session_id().to_hex_string(),
-                    sender_idx,
                     leader_idx,
-                    slot,
-                    e
+                    receive_time,
+                    now,
+                    &self.simplex_state,
+                    &mut self.runtime,
                 );
-                return;
-            }
-        };
-
-        // Trace log incoming candidate details for debugging
-        log::trace!(
-            "Session {} on_candidate_received: parsed candidate {}:{} parent={} leader=v{:03}",
-            &self.session_id().to_hex_string()[..8],
-            slot,
-            &raw_candidate.id.hash.to_hex_string()[..8],
-            raw_candidate
-                .parent_id
-                .as_ref()
-                .map(|p| format!("{}:{}", p.slot, &p.hash.to_hex_string()[..8]))
-                .unwrap_or_else(|| "genesis".to_string()),
-            leader_idx
-        );
-
-        // 5. Candidates can be received via relay or requestCandidate (query response),
-        // so the sender can differ from the slot leader. The signature is verified against
-        // the leader's key above, so a mismatch here is not an error.
-        if sender_idx != leader_idx && !is_broadcast_candidate {
-            log::trace!(
-                "Session {} on_candidate_received: received leader candidate via relay/query: \
-                slot={slot} leader={leader_idx} sender={sender_idx}",
-                &self.session_id().to_hex_string()[..8],
-            );
-        }
-
-        // 6. Check if we already have this candidate
-        let candidate_id = raw_candidate.id.clone();
-        let id_hash = candidate_id.hash.clone();
-        debug_assert!(
-            candidate_id.slot == slot,
-            "RawCandidateId slot mismatch: tl_slot={} raw_candidate.id.slot={}",
-            slot,
-            candidate_id.slot
-        );
-
-        if is_broadcast_candidate {
-            match self.candidate_book.seen_broadcast(slot).cloned() {
-                Some(existing) if existing != candidate_id => {
-                    self.telemetry.candidate_precheck_conflicting_slot_drop_counter.increment(1);
-                    if is_local_self_candidate {
-                        self.note_generated_candidate_validation_missed(
-                            &candidate_id,
-                            format!(
-                                "candidate_precheck_conflicting_slot first_seen_slot_hash={}:{}",
-                                existing.slot,
-                                &existing.hash.to_hex_string()[..8]
-                            ),
-                        );
-                    }
-                    log::warn!(
-                        "Session {} on_candidate_received: REJECTED \
-                        precheck_drop_reason=conflicting_slot_candidate \
-                        slot={} first_seen={:?} new_candidate={:?} origin=broadcast",
-                        &self.session_id().to_hex_string()[..8],
-                        slot,
-                        existing,
-                        candidate_id
-                    );
-                    return;
-                }
-                Some(_) => {}
-                None => {
-                    self.candidate_book.insert_seen_broadcast(slot, candidate_id.clone());
-                }
-            }
-        }
-
-        // Check if candidate already known.
-        // A finalized-boundary stub (seeded by handle_block_finalized with empty data) is NOT
-        // "already known" for this purpose -- we want the real body to overwrite it.
-        let is_finalized_stub = self
-            .candidate_book
-            .received(&candidate_id)
-            .map(|r| r.candidate_hash_data_bytes.is_empty())
-            .unwrap_or(false);
-        if !is_finalized_stub
-            && (self.validation.pending_validation_contains(&candidate_id)
-                || self.validation.pending_approve_contains(&candidate_id)
-                || self.validation.approved_contains(&candidate_id)
-                || self.validation.is_rejected(&candidate_id)
-                || self.candidate_book.contains_received(&candidate_id))
-        {
-            log::trace!(
-                "Session {} on_candidate_received: candidate already known: {:?}",
-                self.session_id().to_hex_string(),
-                candidate_id,
-            );
-
-            // CandidateResolver parity: query responses can carry NotarCert bytes even when we
-            // already have the candidate body (e.g., we missed the certificate broadcast).
-            // Do NOT drop notar_cert in this case, otherwise the node can get permanently stuck
-            // waiting for NotarCert while repeatedly receiving bodies.
-            if let Some(ref cert_bytes) = notar_cert {
-                self.process_received_notar_cert(slot, &id_hash, cert_bytes);
-            }
-            if notar_cert.is_some() {
+                // Immediately process the new candidate (don't wait for next awake).
                 self.check_all();
             }
-            return;
-        }
-
-        // 7. Store candidate in received_candidates for finalization (even if not validated)
-        // This allows us to accept blocks that are finalized before validation completes
-        // Reference: validator-session/src/session_processor.rs set_block_candidate
-        let receive_time = self.now();
-        let block_id = raw_candidate.block.block_id();
-
-        // Trace: candidate received from network (also fires for self-loop after own block)
-        if let Some(tc) = &self.trace_collector {
-            let trace_id = BlockCandidateId {
-                slot: raw_candidate.id.slot,
-                hash: raw_candidate.id.hash.clone(),
-                block: block_id.clone(),
-            };
-            let trace_parent = raw_candidate.parent_id.as_ref().map(|p| BlockCandidateId {
-                slot: p.slot,
-                hash: p.hash.clone(),
-                block: ton_block::BlockIdExt::default(),
-            });
-            tc.record_candidate_received(
-                self.session_id(),
-                &trace_id,
-                trace_parent.as_ref(),
-                Some(block_id),
-                false,
-            );
-        }
-
-        let root_hash = block_id.root_hash.clone();
-        let file_hash = block_id.file_hash.clone();
-
-        // Determine if this is an empty block from the TL variant
-        let is_empty = matches!(candidate, CandidateData::Consensus_Empty(_));
-
-        // Cache serialized CandidateData for RequestCandidate query fallback (C++ parity).
-        // This provides a secondary in-memory store that persists independently of
-        // the receiver's resolver_cache, enabling peers to retrieve candidates even
-        // after the resolver_cache is cleaned up.
-        match serialize_boxed(&candidate) {
-            Ok(bytes) => {
-                self.candidate_book.insert_cached_data(candidate_id.clone(), bytes.clone());
-                // Persist to DB for restart serving (C++ CandidateResolver::store_candidate parity)
-                if let Err(e) =
-                    self.database.db().save_candidate_payload_async(&candidate_id, &bytes)
-                {
-                    log::error!(
-                        "Session {} on_candidate_received: failed to persist candidate payload: {}",
-                        &self.session_id().to_hex_string()[..8],
-                        e
-                    );
-                    self.increment_error();
+            IngressOutcome::AlreadyKnown { slot, hash, notar_cert } => {
+                // CandidateResolver parity: a query response can carry NotarCert
+                // bytes even when we already have the body; ingest it and pump.
+                if let Some(ref cert_bytes) = notar_cert {
+                    self.process_received_notar_cert(slot, &hash, cert_bytes);
+                    self.check_all();
                 }
             }
-            Err(e) => {
-                log::warn!(
-                    "Session {} on_candidate_received: failed to serialize CandidateData for cache: {}",
-                    &self.session_id().to_hex_string()[..8],
-                    e
-                );
-            }
+            IngressOutcome::Rejected => {}
         }
-
-        // Seqno validation for on_candidate_received
-        // Validate seqno is consistent with parent (if parent is already received)
-        let received_seqno = block_id.seq_no;
-        if let Some(ref parent) = raw_candidate.parent_id {
-            if let Some(parent_received) = self.candidate_book.received(parent) {
-                let parent_seqno = parent_received.block_id.seq_no;
-                let expected_seqno = if is_empty { parent_seqno } else { parent_seqno + 1 };
-
-                if received_seqno != expected_seqno {
-                    // NOTE: We no longer reject candidates for seqno mismatch at receive time.
-                    // The seqno in a candidate is based on the collator's prev_blocks_ids (their chain view),
-                    // while the parent slot is from the Simplex FSM. These can legitimately diverge when:
-                    // 1. The FSM parent is an older notarized block
-                    // 2. The collator's chain has more finalized blocks
-                    // Seqno validation is deferred until finalized state is materialized.
-                    log::debug!(
-                        "Session {} on_candidate_received: seqno differs from parent-based \
-                        expectation for slot={slot}, received seqno={received_seqno}, \
-                        expected={expected_seqno} (parent_seqno={parent_seqno}, \
-                        is_empty={is_empty}). Allowing through - finalized path will resolve it.",
-                        &self.session_id().to_hex_string()[..8],
-                    );
-                }
-            }
-            // If parent not yet received, we can't validate seqno - allow it through
-            // Validation will happen when finalized state is applied.
-        } else {
-            // No parent (first block in epoch) - seqno is based on the session's initial_block_seqno
-            // which may be > 1 if this is not the first session (e.g., after zerostate, seqno=1, but
-            // subsequent sessions continue from their start seqno).
-            // We don't validate first block seqno at receive time - defer to finalized application.
-
-            // INVARIANT: First block (no parent) cannot be empty
-            // Empty blocks inherit parent's BlockIdExt, so they require a parent
-            if is_empty {
-                if is_local_self_candidate {
-                    self.note_generated_candidate_validation_missed(
-                        &candidate_id,
-                        "first_block_cannot_be_empty",
-                    );
-                }
-                log::warn!(
-                    "Session {} on_candidate_received: INVARIANT VIOLATION - first block (slot={}) \
-                    cannot be empty (empty blocks require parent). Rejecting.",
-                    &self.session_id().to_hex_string()[..8],
-                    slot
-                );
-                return;
-            }
-
-            // Genesis-parent candidates at slot > 0 are normal in Simplex: when early
-            // slots are skipped, subsequent leaders produce blocks with parent_id=None.
-            if slot.value() != 0 {
-                log::trace!(
-                    "Session {} on_candidate_received: genesis-parent block at slot={} \
-                    (early slots were skipped)",
-                    &self.session_id().to_hex_string()[..8],
-                    slot
-                );
-            }
-
-            log::debug!(
-                "Session {} on_candidate_received: first block (slot={}) has seqno={}",
-                &self.session_id().to_hex_string()[..8],
-                slot,
-                received_seqno
-            );
-        }
-
-        // Extract actual block data from RawCandidate (not the TL wrapper)
-        // This is what validation/finalization callbacks consume.
-        let gen_utime_ms = raw_candidate
-            .block
-            .as_block()
-            .and_then(|block| extract_consensus_gen_utime_ms(&block.collated_data));
-        let (block_data, collated_data) = match raw_candidate.block.as_block() {
-            Some(block) => (
-                consensus_common::ConsensusCommonFactory::create_block_payload(block.data.clone()),
-                consensus_common::ConsensusCommonFactory::create_block_payload(
-                    block.collated_data.clone(),
-                ),
-            ),
-            None => (
-                // Empty block - no data
-                consensus_common::ConsensusCommonFactory::create_empty_block_payload(),
-                consensus_common::ConsensusCommonFactory::create_empty_block_payload(),
-            ),
-        };
-        let observed_data = block_data.clone();
-        let observed_collated_data = collated_data.clone();
-
-        let parent_id = raw_candidate.parent_id.clone();
-
-        // Build CandidateHashData TL bytes for signature verification
-        // This is the data that was hashed to produce candidate_id_hash
-        let candidate_hash_data_bytes = if is_empty {
-            // Empty blocks use candidateHashDataEmpty with CandidateId parent
-            let Some(parent) = parent_id.as_ref() else {
-                if is_local_self_candidate {
-                    self.note_generated_candidate_validation_missed(
-                        &candidate_id,
-                        "empty_candidate_missing_parent",
-                    );
-                }
-                log::error!(
-                    "Session {} on_candidate_received: empty block must have parent",
-                    &self.session_id().to_hex_string()[..8]
-                );
-                return;
-            };
-            crate::utils::build_candidate_hash_data_bytes_empty(
-                &block_id,
-                (parent.slot, &parent.hash),
-            )
-        } else {
-            // Non-empty blocks use candidateHashDataOrdinary
-            let collated_file_hash = match raw_candidate.block.as_block() {
-                Some(block) => block.collated_file_hash.clone(),
-                None => UInt256::default(),
-            };
-            let parent_info = parent_id.as_ref().map(|p| (p.slot, &p.hash));
-            crate::utils::build_candidate_hash_data_bytes(
-                Some(&block_id),
-                Some(&collated_file_hash),
-                parent_info,
-            )
-        };
-
-        let parent_metadata_present =
-            parent_id.as_ref().is_none_or(|parent| self.candidate_book.contains_received(parent));
-        log::trace!(
-            "Session {} on_candidate_received: slot={} parent={:?} parent_metadata_present={}",
-            self.session_id().to_hex_string(),
-            slot,
-            parent_id.as_ref().map(|p| p.slot),
-            parent_metadata_present,
-        );
-
-        // Clone data needed for DB save before moving into ReceivedCandidate
-        let candidate_hash_data_bytes_for_db = candidate_hash_data_bytes.clone();
-        let signature_for_db = raw_candidate.signature.clone();
-
-        self.candidate_book.insert_received(
-            candidate_id.clone(),
-            ReceivedCandidate {
-                slot,
-                source_idx: leader_idx,
-                candidate_hash_data_bytes,
-                block_id: block_id.clone(),
-                root_hash,
-                file_hash,
-                data: block_data,
-                collated_data,
-                gen_utime_ms,
-                receive_time,
-                is_empty,
-                parent_id: parent_id.clone(),
-            },
-        );
-
-        // Save candidate info to DB (fire-and-forget, matching C++ `.start().detach()` pattern)
-        self.database.save_candidate_info_to_db(
-            slot,
-            &id_hash,
-            leader_idx,
-            &candidate_hash_data_bytes_for_db,
-            signature_for_db,
-            self.runtime.description().get_session_id(),
-            &self.telemetry,
-        );
-
-        // Remove from requested_candidates if we were waiting for this
-        self.requested_candidates.remove(&candidate_id);
-
-        if !is_empty {
-            match crate::utils::extract_before_split_flag(observed_data.data()) {
-                Ok(before_split) => {
-                    self.consensus.insert_before_split(block_id.clone(), before_split);
-                }
-                Err(e) => {
-                    log::trace!(
-                        "Session {} on_candidate_received: failed to extract before_split flag \
-                        for block_id={}: {}",
-                        self.session_id().to_hex_string(),
-                        block_id,
-                        e
-                    );
-                }
-            }
-
-            let observed_flags = CandidateObservedFlags {
-                body_present: true,
-                parent_ready: self.simplex_state.get_notarize_certificate(slot, &id_hash).is_some(),
-                local_collated: is_local_self_candidate,
-            };
-            self.callbacks.notify_candidate_observed(
-                block_id.clone(),
-                observed_data,
-                observed_collated_data,
-                observed_flags,
-            );
-        }
-
-        // Candidate arrival can unblock deferred recursive finalization chains.
-        self.with_consensus_backend(|consensus, backend| {
-            consensus.retry_pending_recursive_finalization(backend)
-        });
-
-        // DEBUG: Short pattern for quick grep (RECV = candidate received)
-        log::debug!(
-            "Session {} RECV candidate: slot={slot}, hash={}, seqno={received_seqno}, \
-            from=v{:03}, empty={is_empty}, parent_metadata_present={parent_metadata_present}",
-            &self.session_id().to_hex_string()[..8],
-            &id_hash.to_hex_string()[..8],
-            leader_idx,
-        );
-        // TRACE: Method name pattern for detailed tracking
-        log::trace!(
-            "Session {} on_candidate_received: slot={slot}, hash={}, seqno={received_seqno}, \
-            source={leader_idx}, empty={is_empty}, parent={:?}, parent_metadata_present={parent_metadata_present}",
-            self.session_id().to_hex_string(),
-            id_hash.to_hex_string(),
-            parent_id.as_ref().map(|p| format!("{}:{}", p.slot, p.hash.to_hex_string())),
-        );
-
-        // 8. Process notarization/finalization signature-sets if provided (from query response)
-        // This can be done immediately, regardless of parent-metadata availability.
-        // Clone id_hash before use for certificates
-        let id_hash_for_cert = id_hash.clone();
-        if let Some(ref cert_bytes) = notar_cert {
-            self.process_received_notar_cert(slot, &id_hash_for_cert, cert_bytes);
-        }
-
-        // 9. Admit the candidate immediately; check_validation() owns the remaining
-        // WaitForParent gate and, for empties, waits until the expected normal tip can be
-        // reconstructed from locally known parent metadata.
-        if !parent_metadata_present {
-            log::debug!(
-                "Session {} on_candidate_received: slot={} hash={} is missing parent metadata, \
-                but ingress no longer parks candidates behind a simplex-local resolution queue",
-                &self.session_id().to_hex_string()[..8],
-                slot,
-                &id_hash.to_hex_string()[..8],
-            );
-        }
-        let now = self.now();
-        self.validation.register_candidate_for_validation(
-            raw_candidate,
-            slot,
-            leader_idx,
-            receive_time,
-            now,
-            &self.simplex_state,
-            &mut self.runtime,
-        );
-
-        // Immediately process the new candidate (don't wait for next awake)
-        self.check_all();
-    }
-
-    /// Record receipt of a candidate. Delegates to the telemetry aspect.
-    ///
-    /// Keeps ingress counters focused on peer-delivered traffic: locally
-    /// generated blocks loop back through `on_candidate_received` but are not
-    /// network ingress. The self-index filter lives inside
-    /// [`SessionTelemetry::record_candidate_ingress`].
-    #[inline]
-    fn record_candidate_ingress(&self, sender_idx: ValidatorIndex, is_broadcast_candidate: bool) {
-        self.telemetry.record_candidate_ingress(
-            sender_idx,
-            self.runtime.description().get_self_idx(),
-            is_broadcast_candidate,
-        );
     }
 
     /* Outbound repair (request scheduling / resolver availability) */
 
-    /// Handle a reverse-bridge request from the validator layer to ensure a
-    /// candidate body (and optionally its parent chain) is available.
-    ///
-    /// The validator calls this when collation/validation needs a parent
-    /// state that hasn't been applied by the engine yet. Simplex resolves
-    /// `BlockIdExt` to the internal `RawCandidateId` and triggers repair.
-    ///
-    /// Important: a slot may be skipped but still have a notarized candidate.
-    /// The repair must handle that case — the candidate body might not have
-    /// been received via the normal broadcast path.
-    ///
-    /// C++ equivalent: demand-driven path in `BlockProducerImpl::produce()`
-    /// that triggers `StateResolverImpl::resolve()`.
+    /// Reverse-bridge entry point from the validator layer: ensure a candidate
+    /// body (and optionally its parent chain) is available. Delegates to
+    /// [`CandidateController::ensure_candidate_available`].
     pub(crate) fn ensure_candidate_available(
         &mut self,
         block_id: BlockIdExt,
         opts: EnsureCandidateAvailabilityOptions,
     ) {
-        self.ensure_candidate_available_impl(block_id, opts, 0);
+        self.with_candidate_backend(|c, b| c.ensure_candidate_available(block_id, opts, b));
     }
 
-    fn ensure_candidate_available_impl(
-        &mut self,
-        block_id: BlockIdExt,
-        opts: EnsureCandidateAvailabilityOptions,
-        attempt: u32,
-    ) {
-        log::info!(
-            target: "simplex_resolver",
-            "SessionProcessor::ensure_candidate_available session_id={} block_id={} \
-            purpose={:?} include_parent_chain={} attempt={}/{}",
-            self.session_id().to_hex_string(),
-            block_id,
-            opts.purpose,
-            opts.include_parent_chain,
-            attempt,
-            RESOLVER_AVAILABILITY_MAX_RETRIES,
-        );
-
-        let Some(candidate_id) =
-            self.with_collation_backend(|c, b| c.resolve_candidate_id_by_block_id(&block_id, b))
-        else {
-            if attempt < RESOLVER_AVAILABILITY_MAX_RETRIES {
-                let next_attempt = attempt + 1;
-                let expiration_time = self.now() + RESOLVER_AVAILABILITY_RETRY_DELAY;
-                log::info!(
-                    target: "simplex_resolver",
-                    "SessionProcessor::ensure_candidate_available: unresolved block_id={} \
-                    purpose={:?}; scheduling deferred retry {}/{} in {}ms",
-                    block_id,
-                    opts.purpose,
-                    next_attempt,
-                    RESOLVER_AVAILABILITY_MAX_RETRIES,
-                    RESOLVER_AVAILABILITY_RETRY_DELAY.as_millis(),
-                );
-                self.post_delayed_action(expiration_time, move |processor| {
-                    processor.ensure_candidate_available_impl(block_id, opts, next_attempt);
-                });
-            } else {
-                log::warn!(
-                    target: "simplex_resolver",
-                    "SessionProcessor::ensure_candidate_available: unresolved block_id={} \
-                    purpose={:?}; exhausted {RESOLVER_AVAILABILITY_MAX_RETRIES} retries, giving up",
-                    block_id,
-                    opts.purpose,
-                );
-            }
-            return;
-        };
-
-        self.request_candidate_body_for_resolver(candidate_id.clone());
-
-        if !opts.include_parent_chain {
-            return;
-        }
-
-        let mut current = candidate_id;
-        let mut depth = 0u32;
-        let mut depth_warned = false;
-        loop {
-            depth += 1;
-            if depth > EMPTY_CHAIN_WARN_DEPTH && !depth_warned {
-                log::warn!(
-                    target: "simplex_resolver",
-                    "SessionProcessor::ensure_candidate_available: deep parent chain depth={} \
-                    (warn_threshold={EMPTY_CHAIN_WARN_DEPTH}) for block_id={}; \
-                    continuing until hard limit={MAX_CHAIN_DEPTH}",
-                    depth,
-                    block_id,
-                );
-                depth_warned = true;
-            }
-            if depth > MAX_CHAIN_DEPTH {
-                log::error!(
-                    target: "simplex_resolver",
-                    "SessionProcessor::ensure_candidate_available: exceeded \
-                    hard MAX_CHAIN_DEPTH={MAX_CHAIN_DEPTH} while resolving parents for block_id={}",
-                    block_id,
-                );
-                self.increment_error();
-                break;
-            }
-
-            let parent_id = match self
-                .candidate_book
-                .received(&current)
-                .and_then(|received| received.parent_id.clone())
-            {
-                Some(parent_id) => parent_id,
-                None => break,
-            };
-
-            self.request_candidate_body_for_resolver(parent_id.clone());
-
-            if !self.candidate_book.contains_received(&parent_id) {
-                log::trace!(
-                    target: "simplex_resolver",
-                    "SessionProcessor::ensure_candidate_available: parent metadata missing at \
-                    slot={} hash={} while resolving block_id={}; stopping chain traversal",
-                    parent_id.slot,
-                    &parent_id.hash.to_hex_string()[..8],
-                    block_id,
-                );
-                break;
-            }
-
-            current = parent_id;
-        }
-    }
-
-    /// Schedule a candidate request with delay if not already requested
-    ///
-    /// Called when we need to repair missing candidate data after learning about a
-    /// finalized or otherwise required block before all body/notar data is present.
-    /// Adds the (slot, hash) to `requested_candidates` and schedules a delayed action.
-    /// After the delay, if the candidate is still not in `received_candidates`, requests
-    /// it from peers (with want_notar=true to get NotarCert).
-    ///
-    /// The delay allows time for the broadcast to arrive naturally before triggering
-    /// a P2P query, reducing unnecessary network traffic.
-    ///
-    /// Request a candidate with optional initial delay.
-    ///
-    /// # Parameters
-    /// - `initial_delay`: Optional delay before sending the request.
-    ///   - `None`: Use default `CANDIDATE_REQUEST_DELAY` (allows broadcast to arrive first)
-    ///   - `Some(Duration::ZERO)`: Request immediately (for repair-critical paths)
-    ///   - `Some(dur)`: Custom delay
+    /// Schedule a (possibly delayed, throttled) `requestCandidate`. Delegates to
+    /// [`CandidateController::request_candidate`].
     fn request_candidate(
         &mut self,
         slot: SlotIndex,
         block_hash: UInt256,
         initial_delay: Option<Duration>,
     ) {
-        let delay = initial_delay.unwrap_or(CANDIDATE_REQUEST_DELAY);
-
-        let key = RawCandidateId { slot, hash: block_hash.clone() };
-
-        if self.simplex_state.has_skip_certificate_for_slot(self.runtime.description(), slot) {
-            log::trace!(
-                "Session {} request_candidate: slot={} hash={} - skipped already, not requesting",
-                &self.session_id().to_hex_string()[..8],
-                slot,
-                &block_hash.to_hex_string()[..8],
-            );
-            self.requested_candidates.remove(&key);
-            return;
-        }
-
-        // Throttle repeated requests for the same (slot,hash) to survive transient partitions.
-        let now = self.now();
-        if let Some(next_allowed_at) = self.requested_candidates.get(&key) {
-            if *next_allowed_at > now {
-                log::trace!(
-                    "Session {} request_candidate: slot={} hash={} - throttled until {:?}",
-                    &self.session_id().to_hex_string()[..8],
-                    slot,
-                    &block_hash.to_hex_string()[..8],
-                    next_allowed_at
-                );
-                return;
-            }
-        }
-
-        // Check if we already have what we need (stubs don't count as real bodies)
-        let have_body = self.candidate_book.has_real_body(&key);
-        let have_notar = self.simplex_state.get_notarize_certificate(slot, &block_hash).is_some();
-
-        if have_body && have_notar {
-            return;
-        }
-
-        if delay.is_zero() {
-            self.requested_candidates.insert(key.clone(), now + CANDIDATE_REQUEST_RETRY_INTERVAL);
-
-            log::debug!(
-                "Session {} request_candidate: requesting slot={slot} hash={} immediately \
-                (body={}, notar={})",
-                &self.session_id().to_hex_string()[..8],
-                &block_hash.to_hex_string()[..8],
-                !have_body,
-                !have_notar,
-            );
-
-            self.receiver.request_candidate(slot.value(), block_hash);
-        } else {
-            self.requested_candidates
-                .insert(key.clone(), now + delay + CANDIDATE_REQUEST_RETRY_INTERVAL);
-
-            log::trace!(
-                "Session {} request_candidate: scheduling request for slot={} hash={} in {:?}",
-                &self.session_id().to_hex_string()[..8],
-                slot,
-                &block_hash.to_hex_string()[..8],
-                delay,
-            );
-
-            let session_id = self.session_id().clone();
-            let expiration_time = now + delay;
-
-            self.post_delayed_action(expiration_time, move |processor: &mut SessionProcessor| {
-                let candidate_id = RawCandidateId { slot, hash: block_hash.clone() };
-                if !processor.requested_candidates.contains_key(&candidate_id) {
-                    log::trace!(
-                        "Session {} delayed_request_candidate: slot={slot} hash={} \
-                        - cancelled before send",
-                        &session_id.to_hex_string()[..8],
-                        &block_hash.to_hex_string()[..8],
-                    );
-                    return;
-                }
-                if processor
-                    .simplex_state
-                    .has_skip_certificate_for_slot(processor.runtime.description(), slot)
-                {
-                    log::trace!(
-                        "Session {} delayed_request_candidate: slot={slot} hash={} \
-                        - skipped before send",
-                        &session_id.to_hex_string()[..8],
-                        &block_hash.to_hex_string()[..8],
-                    );
-                    processor.requested_candidates.remove(&candidate_id);
-                    return;
-                }
-                let have_body = processor.candidate_book.has_real_body(&candidate_id);
-                let have_notar =
-                    processor.simplex_state.get_notarize_certificate(slot, &block_hash).is_some();
-
-                if have_body && have_notar {
-                    log::trace!(
-                        "Session {} delayed_request_candidate: slot={slot} hash={} - already have \
-                        what we need",
-                        &session_id.to_hex_string()[..8],
-                        &block_hash.to_hex_string()[..8],
-                    );
-                    return;
-                }
-
-                log::debug!(
-                    "Session {} delayed_request_candidate: requesting slot={slot} hash={} from \
-                    peers (body={}, notar={})",
-                    &session_id.to_hex_string()[..8],
-                    &block_hash.to_hex_string()[..8],
-                    !have_body,
-                    !have_notar,
-                );
-
-                processor.receiver.request_candidate(slot.value(), block_hash);
-                processor
-                    .requested_candidates
-                    .insert(candidate_id, processor.now() + CANDIDATE_REQUEST_RETRY_INTERVAL);
-            });
-        }
+        self.with_candidate_backend(|c, b| c.request_candidate(slot, block_hash, initial_delay, b));
     }
 
-    /// Resolver-driven candidate body request.
-    ///
-    /// Unlike `request_candidate`, this path is used by validator-side state resolution and
-    /// must still request a candidate even when the slot already has a skip certificate.
-    /// (A slot can be skipped and still have a notarized block body needed for parent state.)
-    fn request_candidate_body_for_resolver(&mut self, candidate_id: RawCandidateId) {
-        let now = self.now();
-
-        if self.candidate_book.has_real_body(&candidate_id) {
-            return;
-        }
-
-        if let Some(next_allowed_at) = self.requested_candidates.get(&candidate_id) {
-            if *next_allowed_at > now {
-                log::trace!(
-                    target: "simplex_resolver",
-                    "Session {} request_candidate_body_for_resolver: slot={} hash={} \
-                    - throttled until {:?}",
-                    &self.session_id().to_hex_string()[..8],
-                    candidate_id.slot,
-                    &candidate_id.hash.to_hex_string()[..8],
-                    next_allowed_at,
-                );
-                return;
-            }
-        }
-
-        let skipped = self
-            .simplex_state
-            .has_skip_certificate_for_slot(self.runtime.description(), candidate_id.slot);
-
-        log::debug!(
-            target: "simplex_resolver",
-            "Session {} request_candidate_body_for_resolver: requesting slot={} hash={} \
-            immediately (skipped_slot={})",
-            &self.session_id().to_hex_string()[..8],
-            candidate_id.slot,
-            &candidate_id.hash.to_hex_string()[..8],
-            skipped,
-        );
-
-        self.requested_candidates
-            .insert(candidate_id.clone(), now + CANDIDATE_REQUEST_RETRY_INTERVAL);
-        self.receiver.request_candidate(candidate_id.slot.value(), candidate_id.hash.clone());
-    }
-
+    /// Cancel outbound repair for a slot after it finalizes / skips. Delegates to
+    /// [`CandidateController::cancel_repairs_for_slot`].
     fn cancel_candidate_repairs_for_slot(&mut self, slot: SlotIndex) {
-        let before = self.requested_candidates.len();
-        self.requested_candidates.retain(|candidate_id, _| candidate_id.slot != slot);
-        let removed_requests = before.saturating_sub(self.requested_candidates.len());
-        let removed_missing_body = self.telemetry.forget_missing_body_log(slot.value());
-
-        self.receiver.cancel_candidate_requests_for_slot(slot.value());
-
-        if removed_requests > 0 || removed_missing_body {
-            log::trace!(
-                "Session {} cancel_candidate_repairs_for_slot: slot={slot} \
-                removed_requests={removed_requests} removed_missing_body={removed_missing_body}",
-                &self.session_id().to_hex_string()[..8]
-            );
-        }
+        self.with_candidate_backend(|c, b| c.cancel_repairs_for_slot(slot, b));
     }
 
     /* Serving inbound candidate queries (SXRCV fallback) */
 
-    /// Handle RequestCandidate query fallback when receiver's resolver_cache misses.
-    ///
-    /// Called from SXRCV thread via ReceiverListener when a peer's RequestCandidate query
-    /// cannot be fully answered from the in-memory resolver_cache. Attempts to reconstruct
-    /// requested candidate body and/or notar parts from:
-    ///   1. `candidate_data_cache` (in-memory, fast path)
-    ///   2. SimplexDB `CandidateInfoRecord` (empty blocks only -- reconstructed from metadata)
-    ///
-    /// Non-empty blocks not in the in-memory cache return an empty response; the
-    /// querying peer will retry with other validators. This matches C++ behavior
-    /// where `CandidateResolver` only loads from its own consensus DB, never from
-    /// the validator manager.
-    ///
-    /// Reference: C++ `CandidateResolver::try_load_candidate_data_from_db()`
-    /// TODO: LK: move DB operations to background thread
+    /// Answer a peer's `RequestCandidate` query fallback. Delegates to
+    /// [`CandidateController::serve_query_fallback`].
     pub(crate) fn handle_candidate_query_fallback(
         &mut self,
         slot: SlotIndex,
@@ -2123,173 +1207,182 @@ impl SessionProcessor {
         want_notar: bool,
         response_callback: crate::QueryResponseCallback,
     ) {
-        check_execution_time!(50_000);
-
-        let candidate_id = RawCandidateId { slot, hash: block_hash.clone() };
-        let session_hex = &self.session_id().to_hex_string()[..8];
-
-        // Candidate and notar can be requested independently. Build each part
-        // from the best available source and return partials when only one part exists.
-        let mut candidate_bytes = Vec::new();
-
-        if want_candidate {
-            // 1. Fast path: in-memory candidate_data_cache
-            if let Some(bytes) = self.candidate_book.cached_data(&candidate_id) {
-                log::debug!(
-                    "Session {session_hex} candidate_query_fallback: \
-                    candidate cache HIT for slot={slot} hash={} ({}B)",
-                    &block_hash.to_hex_string()[..8],
-                    bytes.len()
-                );
-                candidate_bytes.clone_from(bytes);
-            } else {
-                // 2. DB path: candidate metadata
-                let candidate_info = self.database.load_candidate_info_from_db(
-                    &candidate_id,
-                    self.runtime.description().get_session_id(),
-                );
-
-                // 3. Persisted payload (works for both empty and non-empty blocks)
-                const DB_TIMEOUT: Duration = Duration::from_secs(2);
-                match self.database.db().load_candidate_payload_by_id(&candidate_id, DB_TIMEOUT) {
-                    Ok(Some(payload_bytes)) => {
-                        log::debug!(
-                            "Session {session_hex} candidate_query_fallback: \
-                            loaded payload from DB for slot={slot} ({}B)",
-                            payload_bytes.len()
-                        );
-                        candidate_bytes = payload_bytes;
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        log::warn!(
-                            "Session {session_hex} candidate_query_fallback: \
-                            DB payload load error for slot={slot}: {e}"
-                        );
-                    }
-                }
-
-                // 4. Metadata reconstruction for empty blocks when payload missing.
-                if candidate_bytes.is_empty() {
-                    if let Some(info) = candidate_info.as_ref() {
-                        let is_empty = matches!(
-                            info.candidate_hash_data,
-                            CandidateHashData::Consensus_CandidateHashDataEmpty(_)
-                        );
-                        if is_empty {
-                            match self
-                                .reconstruct_empty_candidate_data_from_info(&candidate_id, info)
-                            {
-                                Ok(bytes) => {
-                                    log::debug!(
-                                        "Session {session_hex} candidate_query_fallback: \
-                                        reconstructed empty block for slot={slot} ({}B)",
-                                        bytes.len()
-                                    );
-                                    candidate_bytes = bytes;
-                                }
-                                Err(e) => {
-                                    log::warn!(
-                                        "Session {session_hex} candidate_query_fallback: \
-                                        failed to reconstruct empty block for slot={slot}: {e}"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let notar_bytes = if want_notar {
-            self.database.load_notar_cert_bytes_from_db(
-                &candidate_id,
-                self.runtime.description().get_session_id(),
-            )
-        } else {
-            Vec::new()
-        };
-
-        if candidate_bytes.is_empty() && notar_bytes.is_empty() {
-            log::debug!(
-                "Session {} candidate_query_fallback: NOT FOUND for slot={} hash={} \
-                (want_candidate={}, want_notar={})",
-                session_hex,
+        self.with_candidate_backend(|c, b| {
+            c.serve_query_fallback(
                 slot,
-                &block_hash.to_hex_string()[..8],
+                block_hash,
                 want_candidate,
                 want_notar,
-            );
-        } else {
-            log::debug!(
-                "Session {} candidate_query_fallback: responding slot={} hash={} \
-                candidate_bytes={} notar_bytes={}",
-                session_hex,
-                slot,
-                &block_hash.to_hex_string()[..8],
-                candidate_bytes.len(),
-                notar_bytes.len()
-            );
-        }
+                response_callback,
+                b,
+            )
+        });
+    }
+}
 
-        Self::send_candidate_and_cert_response(candidate_bytes, notar_bytes, response_callback);
+/// Composition-root adapter bridging a [`ControllerQueue<CandidateController>`]
+/// to the real SXMAIN task queue.
+///
+/// The candidate analogue of [`CollationQueueAdapter`]: the one place allowed to
+/// name *both* `SessionProcessor` and `CandidateController`, owning the
+/// `&mut SessionProcessor -> &mut p.candidate` projection so the controller never
+/// has to. The controller holds only the generic
+/// `ControllerQueuePtr<CandidateController>` handle and stays independently
+/// constructible (and testable) without this type. Drives the repair delayed
+/// retries (`request_candidate` / `ensure_candidate_available`).
+struct CandidateQueueAdapter {
+    /// Shared handle to the main session task queue (the SXMAIN mailbox).
+    task_queue: TaskQueuePtr,
+}
+
+impl ControllerQueue<CandidateController> for CandidateQueueAdapter {
+    fn post_boxed(&self, task: ControllerTask<CandidateController>) {
+        crate::task_queue::post_closure(&self.task_queue, move |p: &mut SessionProcessor| {
+            p.with_candidate_backend(move |candidate, backend| task(candidate, backend));
+        });
     }
 
-    /// Build and send CandidateAndCert response.
-    fn send_candidate_and_cert_response(
-        candidate_bytes: Vec<u8>,
-        notar_bytes: Vec<u8>,
-        response_callback: crate::QueryResponseCallback,
+    fn post_delayed_boxed(&self, at: SystemTime, task: ControllerTask<CandidateController>) {
+        // Delayed actions live on the stack-bound `SessionRuntime` scheduler,
+        // reachable only on SXMAIN with `&mut SessionProcessor`. Bounce through
+        // the immediate queue: the immediate task (run on SXMAIN) schedules the
+        // projected delayed task, mirroring [`CollationQueueAdapter`].
+        crate::task_queue::post_closure(&self.task_queue, move |p: &mut SessionProcessor| {
+            p.runtime.post_delayed_action(
+                at,
+                Box::new(move |p2: &mut SessionProcessor| {
+                    p2.with_candidate_backend(move |candidate, backend| task(candidate, backend));
+                }),
+            );
+        });
+    }
+}
+
+/// Borrowing [`CandidateBackend`] view built fresh at drain.
+///
+/// [`SessionProcessor::with_candidate_backend`] constructs one from disjoint
+/// `&mut SessionProcessor` fields immediately before a candidate re-entry, hands
+/// `&mut dyn CandidateBackend` to the controller, and drops it when the call
+/// returns (RAII). Borrows the FSM state (prechecks / skip-cert / notar-cert
+/// probes), the database controller (serving loads + the in-line payload save and
+/// candidate-info persist), the validation controller (dedup probe), the
+/// collation controller (the generated-parent half of the resolver lookup), the
+/// network sender (repair `requestCandidate` / cancel effects), the runtime
+/// (session id for the candidate-info persist), and the telemetry sink threaded
+/// into that persist.
+struct CandidateBackendAdapter<'a> {
+    /// Consensus FSM state: far-future / stale-slot prechecks, skip-cert and
+    /// notarize-certificate probes. Shared (`&`).
+    simplex_state: &'a SimplexState,
+    /// Persistence controller. `&mut` for the candidate-info persist
+    /// (`save_candidate_info_to_db`); the serving loads + payload save are `&self`
+    /// calls reached through the shared `database()` reader.
+    database: &'a mut DatabaseController,
+    /// Validation queues, read by the dedup probe `candidate_known_in_validation`.
+    /// Shared (`&`).
+    validation: &'a ValidationController,
+    /// Collation controller, read for the generated-parent half of the resolver
+    /// `BlockIdExt -> RawCandidateId` lookup. Shared (`&`).
+    collation: &'a CollationController,
+    /// Network sender. The repair effects (`request_candidate_from_peers`,
+    /// `cancel_candidate_requests_for_slot`) forward directly to the `&self`
+    /// `Receiver` calls. Shared (`&`).
+    receiver: &'a ReceiverPtr,
+    /// Runtime handle, read for the session id threaded into the candidate-info
+    /// DB write. Shared (`&`).
+    runtime: &'a SessionRuntime,
+    /// Telemetry sink threaded into the candidate-info DB write. Shared (`&`).
+    telemetry: &'a SessionTelemetry,
+}
+
+impl CandidateBackend for CandidateBackendAdapter<'_> {
+    fn simplex_state(&self) -> &SimplexState {
+        self.simplex_state
+    }
+
+    fn database(&self) -> &DatabaseController {
+        &*self.database
+    }
+
+    fn candidate_known_in_validation(&self, candidate_id: &RawCandidateId) -> bool {
+        self.validation.pending_validation_contains(candidate_id)
+            || self.validation.pending_approve_contains(candidate_id)
+            || self.validation.approved_contains(candidate_id)
+            || self.validation.is_rejected(candidate_id)
+    }
+
+    fn collation_candidate_id_by_block_id(&self, block_id: &BlockIdExt) -> Option<RawCandidateId> {
+        self.collation.find_generated_parent_id_by_block_id(block_id)
+    }
+
+    fn persist_candidate_info(
+        &mut self,
+        slot: SlotIndex,
+        candidate_hash: &UInt256,
+        leader_idx: ValidatorIndex,
+        candidate_hash_data_bytes: &[u8],
+        signature: Vec<u8>,
     ) {
-        use consensus_common::ConsensusCommonFactory;
-
-        let response =
-            CandidateAndCert { candidate: candidate_bytes.into(), notar: notar_bytes.into() };
-
-        let result = match serialize_boxed(&response.into_boxed()) {
-            Ok(bytes) => Ok(ConsensusCommonFactory::create_block_payload(bytes)),
-            Err(e) => Err(error!("Failed to serialize fallback response: {}", e)),
-        };
-        response_callback(result);
+        self.database.save_candidate_info_to_db(
+            slot,
+            candidate_hash,
+            leader_idx,
+            candidate_hash_data_bytes,
+            signature,
+            self.runtime.description().get_session_id(),
+            self.telemetry,
+        );
     }
 
-    /// Reconstruct CandidateData::Consensus_Empty bytes from CandidateInfoRecord.
-    fn reconstruct_empty_candidate_data_from_info(
-        &self,
-        candidate_id: &RawCandidateId,
-        candidate_info: &crate::database::CandidateInfoRecord,
-    ) -> Result<Vec<u8>> {
-        let parent_id = match &candidate_info.candidate_hash_data {
-            CandidateHashData::Consensus_CandidateHashDataEmpty(empty) => {
-                let slot = SlotIndex(empty.parent.slot as u32);
-                let hash = empty.parent.hash.clone();
-                (slot, hash)
-            }
-            _ => return Err(error!("Expected empty hash data")),
+    fn request_candidate_from_peers(&self, slot: u32, hash: UInt256) {
+        self.receiver.request_candidate(slot, hash);
+    }
+
+    fn cancel_candidate_requests_for_slot(&self, slot: u32) {
+        self.receiver.cancel_candidate_requests_for_slot(slot);
+    }
+}
+
+impl SessionProcessor {
+    /* Controller seam (split-borrow) */
+
+    /// Run `f` against `&mut self.candidate` with a freshly built borrowing
+    /// [`CandidateBackend`].
+    ///
+    /// Splits `&mut self` into the disjoint pieces a candidate re-entry needs —
+    /// `&mut self.candidate` plus a fresh [`CandidateBackendAdapter`] over the FSM
+    /// state, database controller, validation + collation controllers, network
+    /// sender, runtime, and telemetry — invokes `f`, then drops the backend
+    /// (RAII). Mirrors [`Self::with_collation_backend`]; the single place that
+    /// assembles the candidate controller's backend view from `SessionProcessor`.
+    /// Used by the ingress shell ([`Self::on_candidate_received`]), the repair /
+    /// serving wrappers, and [`CandidateQueueAdapter`] when draining a queued
+    /// repair retry.
+    fn with_candidate_backend<R>(
+        &mut self,
+        f: impl for<'b> FnOnce(&mut CandidateController, &'b mut dyn CandidateBackend) -> R,
+    ) -> R {
+        let Self {
+            candidate,
+            simplex_state,
+            database,
+            validation,
+            collation,
+            receiver,
+            runtime,
+            telemetry,
+            ..
+        } = self;
+        let mut backend = CandidateBackendAdapter {
+            simplex_state: &*simplex_state,
+            database,
+            validation: &*validation,
+            collation: &*collation,
+            receiver: &*receiver,
+            runtime: &*runtime,
+            telemetry: &**telemetry,
         };
-
-        let block_id = if let Some(rc) = self.candidate_book.received(candidate_id) {
-            rc.block_id.clone()
-        } else {
-            return Err(error!(
-                "Cannot reconstruct empty block: no block_id available for slot={}",
-                candidate_id.slot
-            ));
-        };
-
-        let parent =
-            CandidateId { slot: parent_id.0.value() as i32, hash: parent_id.1 }.into_boxed();
-
-        let tl_empty = CandidateDataEmpty {
-            slot: candidate_id.slot.value() as i32,
-            parent,
-            block: block_id,
-            signature: candidate_info.signature.clone(),
-        };
-
-        let candidate_data = CandidateData::Consensus_Empty(tl_empty);
-        serialize_boxed(&candidate_data)
-            .map_err(|e| error!("Failed to serialize empty CandidateData: {}", e))
+        f(candidate, &mut backend)
     }
 }
 
@@ -2354,11 +1447,10 @@ struct CollationBackendAdapter<'a> {
     /// (`first_non_progressed_slot`) and the current leader window.
     simplex_state: &'a SimplexState,
     /// Received-candidate book. Backs the "book seam" reads
-    /// (`book_received_block_id`, `book_received_gen_utime_ms`,
-    /// `book_candidate_id_by_block_id`) so the controller's parent-resolution
-    /// helpers can fall back to the book without it crossing the seam as a
-    /// borrowed collection. Shared (`&`) — the collation re-entries never mutate
-    /// the book.
+    /// (`book_received_block_id`, `book_received_gen_utime_ms`) so the
+    /// controller's parent-resolution helpers can fall back to the book without
+    /// it crossing the seam as a borrowed collection. Shared (`&`) — the
+    /// collation re-entries never mutate the book.
     candidate_book: &'a CandidateBook,
     /// Per-block before-split flags, read by the `before_split_flag` seam for
     /// the empty-block policy (`resolve_parent_before_split_flag`). Shared (`&`).
@@ -2425,10 +1517,6 @@ impl CollationBackend for CollationBackendAdapter<'_> {
 
     fn book_received_gen_utime_ms(&self, id: &RawCandidateId) -> Option<u64> {
         self.candidate_book.received(id).and_then(|c| c.gen_utime_ms)
-    }
-
-    fn book_candidate_id_by_block_id(&self, block_id: &BlockIdExt) -> Option<RawCandidateId> {
-        self.candidate_book.find_received_by_block_id(block_id)
     }
 
     fn before_split_flag(&self, parent_block_id: &BlockIdExt) -> Option<bool> {
@@ -2577,7 +1665,7 @@ impl SessionProcessor {
             database,
             telemetry,
             task_queue,
-            candidate_book,
+            candidate,
             ..
         } = self;
         // The finalized-head cursor + before-split map + finalization-cursor
@@ -2587,7 +1675,7 @@ impl SessionProcessor {
         // collation` borrow).
         let mut backend = CollationBackendAdapter {
             simplex_state: &*simplex_state,
-            candidate_book: &*candidate_book,
+            candidate_book: candidate.book(),
             before_split_by_block_id: consensus.before_split_by_block_id(),
             finalized_head_block_id: consensus.finalized_head_block_id(),
             finalized_head_before_split: consensus.finalized_head_before_split(),
@@ -2772,7 +1860,7 @@ impl SessionProcessor {
         let Self {
             validation,
             simplex_state,
-            candidate_book,
+            candidate,
             collation,
             consensus,
             runtime,
@@ -2781,7 +1869,7 @@ impl SessionProcessor {
         } = self;
         let mut backend = ValidationBackendAdapter {
             simplex_state: &*simplex_state,
-            candidate_book: &*candidate_book,
+            candidate_book: candidate.book(),
             collation: &*collation,
             // Accepted-normal-head + finalized-head seqno now live on the
             // consensus controller; source them through its `pub(crate)`
@@ -3528,7 +2616,7 @@ impl SessionProcessor {
         let Self {
             consensus,
             simplex_state,
-            candidate_book,
+            candidate,
             runtime,
             database,
             telemetry,
@@ -3538,7 +2626,7 @@ impl SessionProcessor {
         } = self;
         let mut backend = ConsensusBackendAdapter {
             simplex_state,
-            candidate_book: &*candidate_book,
+            candidate_book: candidate.book(),
             runtime,
             database,
             telemetry: &**telemetry,
@@ -4242,19 +3330,6 @@ impl SessionProcessor {
         );
     }
 
-    fn note_generated_candidate_validation_missed_for_slot(
-        &mut self,
-        slot: SlotIndex,
-        reason: impl Into<String>,
-    ) {
-        self.telemetry.note_generated_candidate_validation_missed_for_slot(
-            slot,
-            reason,
-            self.runtime.description(),
-            self.now(),
-        );
-    }
-
     /* Snapshot builders */
 
     /// Build the expensive `FullDumpSnapshot` used by `debug_dump_full`.
@@ -4344,7 +3419,7 @@ impl SessionProcessor {
         let mut notarized = Vec::new();
         let mut finalized = Vec::new();
 
-        for (id, rc) in self.candidate_book.iter_received() {
+        for (id, rc) in self.candidate.book().iter_received() {
             let is_finalized = self.consensus.is_finalized_block(id);
             let is_notarized = self.simplex_state.has_notarized_block(id.slot);
             let is_approved = self.validation.approved_contains(id);
@@ -4430,14 +3505,14 @@ impl SessionProcessor {
 
     /// Compute candidate funnel totals for validation inventory dump.
     fn compute_candidate_totals(&self, now: SystemTime) -> CandidateTotals {
-        let received_total = self.candidate_book.received_count();
+        let received_total = self.candidate.book().received_count();
         let mut received_unvalidated = 0usize;
         let mut validated_not_notarized = 0usize;
         let mut notarized_not_finalized = 0usize;
         let mut finalized_recent = 0usize;
         let mut other_omitted = 0usize;
 
-        for (id, _rc) in self.candidate_book.iter_received() {
+        for (id, _rc) in self.candidate.book().iter_received() {
             let is_finalized = self.consensus.is_finalized_block(id);
             let is_notarized = self
                 .simplex_state
@@ -5074,11 +4149,11 @@ impl StartupRecoveryBackend for SessionProcessor {
     }
 
     fn candidate_book(&self) -> &CandidateBook {
-        &self.candidate_book
+        self.candidate.book()
     }
 
     fn candidate_book_mut(&mut self) -> &mut CandidateBook {
-        &mut self.candidate_book
+        self.candidate.book_mut()
     }
 
     fn database(&self) -> &DatabaseController {
@@ -5148,6 +4223,27 @@ impl SessionProcessor {
         self.runtime.description().set_time(self.now() + delta);
     }
 
+    /* Lifecycle (bring-up / teardown / main loop) */
+
+    /// Post a delayed action to be executed at a future time.
+    ///
+    /// The handler runs when `expiration_time` is reached during
+    /// `check_all()`. Storage and drain ordering live on `SessionRuntime`;
+    /// this wrapper boxes the handler, pushes it onto the queue, and lowers
+    /// the wake horizon to `expiration_time`.
+    ///
+    /// Test-only: production controllers schedule delayed work through their own
+    /// controller queues (`ControllerQueueExt::post_delayed`); this
+    /// `&mut SessionProcessor` wrapper is now exercised only by unit tests.
+    #[cfg(test)]
+    fn post_delayed_action<F>(&mut self, expiration_time: SystemTime, handler: F)
+    where
+        F: FnOnce(&mut SessionProcessor) + Send + 'static,
+    {
+        self.runtime.post_delayed_action(expiration_time, Box::new(handler));
+        self.runtime.set_next_awake_time(expiration_time);
+    }
+
     /* Telemetry wrappers */
 
     /// Thin telemetry wrapper kept for the validation-tracking unit test; the
@@ -5205,18 +4301,12 @@ impl SessionProcessor {
     }
 
     /// Thin dispatch onto
-    /// [`CollationController::on_collation_failed_impl`] (drop-vs-retry
-    /// classification + retry scheduling live there), kept for the failure-path
-    /// unit tests that drive it directly.
-    fn on_collation_failed_impl(
-        &mut self,
-        slot: SlotIndex,
-        request_id: u32,
-        err: Error,
-        retry_count: u32,
-    ) {
+    /// [`CollationController::on_collation_failed_impl`] (single-restart genuine-
+    /// error handling lives there), kept for the failure-path unit tests that
+    /// drive it directly.
+    fn on_collation_failed_impl(&mut self, slot: SlotIndex, request_id: u32, err: Error) {
         self.with_collation_backend(|collation, backend| {
-            collation.on_collation_failed_impl(backend, slot, request_id, err, retry_count)
+            collation.on_collation_failed_impl(backend, slot, request_id, err)
         });
     }
 
@@ -5375,6 +4465,27 @@ impl SessionProcessor {
         self.with_consensus_backend(|consensus, backend| {
             consensus.maybe_apply_finalized_state(backend, finalized_id, is_final)
         })
+    }
+
+    /* Candidate-domain accessors (test) */
+
+    /// Shared access to the candidate book now owned by [`CandidateController`].
+    ///
+    /// Test-only inherent accessor: the `#[path]`-included unit tests inspect
+    /// (and via [`Self::candidate_book_mut`] seed) the book that production code
+    /// reaches through `self.candidate.book()`.
+    fn candidate_book(&self) -> &CandidateBook {
+        self.candidate.book()
+    }
+
+    /// Mutable access to the candidate book for test seeding.
+    fn candidate_book_mut(&mut self) -> &mut CandidateBook {
+        self.candidate.book_mut()
+    }
+
+    /// Read access to the repair throttle map now owned by the controller.
+    fn requested_candidates(&self) -> &HashMap<RawCandidateId, SystemTime> {
+        self.candidate.requested_candidates()
     }
 }
 

@@ -30,7 +30,7 @@ pub mod validator_session_listener;
 pub mod validator_utils;
 
 use crate::shard_state::ShardStateStuff;
-use std::sync::Arc;
+use std::{sync::Arc, time::SystemTime};
 use ton_block::{
     error, BlkMasterInfo, BlockIdExt, ConfigParams, CurrencyCollection, ExtBlkRef, KeyExtBlkRef,
     Libraries, McStateExtra, Result, UInt256,
@@ -82,6 +82,19 @@ pub struct CollatorSettings {
     pub is_simplex: bool,
     // when set, collator must not choose gen_utime_ms earlier than this value
     pub min_gen_utime_ms: Option<u64>,
+    // Absolute per-collation deadlines + budget anchor, set under simplex and carried on
+    // the AsyncCollationRequest. All three are `Some` together (simplex) or all `None`
+    // (catchain and tests), in which case the collator keeps its static
+    // `collator_config()` durations. Absolute `SystemTime` (not relative budgets) so the
+    // latency between the simplex dispatch and the collator start cannot shift them
+    // (matches the C++ `slot_start + X` deadlines in block-producer.cpp).
+    //   collation_budget_anchor -> start the soft sub-budgets are measured from (the
+    //       dispatch instant: shard `slot_start - target_rate`, MC `slot_start`)
+    //   soft_deadline -> cancel_ext (message-intake cutoff; C++ soft_timeout)
+    //   hard_deadline -> stop_flag   (whole-collation abort cap; C++ hard_timeout)
+    pub collation_budget_anchor: Option<SystemTime>,
+    pub soft_deadline: Option<SystemTime>,
+    pub hard_deadline: Option<SystemTime>,
 }
 
 impl CollatorSettings {

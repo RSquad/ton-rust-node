@@ -41,8 +41,6 @@
 //!   leaves the rest of the pipeline untouched.
 //! - `resolve_parent_block_id` lookup order: synchronous cache → book →
 //!   miss.
-//! - `resolve_candidate_id_by_block_id` lookup order: synchronous cache
-//!   → book → miss.
 //! - `try_begin_collation_slot` truth table: precollation pending → None,
 //!   not-leader → None, leader + no pending → `Some(self_idx)`.
 //! - `create_pending_collation_request` allocates id, registers entry,
@@ -64,6 +62,34 @@
 //! - `compute_collation_timing`: shardchains dispatch `target_rate` early
 //!   (`dispatch_time = min_gen_time - target_rate`) while the masterchain
 //!   dispatches at `min_gen_time`.
+//! - `collation_deadlines`: masterchain soft cutoff = `slot_start + target_rate`,
+//!   shardchain soft cutoff = `slot_start`, and the window-end hard cap shrinks as
+//!   the slot advances within its leader window (clamping a zero window to 1).
+//! - `block_generation_active`: `clear_block_generation_if` only releases the
+//!   marker for the matching request id; `reset` clears it unconditionally;
+//!   `clear_stale_block_generation` drops it (and cancels the pending request) only
+//!   when the tracked window no longer matches the current leader window.
+//! - single in-flight guard + per-slot deadline wake: `execute_collation_attempt`
+//!   declines a second real dispatch while one is in flight; `on_slot_deadline`
+//!   keeps the real alive, advances the horizon by `target_rate` and re-arms while
+//!   the same collation runs in the same window, no-ops on a stale request id or
+//!   once the loop slot runs past the window, and clears the stale marker when the
+//!   leader window has advanced.
+//! - per-slot empty fillers + late re-tag: `on_slot_deadline` publishes a
+//!   state-preserving empty filler for the elapsed slot (keeping the real alive and
+//!   its precollation entry intact), keeps waiting on the same slot when no filler
+//!   can be placed, and no-ops once the loop slot runs past the leader window;
+//!   `on_collation_complete` re-tags a late tracked real onto the current chain
+//!   head (`local_chain_head.slot + 1`) rather than its dispatch slot, consuming the
+//!   precollation entry and clearing the in-flight marker.
+//! - `allow_empty` finalization-staleness gate: empties are suppressed once
+//!   finalization stalls past `no_empty_blocks_on_error_timeout` and the wake
+//!   refreshes the finalization timestamp before evaluating the gate.
+//! - genuine-error path: a still-current slot schedules exactly one fixed-backoff
+//!   restart that reuses the original attempt's pinned soft/hard deadlines and
+//!   budget anchor (no fresh window from the advanced clock); a passed slot or an
+//!   advanced leader window drops without a restart; an `allow_empty`-satisfied
+//!   error recovers with one empty block (re-tagging past any fillers).
 //! - `Debug` impl smoke test.
 //!
 //! The self-collation observability funnel (start/generated/acceptance
@@ -73,7 +99,7 @@
 
 use super::*;
 use crate::{block::WindowIndex, candidate_book::ReceivedCandidate, SessionNode, SessionOptions};
-use consensus_common::ConsensusCommonFactory;
+use consensus_common::{AsyncCollationRequest, ConsensusCommonFactory};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ton_block::{Ed25519KeyOption, ShardIdent, UInt256, ZeroizingBytes};
 
@@ -143,6 +169,15 @@ fn make_mc_description(node_count: u32) -> SessionDescription {
     make_description_with_opts(node_count, ShardIdent::masterchain(), SessionOptions::default())
 }
 
+/// Masterchain description with an explicit `slots_per_leader_window`. The
+/// per-slot filler / late re-tag only make sense when a leader owns
+/// several consecutive slots inside one window (the default `spw == 1` makes
+/// every slot its own window, so a wake would immediately run past the window).
+fn make_mc_description_spw(node_count: u32, slots_per_leader_window: u32) -> SessionDescription {
+    let opts = SessionOptions { slots_per_leader_window, ..SessionOptions::default() };
+    make_description_with_opts(node_count, ShardIdent::masterchain(), opts)
+}
+
 fn make_shard_description(node_count: u32, mc_lag_threshold: Option<u32>) -> SessionDescription {
     let opts = SessionOptions {
         empty_block_mc_lag_threshold: mc_lag_threshold,
@@ -178,6 +213,47 @@ fn test_collation_queue() -> crate::controller_queue::ControllerQueuePtr<Collati
     Arc::new(NoopCollationQueue)
 }
 
+/// Recording `ControllerQueue` that captures `post_delayed` deadlines so the
+/// per-slot deadline wake re-arm can be asserted without a
+/// `SessionProcessor`. The boxed task itself is dropped - the wake tests assert on
+/// the scheduled deadline, while the handler's state effects are observed directly
+/// on `block_generation_active`.
+#[derive(Default)]
+struct RecordingCollationQueue {
+    delayed: std::sync::Mutex<Vec<SystemTime>>,
+}
+
+impl RecordingCollationQueue {
+    /// Snapshot of the deadlines passed to `post_delayed`.
+    fn delayed(&self) -> Vec<SystemTime> {
+        self.delayed.lock().expect("recording queue mutex").clone()
+    }
+}
+
+impl crate::controller_queue::ControllerQueue<CollationController> for RecordingCollationQueue {
+    fn post_boxed(&self, _task: crate::controller_queue::ControllerTask<CollationController>) {}
+
+    fn post_delayed_boxed(
+        &self,
+        at: SystemTime,
+        _task: crate::controller_queue::ControllerTask<CollationController>,
+    ) {
+        self.delayed.lock().expect("recording queue mutex").push(at);
+    }
+}
+
+/// Build a controller wired to a [`RecordingCollationQueue`], returning the queue
+/// handle so a test can assert which `post_delayed` deadlines were scheduled.
+fn ctrl_with_recording_queue(
+    description: Arc<SessionDescription>,
+) -> (CollationController, Arc<RecordingCollationQueue>) {
+    let queue = Arc::new(RecordingCollationQueue::default());
+    let callbacks = make_callbacks();
+    let telemetry = make_telemetry(&description);
+    let ctrl = CollationController::new(queue.clone(), callbacks, description, telemetry, None);
+    (ctrl, queue)
+}
+
 /// No-op [`SessionListener`](consensus_common::SessionListener) so the
 /// controller's `SessionCallbacks` can be constructed in the focused unit
 /// tests. The generate-slot dispatch path is covered end-to-end by
@@ -199,7 +275,7 @@ impl consensus_common::SessionListener for NoopSessionListener {
     fn on_generate_slot(
         &self,
         _source_info: consensus_common::BlockSourceInfo,
-        _request: consensus_common::AsyncRequestPtr,
+        _request: consensus_common::AsyncCollationRequestPtr,
         _parent: consensus_common::CollationParentHint,
         _callback: consensus_common::ValidatorBlockCandidateCallback,
     ) {
@@ -362,9 +438,9 @@ struct FakeCollationBackend {
     /// when no window-local chain head directly precedes the target).
     available_parents: std::collections::HashMap<SlotIndex, CandidateParentInfo>,
     /// `CandidateBook` stand-in backing the book-seam reads
-    /// (`book_received_block_id` / `book_received_gen_utime_ms` /
-    /// `book_candidate_id_by_block_id`), so the parent-resolution helpers can be
-    /// driven with no `SessionProcessor` / real `CandidateBook`.
+    /// (`book_received_block_id` / `book_received_gen_utime_ms`), so the
+    /// parent-resolution helpers can be driven with no `SessionProcessor` /
+    /// real `CandidateBook`.
     received: std::collections::HashMap<RawCandidateId, ReceivedCandidate>,
     /// Per-block before-split flags backing the `before_split_flag` seam (the
     /// empty-block policy input read by `resolve_parent_before_split_flag`).
@@ -449,10 +525,6 @@ impl CollationBackend for FakeCollationBackend {
 
     fn book_received_gen_utime_ms(&self, id: &RawCandidateId) -> Option<u64> {
         self.received.get(id).and_then(|c| c.gen_utime_ms)
-    }
-
-    fn book_candidate_id_by_block_id(&self, block_id: &BlockIdExt) -> Option<RawCandidateId> {
-        self.received.iter().find(|(_, c)| &c.block_id == block_id).map(|(id, _)| id.clone())
     }
 
     fn before_split_flag(&self, parent_block_id: &BlockIdExt) -> Option<bool> {
@@ -817,7 +889,7 @@ fn remove_precollated_with_log_returns_actually_removed_flag() {
 
 /*
     --------------------------------------------------------------------
-    resolve_parent_block_id / resolve_candidate_id_by_block_id
+    resolve_parent_block_id
     --------------------------------------------------------------------
 */
 
@@ -846,22 +918,6 @@ fn resolve_parent_block_id_prefers_cache_then_book_then_none() {
     assert!(ctrl.resolve_parent_block_id(&parent_missing, &backend).is_none());
 }
 
-#[test]
-fn resolve_candidate_id_by_block_id_prefers_cache_then_book_then_none() {
-    let mut ctrl = new_ctrl();
-    let book_id = make_candidate_id(2, 0xBB);
-    let book_block = make_block_id(22, 0x20);
-    let backend = FakeCollationBackend::new(SlotIndex::new(0), WindowIndex::new(0))
-        .with_received(book_id.clone(), make_received(2, book_block.clone(), None));
-    let cache_id = make_candidate_id(1, 0xAA);
-    let cache_block = make_block_id(11, 0x10);
-    ctrl.insert_generated_parent(cache_id.clone(), cache_block.clone());
-
-    assert_eq!(ctrl.resolve_candidate_id_by_block_id(&cache_block, &backend), Some(cache_id));
-    assert_eq!(ctrl.resolve_candidate_id_by_block_id(&book_block, &backend), Some(book_id));
-    assert!(ctrl.resolve_candidate_id_by_block_id(&make_block_id(999, 0x99), &backend).is_none());
-}
-
 /*
     --------------------------------------------------------------------
     try_begin_collation_slot
@@ -880,17 +936,14 @@ fn try_begin_collation_slot_truth_table() {
 
     // Leader case with no precollation pending.
     let local_idx = description.get_self_idx();
-    assert_eq!(
-        ctrl.try_begin_collation_slot(slot_leader, CollationAttempt::Initial),
-        Some(local_idx),
-    );
+    assert_eq!(ctrl.try_begin_collation_slot(slot_leader), Some(local_idx));
 
     // Not-leader case: returns None.
-    assert!(ctrl.try_begin_collation_slot(slot_not_leader, CollationAttempt::Initial).is_none());
+    assert!(ctrl.try_begin_collation_slot(slot_not_leader).is_none());
 
     // Leader case but precollation already pending: returns None.
     ctrl.insert_precollated(slot_leader, make_precollated(0, None));
-    assert!(ctrl.try_begin_collation_slot(slot_leader, CollationAttempt::Initial).is_none());
+    assert!(ctrl.try_begin_collation_slot(slot_leader).is_none());
 }
 
 /// Controller bound to a masterchain description with a configurable multi-slot
@@ -952,12 +1005,32 @@ fn create_pending_collation_request_allocates_and_registers() {
     let slot = SlotIndex::new(4);
     let parent = make_parent_info(3, 0xAB);
     let now = SystemTime::now();
+    let soft = now + Duration::from_millis(1_000);
+    let hard = now + Duration::from_millis(9_600);
+    // The budget anchor is the dispatch instant, distinct from the creation time
+    // (`now` here, the slot start): for shardchains it predates the slot start.
+    let anchor = now - Duration::from_millis(500);
 
-    let (req_id, request) = ctrl.create_pending_collation_request(slot, Some(parent.clone()), now);
+    let (req_id, request) = ctrl.create_pending_collation_request(
+        slot,
+        Some(parent.clone()),
+        now,
+        Some(soft),
+        Some(hard),
+        Some(anchor),
+    );
 
     assert_eq!(req_id, 0, "first request must be id 0 (post-increment)");
     assert_eq!(request.get_request_id(), 0);
     assert!(!request.is_cancelled());
+    assert_eq!(request.get_creation_time(), now);
+    assert_eq!(request.get_collation_soft_deadline(), Some(soft), "soft deadline round-trips");
+    assert_eq!(request.get_collation_hard_deadline(), Some(hard), "hard deadline round-trips");
+    assert_eq!(
+        request.get_collation_budget_anchor(),
+        Some(anchor),
+        "budget anchor round-trips and is distinct from the creation time"
+    );
     assert!(ctrl.precollated_contains(slot));
     assert_eq!(ctrl.precollated_max_slot(), Some(slot));
 
@@ -966,7 +1039,8 @@ fn create_pending_collation_request_allocates_and_registers() {
     assert_eq!(stored.parent.as_ref().unwrap().slot, parent.slot);
 
     // Second request must get the next monotonic id.
-    let (next_id, _) = ctrl.create_pending_collation_request(SlotIndex::new(5), None, now);
+    let (next_id, _) =
+        ctrl.create_pending_collation_request(SlotIndex::new(5), None, now, None, None, None);
     assert_eq!(next_id, 1);
 }
 
@@ -1260,5 +1334,851 @@ fn debug_impl_includes_field_counts() {
     assert!(
         dbg.contains("generated_parent_cache: 1"),
         "Debug must expose generated_parent_cache size: {dbg}",
+    );
+}
+
+/*
+    --------------------------------------------------------------------
+    collation_deadlines: absolute per-slot soft cutoff + window-end hard cap
+    --------------------------------------------------------------------
+*/
+
+/// Masterchain soft cutoff is `slot_start + target_rate` (C++ block-producer.cpp);
+/// the window-end hard cap for the first slot of a window spans the whole window.
+#[test]
+fn collation_deadlines_masterchain_soft_is_slot_plus_rate() {
+    let start = UNIX_EPOCH + Duration::from_secs(1_000);
+    let rate = Duration::from_millis(2_400);
+    let (soft, hard) = collation_deadlines(SlotIndex::new(0), start, rate, 4, true);
+    assert_eq!(soft, start + rate);
+    assert_eq!(hard, start + rate * 4, "offset 0 => the whole window remains");
+}
+
+/// Shardchain soft cutoff is `slot_start` itself (C++ block-producer.cpp): shard
+/// collation dispatches `target_rate` early, so message intake closes at the slot start.
+#[test]
+fn collation_deadlines_shardchain_soft_is_slot_start() {
+    let start = UNIX_EPOCH + Duration::from_secs(1_000);
+    let rate = Duration::from_millis(2_400);
+    let (soft, _hard) = collation_deadlines(SlotIndex::new(0), start, rate, 4, false);
+    assert_eq!(soft, start);
+}
+
+/// The hard cap shrinks toward the window end as the slot advances within its leader
+/// window: `slots_to_window_end = slots_per_leader_window - offset_in_window`.
+#[test]
+fn collation_deadlines_hard_cap_shrinks_within_window() {
+    let start = UNIX_EPOCH + Duration::from_secs(1_000);
+    let rate = Duration::from_millis(2_400);
+    // Last slot of a 4-slot window (offset 3): one rate remains to the window end.
+    let (_soft, hard_last) = collation_deadlines(SlotIndex::new(3), start, rate, 4, true);
+    assert_eq!(hard_last, start + rate);
+    // Slot 6 (offset 2 of window [4, 8)): two rates remain.
+    let (_s, hard_mid) = collation_deadlines(SlotIndex::new(6), start, rate, 4, true);
+    assert_eq!(hard_mid, start + rate * 2);
+}
+
+/// `slots_per_leader_window == 0` is clamped to 1 (never divide by zero); a single-slot
+/// window always has exactly one rate to its end.
+#[test]
+fn collation_deadlines_handles_zero_window() {
+    let start = UNIX_EPOCH + Duration::from_secs(1_000);
+    let rate = Duration::from_millis(500);
+    let (_soft, hard) = collation_deadlines(SlotIndex::new(7), start, rate, 0, true);
+    assert_eq!(hard, start + rate);
+}
+
+/*
+    --------------------------------------------------------------------
+    block_generation_active: single in-flight collation bookkeeping
+    --------------------------------------------------------------------
+*/
+
+/// A placeholder deadline context for tests that only exercise the in-flight marker
+/// bookkeeping (window / slot / request id / per-slot horizon) and do not assert on the
+/// pinned soft/hard cutoffs or budget anchor.
+fn fake_deadline_context() -> CollationDeadlineContext {
+    CollationDeadlineContext {
+        soft_deadline: UNIX_EPOCH + Duration::from_secs(100),
+        hard_deadline: UNIX_EPOCH + Duration::from_secs(120),
+        budget_anchor: UNIX_EPOCH + Duration::from_secs(98),
+    }
+}
+
+fn fake_real_collation_state(request_id: u32) -> RealCollationState {
+    RealCollationState {
+        window: WindowIndex::new(0),
+        slot_dispatched: SlotIndex::new(2),
+        request_id,
+        next_slot_deadline: UNIX_EPOCH + Duration::from_secs(100),
+        deadlines: fake_deadline_context(),
+    }
+}
+
+/// `clear_block_generation_if` only releases the marker for the in-flight collation's
+/// own request id: an empty filler / chained precollation (a different request) must
+/// leave a still-running real collation untouched (C++ block-producer.cpp).
+#[test]
+fn clear_block_generation_only_matches_request_id() {
+    let mut ctrl = new_ctrl();
+    ctrl.block_generation_active = Some(fake_real_collation_state(7));
+
+    // A different request (e.g. an empty filler) must NOT clear it.
+    ctrl.clear_block_generation_if(99);
+    assert!(ctrl.block_generation_active.is_some(), "non-matching request must not clear");
+
+    // The real collation's own request clears it.
+    ctrl.clear_block_generation_if(7);
+    assert!(ctrl.block_generation_active.is_none(), "matching request clears the marker");
+}
+
+/// `reset()` drops the in-flight marker unconditionally: it cancels the pending
+/// AsyncRequests, so no completion would otherwise arrive to clear it.
+#[test]
+fn reset_clears_block_generation_active() {
+    let mut ctrl = new_ctrl();
+    ctrl.block_generation_active = Some(fake_real_collation_state(3));
+
+    let backend = FakeCollationBackend::new(SlotIndex::new(0), WindowIndex::new(0));
+    ctrl.reset(&backend);
+
+    assert!(ctrl.block_generation_active.is_none());
+}
+
+/*
+    --------------------------------------------------------------------
+    Single in-flight guard + per-slot deadline wake + late re-tag
+    --------------------------------------------------------------------
+*/
+
+/// Build an in-flight `RealCollationState` with a future per-slot horizon so the
+/// wake's `next_deadline <= now` clamp does not fire (the deadline math under test
+/// stays the simple `deadline + target_rate`).
+fn in_flight_state(
+    request_id: u32,
+    window: u32,
+    slot: u32,
+    next_slot_deadline: SystemTime,
+) -> RealCollationState {
+    RealCollationState {
+        window: WindowIndex::new(window),
+        slot_dispatched: SlotIndex::new(slot),
+        request_id,
+        next_slot_deadline,
+        deadlines: fake_deadline_context(),
+    }
+}
+
+/// The single in-flight guard (C++ block-producer.cpp): `execute_collation_attempt`
+/// must decline a second REAL collation while one is in flight, leaving the in-flight
+/// marker untouched and creating no new precollation entry.
+#[test]
+fn single_in_flight_guard_declines_second_real_dispatch() {
+    let mut ctrl = new_ctrl();
+    ctrl.block_generation_active = Some(fake_real_collation_state(5));
+
+    let mut backend = FakeCollationBackend::new(SlotIndex::new(0), WindowIndex::new(0));
+    let slot = SlotIndex::new(0);
+    ctrl.execute_collation_attempt(
+        &mut backend,
+        slot,
+        None,
+        ValidatorIndex::new(0),
+        true,
+        false,
+        None,
+    );
+
+    assert!(
+        !ctrl.precollated_contains(slot),
+        "guard must not dispatch a second real collation while one is in flight"
+    );
+    assert_eq!(
+        ctrl.block_generation_active.as_ref().map(|s| s.request_id),
+        Some(5),
+        "the in-flight real collation must remain tracked"
+    );
+}
+
+/// Per-slot deadline wake when no empty filler can be placed (no parent: the
+/// first block in an epoch cannot be empty): keep the real alive, advance the
+/// horizon by `target_rate`, and re-arm the SAME loop slot (C++ `--slot;
+/// continue;` with `slot_start = max(slot_start, now())`). No candidate is
+/// published.
+#[test]
+fn slot_deadline_wake_without_parent_keeps_waiting_same_slot() {
+    let description = Arc::new(make_mc_description_spw(1, 4));
+    let now = description.get_time();
+    let target_rate = description.opts().target_rate;
+    let (mut ctrl, queue) = ctrl_with_recording_queue(description);
+
+    let deadline = now + Duration::from_secs(100);
+    let request_id = 11;
+    // Real dispatched for slot 1 (window 0, spw=4). No precollation entry and no
+    // local chain head => emit_slot_filler finds no parent.
+    ctrl.block_generation_active = Some(in_flight_state(request_id, 0, 1, deadline));
+    // Recent finalization => the allow_empty gate permits an empty, so the decline
+    // under test is the first-block (no-parent) check inside emit_slot_filler.
+    ctrl.last_consensus_finalized_at = Some(now);
+
+    let mut backend = FakeCollationBackend::new(SlotIndex::new(1), WindowIndex::new(0));
+    ctrl.on_slot_deadline(&mut backend, SlotIndex::new(1), request_id, deadline);
+
+    let expected = deadline + target_rate;
+    assert_eq!(
+        ctrl.block_generation_active.as_ref().map(|s| s.next_slot_deadline),
+        Some(expected),
+        "wake must advance the per-slot horizon by target_rate"
+    );
+    assert_eq!(
+        queue.delayed().as_slice(),
+        &[expected],
+        "wake must re-arm exactly once, at the advanced deadline"
+    );
+    assert!(
+        ctrl.block_generation_active.is_some(),
+        "the real collation must stay in flight (keep-alive, not cancelled)"
+    );
+    assert!(
+        ctrl.local_chain_head().is_none(),
+        "no filler may be published when no parent is available (first block cannot be empty)"
+    );
+}
+
+/// Per-slot deadline wake that DOES publish an empty filler: the elapsed slot is
+/// filled (chained onto the real's locked parent), the real is kept alive, its
+/// precollation entry is preserved for the eventual re-tag, the horizon advances,
+/// and the wake re-arms (C++ await-timeout branch publishing an empty and
+/// continuing to await the same `block_generation`).
+#[test]
+fn slot_deadline_wake_publishes_filler_keeps_real_and_precollation() {
+    let description = Arc::new(make_mc_description_spw(1, 4));
+    let now = description.get_time();
+    let target_rate = description.opts().target_rate;
+    let (mut ctrl, queue) = ctrl_with_recording_queue(description);
+
+    let deadline = now + Duration::from_secs(100);
+    let request_id = 31;
+    let dispatch_slot = SlotIndex::new(1);
+    // The real's locked parent (a preceding candidate that resolves via the book).
+    let parent = make_parent_info(0, 0xAA);
+    let parent_block_id = make_block_id(42, 0xAA);
+    ctrl.insert_precollated(dispatch_slot, make_precollated(request_id, Some(parent.clone())));
+    ctrl.block_generation_active = Some(in_flight_state(request_id, 0, 1, deadline));
+    // Recent finalization => the allow_empty gate permits the filler; the
+    // no_empty_blocks_on_error_timeout suppression path is covered by its own test
+    // below.
+    ctrl.last_consensus_finalized_at = Some(now);
+
+    let mut backend = FakeCollationBackend::new(SlotIndex::new(1), WindowIndex::new(0))
+        .with_received(make_candidate_id(0, 0xAA), make_received(0, parent_block_id, None));
+    ctrl.on_slot_deadline(&mut backend, dispatch_slot, request_id, deadline);
+
+    let head = ctrl.local_chain_head().expect("filler must set the local chain head");
+    assert_eq!(head.slot, dispatch_slot, "filler published at the elapsed loop slot");
+    assert!(
+        ctrl.block_generation_active.is_some(),
+        "the real collation must stay in flight across the filler (keep-alive)"
+    );
+    assert!(
+        ctrl.precollated(dispatch_slot).is_some(),
+        "filler must NOT consume the real's precollation entry (needed for the re-tag)"
+    );
+    assert_eq!(
+        ctrl.block_generation_active.as_ref().map(|s| s.next_slot_deadline),
+        Some(deadline + target_rate),
+        "wake must advance the per-slot horizon by target_rate"
+    );
+    assert_eq!(
+        queue.delayed().as_slice(),
+        &[deadline + target_rate],
+        "wake must re-arm exactly once for the next loop slot"
+    );
+}
+
+/// A wake whose loop slot has run past the leader window (C++ `slot < end_slot`)
+/// must not publish, advance the horizon, nor re-arm: filling stops at the window
+/// boundary, leaving the still-in-flight real to re-tag on completion.
+#[test]
+fn slot_deadline_wake_past_window_end_is_noop() {
+    let description = Arc::new(make_mc_description_spw(1, 4));
+    let now = description.get_time();
+    let (mut ctrl, queue) = ctrl_with_recording_queue(description);
+
+    let deadline = now + Duration::from_secs(100);
+    let request_id = 21;
+    // Active real in window 0; the wake fires for slot 4, which is window 1.
+    ctrl.block_generation_active = Some(in_flight_state(request_id, 0, 0, deadline));
+
+    let mut backend = FakeCollationBackend::new(SlotIndex::new(0), WindowIndex::new(0));
+    ctrl.on_slot_deadline(&mut backend, SlotIndex::new(4), request_id, deadline);
+
+    assert_eq!(
+        ctrl.block_generation_active.as_ref().map(|s| s.next_slot_deadline),
+        Some(deadline),
+        "a past-window wake must not advance the horizon"
+    );
+    assert!(queue.delayed().is_empty(), "a past-window wake must not re-arm");
+    assert!(ctrl.local_chain_head().is_none(), "a past-window wake must not publish a filler");
+}
+
+/// A wake carrying a superseded request id (the in-flight real has since changed)
+/// must not mutate the horizon nor re-arm.
+#[test]
+fn slot_deadline_wake_stale_request_id_is_noop() {
+    let description = Arc::new(make_mc_description(1));
+    let now = description.get_time();
+    let (mut ctrl, queue) = ctrl_with_recording_queue(description);
+
+    let deadline = now + Duration::from_secs(100);
+    ctrl.block_generation_active = Some(in_flight_state(5, 0, 2, deadline));
+
+    let mut backend = FakeCollationBackend::new(SlotIndex::new(2), WindowIndex::new(0));
+    ctrl.on_slot_deadline(&mut backend, SlotIndex::new(2), 999, deadline);
+
+    assert_eq!(
+        ctrl.block_generation_active.as_ref().map(|s| s.next_slot_deadline),
+        Some(deadline),
+        "a stale-request-id wake must not advance the horizon"
+    );
+    assert!(queue.delayed().is_empty(), "a stale-request-id wake must not re-arm");
+}
+
+/// A wake that fires after the leader window advanced clears the now-stale in-flight
+/// marker so the single-in-flight guard cannot wedge the new window: the marker is
+/// dropped, its pending request cancelled, its precollation entry removed, and the
+/// self-collation tracking forgotten. No filler is published and no wake re-arms.
+#[test]
+fn slot_deadline_wake_window_change_clears_stale_marker() {
+    let description = Arc::new(make_mc_description(1));
+    let now = description.get_time();
+    let (mut ctrl, queue) = ctrl_with_recording_queue(description);
+
+    let deadline = now + Duration::from_secs(100);
+    let request_id = 8;
+    let stale_slot = SlotIndex::new(2);
+    // The stale real still holds its dispatch-slot precollation entry; clearing must
+    // cancel its request so a late callback is a no-op for the superseded window.
+    let precollated = make_precollated(request_id, None);
+    let req = precollated.request.clone();
+    ctrl.insert_precollated(stale_slot, precollated);
+    ctrl.block_generation_active = Some(in_flight_state(request_id, 0, 2, deadline));
+
+    // Backend reports a newer leader window than the one the collation belongs to.
+    let mut backend = FakeCollationBackend::new(stale_slot, WindowIndex::new(1));
+    ctrl.on_slot_deadline(&mut backend, stale_slot, request_id, deadline);
+
+    assert!(
+        ctrl.block_generation_active.is_none(),
+        "a window-change wake must drop the stale in-flight marker"
+    );
+    assert!(req.is_cancelled(), "the stale collation's pending request must be cancelled");
+    assert!(!ctrl.precollated_contains(stale_slot), "the stale precollation entry must be removed");
+    assert_eq!(
+        backend.forgotten(),
+        vec![(stale_slot, "stale_window_block_generation_cleared".to_string())],
+        "clearing must forget the stale slot's self-collation tracking"
+    );
+    assert!(queue.delayed().is_empty(), "a window-change wake must not re-arm");
+}
+
+/// Direct coverage of [`CollationController::clear_stale_block_generation`]: a marker
+/// whose window matches the current leader window is preserved (returns `false`); a
+/// mismatched window is cleared (returns `true`) with its request cancelled.
+#[test]
+fn clear_stale_block_generation_only_fires_on_window_mismatch() {
+    let mut ctrl = new_ctrl();
+    let slot = SlotIndex::new(2);
+    let request_id = 12;
+    let precollated = make_precollated(request_id, None);
+    let req = precollated.request.clone();
+    ctrl.insert_precollated(slot, precollated);
+    ctrl.block_generation_active = Some(in_flight_state(request_id, 0, 2, UNIX_EPOCH));
+
+    // Same window => nothing to clear.
+    let same_window = FakeCollationBackend::new(slot, WindowIndex::new(0));
+    assert!(!ctrl.clear_stale_block_generation(&same_window), "matching window must not clear");
+    assert!(ctrl.block_generation_active.is_some(), "matching window leaves the marker intact");
+    assert!(!req.is_cancelled(), "matching window must not cancel the request");
+
+    // Window moved on => clear and cancel.
+    let newer_window = FakeCollationBackend::new(slot, WindowIndex::new(1));
+    assert!(ctrl.clear_stale_block_generation(&newer_window), "stale window must clear");
+    assert!(ctrl.block_generation_active.is_none(), "stale window drops the marker");
+    assert!(req.is_cancelled(), "stale window cancels the pending request");
+}
+
+/// Late re-tag (C++ block-producer.cpp): when the tracked real collation
+/// completes after the per-slot wake already filled past its dispatch slot, it is
+/// published at the current chain position (`local_chain_head.slot + 1`)
+/// re-parented to the last filler - NOT at its original dispatch slot, which an
+/// empty filler already occupies (republishing there would equivocate). The stale
+/// dispatch-slot precollation entry is consumed and the in-flight marker cleared.
+///
+/// Uses an `Empty` result for fixture simplicity (the real-`Block` publish needs
+/// valid BOC candidate data and is integration-covered by `test_session_processor`);
+/// the re-tag decision, target slot, re-parent, precollation consume, and marker
+/// clear are identical for either result variant.
+#[test]
+fn on_collation_complete_retags_late_real_onto_filler() {
+    let description = Arc::new(make_mc_description_spw(1, 4));
+    let now = description.get_time();
+    let (mut ctrl, _queue) = ctrl_with_recording_queue(description);
+
+    let request_id = 41;
+    let dispatch_slot = SlotIndex::new(1);
+    // A filler the per-slot wake already published at slot 2 (window 0): the chain
+    // head is ahead of the real's dispatch slot.
+    let head_parent = make_parent_info(2, 0xBB);
+    let head_block_id = make_block_id(42, 0xBB);
+    ctrl.set_local_chain_head(Some(make_local_chain_head(0, 2, head_parent)));
+    // The real is tracked and still holds its (now stale) dispatch-slot precollation
+    // entry, locked onto its original parent.
+    ctrl.insert_precollated(
+        dispatch_slot,
+        make_precollated(request_id, Some(make_parent_info(0, 0x11))),
+    );
+    ctrl.block_generation_active =
+        Some(in_flight_state(request_id, 0, 1, now + Duration::from_secs(100)));
+
+    // first_non_progressed has advanced past the real's dispatch slot (the fillers
+    // generated slots 1..=2), but the leader window is still 0.
+    let mut backend = FakeCollationBackend::new(SlotIndex::new(3), WindowIndex::new(0));
+    ctrl.on_collation_complete(
+        &mut backend,
+        dispatch_slot,
+        request_id,
+        CollationResult::Empty { parent_block_id: head_block_id },
+    );
+
+    let new_head = ctrl.local_chain_head().expect("re-tag must publish a candidate");
+    assert_eq!(
+        new_head.slot,
+        SlotIndex::new(3),
+        "late real must be re-tagged to local_chain_head.slot + 1, not its dispatch slot"
+    );
+    assert!(
+        ctrl.precollated(dispatch_slot).is_none(),
+        "re-tag must consume the dispatch-slot precollation entry"
+    );
+    assert!(
+        ctrl.block_generation_active.is_none(),
+        "the real completing must clear the in-flight marker"
+    );
+}
+
+/*
+    --------------------------------------------------------------------
+    allow_empty finalization-staleness gate
+    --------------------------------------------------------------------
+*/
+
+/// The `allow_empty` finalization-staleness gate (C++ block-producer.cpp):
+/// [`CollationController::empties_allowed_by_finalization`] is true only while the
+/// last finalization plus `no_empty_blocks_on_error_timeout` has not elapsed.
+/// `None` (nothing finalized yet) suppresses empties, matching C++'s
+/// default-constructed in-the-past `last_consensus_finalized_at_`.
+#[test]
+fn empties_allowed_by_finalization_gates_on_recent_finalization() {
+    let description = Arc::new(make_mc_description(1));
+    let now = description.get_time();
+    let timeout = description.opts().no_empty_blocks_on_error_timeout;
+    let (mut ctrl, _queue) = ctrl_with_recording_queue(description);
+
+    // Nothing finalized yet => suppress (C++ default in-the-past timestamp).
+    ctrl.last_consensus_finalized_at = None;
+    assert!(!ctrl.empties_allowed_by_finalization(), "no finalization => suppress empties");
+
+    // Just finalized => allow.
+    ctrl.last_consensus_finalized_at = Some(now);
+    assert!(ctrl.empties_allowed_by_finalization(), "recent finalization => allow empties");
+
+    // Finalized within the window (deadline still in the future) => allow.
+    ctrl.last_consensus_finalized_at = Some(now - timeout + Duration::from_secs(1));
+    assert!(
+        ctrl.empties_allowed_by_finalization(),
+        "finalization within no_empty_blocks_on_error_timeout => allow empties"
+    );
+
+    // No finalization for longer than the timeout => suppress.
+    ctrl.last_consensus_finalized_at = Some(now - timeout - Duration::from_secs(1));
+    assert!(
+        !ctrl.empties_allowed_by_finalization(),
+        "stalled finalization beyond no_empty_blocks_on_error_timeout => suppress empties"
+    );
+}
+
+/// allow_empty gate suppression on the wake (C++ timeout branch with
+/// `!allow_empty`): even with a placeable parent, a wake whose last
+/// finalization is older than `no_empty_blocks_on_error_timeout` publishes NO empty.
+/// It keeps the real alive, preserves its precollation entry, advances the per-slot
+/// horizon, and re-arms on the SAME loop slot.
+#[test]
+fn slot_deadline_wake_suppressed_when_finalization_stale() {
+    let description = Arc::new(make_mc_description_spw(1, 4));
+    let now = description.get_time();
+    let target_rate = description.opts().target_rate;
+    let timeout = description.opts().no_empty_blocks_on_error_timeout;
+    let (mut ctrl, queue) = ctrl_with_recording_queue(description);
+
+    let deadline = now + Duration::from_secs(100);
+    let request_id = 51;
+    let dispatch_slot = SlotIndex::new(1);
+    // A placeable parent: the filler WOULD succeed if the gate allowed it.
+    let parent = make_parent_info(0, 0xAA);
+    let parent_block_id = make_block_id(42, 0xAA);
+    ctrl.insert_precollated(dispatch_slot, make_precollated(request_id, Some(parent.clone())));
+    ctrl.block_generation_active = Some(in_flight_state(request_id, 0, 1, deadline));
+    // Finalization stalled beyond no_empty_blocks_on_error_timeout => suppress.
+    ctrl.last_consensus_finalized_at = Some(now - timeout - Duration::from_secs(1));
+
+    let mut backend = FakeCollationBackend::new(SlotIndex::new(1), WindowIndex::new(0))
+        .with_received(make_candidate_id(0, 0xAA), make_received(0, parent_block_id, None));
+    ctrl.on_slot_deadline(&mut backend, dispatch_slot, request_id, deadline);
+
+    assert!(
+        ctrl.local_chain_head().is_none(),
+        "stalled finalization must suppress the empty filler (no publish)"
+    );
+    assert!(
+        ctrl.precollated(dispatch_slot).is_some(),
+        "suppression must leave the real's precollation entry intact"
+    );
+    assert!(
+        ctrl.block_generation_active.is_some(),
+        "the real collation must stay in flight while empties are suppressed"
+    );
+    assert_eq!(
+        ctrl.block_generation_active.as_ref().map(|s| s.next_slot_deadline),
+        Some(deadline + target_rate),
+        "the per-slot horizon must still advance even when the empty is suppressed"
+    );
+    assert_eq!(
+        queue.delayed().as_slice(),
+        &[deadline + target_rate],
+        "a suppressed wake must re-arm exactly once (keep waiting on the same slot)"
+    );
+}
+
+/// The wake refreshes `last_consensus_finalized_at` from the backend BEFORE the gate
+/// (C++ updates it via the independent FinalizeBlock handler):
+/// a stale tracker is reseeded by a freshly-advanced finalized seqno, so the gate
+/// then permits the filler rather than reading a value frozen at the last
+/// `check_collation`.
+#[test]
+fn slot_deadline_wake_refreshes_finalization_and_allows_filler() {
+    let description = Arc::new(make_mc_description_spw(1, 4));
+    let now = description.get_time();
+    let timeout = description.opts().no_empty_blocks_on_error_timeout;
+    let (mut ctrl, _queue) = ctrl_with_recording_queue(description);
+
+    let deadline = now + Duration::from_secs(100);
+    let request_id = 61;
+    let dispatch_slot = SlotIndex::new(1);
+    let parent = make_parent_info(0, 0xAA);
+    let parent_block_id = make_block_id(42, 0xAA);
+    ctrl.insert_precollated(dispatch_slot, make_precollated(request_id, Some(parent.clone())));
+    ctrl.block_generation_active = Some(in_flight_state(request_id, 0, 1, deadline));
+    // A stale tracker that, on its own, would suppress the filler...
+    ctrl.last_consensus_finalized_at = Some(now - timeout - Duration::from_secs(1));
+
+    // ...but the backend reports a freshly-advanced finalized seqno, which the wake
+    // folds in (refresh_finalization_timestamp) before evaluating the gate.
+    let mut backend = FakeCollationBackend::new(SlotIndex::new(1), WindowIndex::new(0))
+        .with_received(make_candidate_id(0, 0xAA), make_received(0, parent_block_id, None));
+    backend.last_consensus_finalized_seqno = Some(7);
+    ctrl.on_slot_deadline(&mut backend, dispatch_slot, request_id, deadline);
+
+    assert!(
+        ctrl.local_chain_head().is_some(),
+        "an advanced finalized seqno must reseed last_consensus_finalized_at and allow the filler"
+    );
+    assert_eq!(
+        ctrl.last_observed_finalized_seqno,
+        Some(7),
+        "the wake must record the freshly-observed finalized seqno"
+    );
+}
+
+/*
+    --------------------------------------------------------------------
+    Genuine-error single restart bounded by the window budget
+    --------------------------------------------------------------------
+*/
+
+/// A genuine collation error for a still-current slot releases the
+/// single-in-flight marker and schedules exactly ONE restart at
+/// `now + COLLATION_ERROR_RESTART_BACKOFF` (the C++ genuine-error retry). There
+/// is no attempt counter and no fresh-budget storm: the restart reuses the
+/// absolute window-end deadline.
+#[test]
+fn genuine_error_while_slot_current_schedules_single_restart() {
+    let description = Arc::new(make_mc_description_spw(1, 4));
+    let fixed = UNIX_EPOCH + Duration::from_secs(1_000_000);
+    description.set_time(fixed);
+    let (mut ctrl, queue) = ctrl_with_recording_queue(description);
+
+    let request_id = 71;
+    let slot = SlotIndex::new(0);
+    ctrl.insert_precollated(slot, make_precollated(request_id, None));
+    ctrl.block_generation_active =
+        Some(in_flight_state(request_id, 0, 0, fixed + Duration::from_secs(100)));
+
+    // Slot 0 is still current (first_non_progressed == 0): the failure is not terminal.
+    let mut backend = FakeCollationBackend::new(SlotIndex::new(0), WindowIndex::new(0));
+    ctrl.on_collation_failed_impl(
+        &mut backend,
+        slot,
+        request_id,
+        ton_block::error!("collation error"),
+    );
+
+    assert!(
+        ctrl.block_generation_active.is_none(),
+        "the failed real must release the single-in-flight marker"
+    );
+    assert!(
+        !ctrl.precollated_contains(slot),
+        "the failed precollation entry must be dropped (the restart re-registers it)"
+    );
+    assert_eq!(
+        queue.delayed().as_slice(),
+        &[fixed + COLLATION_ERROR_RESTART_BACKOFF],
+        "a genuine error schedules exactly ONE restart at the fixed backoff - no attempt-count \
+         storm and no fresh window (C++ block-producer.cpp)"
+    );
+}
+
+/// A genuine error for a slot that consensus has already progressed past is
+/// terminal: the marker is released, the precollation entry dropped, and NO
+/// restart is scheduled (the slot is gone / the budget is spent).
+#[test]
+fn genuine_error_after_slot_passed_drops_without_restart() {
+    let description = Arc::new(make_mc_description_spw(1, 4));
+    let (mut ctrl, queue) = ctrl_with_recording_queue(description);
+
+    let request_id = 72;
+    let slot = SlotIndex::new(0);
+    ctrl.insert_precollated(slot, make_precollated(request_id, None));
+    ctrl.block_generation_active =
+        Some(in_flight_state(request_id, 0, 0, SystemTime::now() + Duration::from_secs(100)));
+
+    // first_non_progressed == 1 => slot 0 already passed.
+    let mut backend = FakeCollationBackend::new(SlotIndex::new(1), WindowIndex::new(0));
+    ctrl.on_collation_failed_impl(
+        &mut backend,
+        slot,
+        request_id,
+        ton_block::error!("collation error"),
+    );
+
+    assert!(ctrl.block_generation_active.is_none(), "the failed real must release the marker");
+    assert!(!ctrl.precollated_contains(slot), "a passed slot's precollation entry must be dropped");
+    assert!(
+        queue.delayed().is_empty(),
+        "a slot that already progressed past must NOT be restarted"
+    );
+}
+
+/*
+    --------------------------------------------------------------------
+    Genuine-error allow_empty recovery (C++ block-producer.cpp)
+    --------------------------------------------------------------------
+*/
+
+/// Genuine error with `allow_empty` satisfied (consensus finalized recently AND a
+/// parent is available): recover by publishing ONE empty block for the failed slot
+/// and advancing the pipeline rather than restarting (C++ block-producer.cpp).
+/// With no fillers ahead, the empty publishes at the failed slot itself; the real is
+/// retried at the next slot by the normal precollation pipeline, so NO restart is
+/// scheduled.
+#[test]
+fn genuine_error_with_allow_empty_publishes_recovery_empty() {
+    let description = Arc::new(make_mc_description_spw(1, 4));
+    let now = description.get_time();
+    let (mut ctrl, queue) = ctrl_with_recording_queue(description);
+
+    let request_id = 73;
+    // Last slot of window 0 so the post-publish precollate_block(slot + 1) lands in
+    // window 1 and cleanly no-ops (out of the current leader window).
+    let slot = SlotIndex::new(3);
+    let parent = make_parent_info(2, 0xAA);
+    let parent_block_id = make_block_id(42, 0xAA);
+    ctrl.insert_precollated(slot, make_precollated(request_id, Some(parent.clone())));
+    ctrl.block_generation_active =
+        Some(in_flight_state(request_id, 0, 3, now + Duration::from_secs(100)));
+    // Recent finalization => allow_empty holds (C++ block-producer.cpp).
+    ctrl.last_consensus_finalized_at = Some(now);
+
+    // first_non_progressed == 3 => slot 3 is still current (not passed); window 0.
+    let mut backend = FakeCollationBackend::new(SlotIndex::new(3), WindowIndex::new(0))
+        .with_received(make_candidate_id(2, 0xAA), make_received(2, parent_block_id, None));
+    ctrl.on_collation_failed_impl(
+        &mut backend,
+        slot,
+        request_id,
+        ton_block::error!("collation error"),
+    );
+
+    let head = ctrl.local_chain_head().expect("allow_empty recovery must publish an empty");
+    assert_eq!(
+        head.slot, slot,
+        "with no fillers ahead, the recovery empty publishes at the failed slot"
+    );
+    assert!(
+        !ctrl.precollated_contains(slot),
+        "the failed precollation entry is consumed by the recovery"
+    );
+    assert!(
+        ctrl.block_generation_active.is_none(),
+        "the failed real released the marker; the out-of-window next slot did not re-dispatch"
+    );
+    assert!(
+        queue.delayed().is_empty(),
+        "allow_empty recovery publishes an empty and advances - it does NOT schedule a restart"
+    );
+}
+
+/// Genuine error with `allow_empty` when the per-slot wake already published empty
+/// fillers past the failed slot (local_chain_head advanced, but consensus has not
+/// progressed past the dispatch slot): the recovery empty is re-tagged onto the
+/// current chain head rather than the now-occupied failed slot, avoiding equivocation
+/// (C++ block-producer.cpp) - identical to the on_collation_complete late re-tag.
+#[test]
+fn genuine_error_with_allow_empty_retags_onto_filler_head() {
+    let description = Arc::new(make_mc_description_spw(1, 4));
+    let now = description.get_time();
+    let (mut ctrl, queue) = ctrl_with_recording_queue(description);
+
+    let request_id = 74;
+    let dispatch_slot = SlotIndex::new(1);
+    // Fillers already advanced the local chain head to slot 2 in window 0.
+    let head_parent = make_parent_info(2, 0xBB);
+    let head_block_id = make_block_id(42, 0xBB);
+    ctrl.set_local_chain_head(Some(make_local_chain_head(0, 2, head_parent)));
+    ctrl.insert_precollated(
+        dispatch_slot,
+        make_precollated(request_id, Some(make_parent_info(0, 0x11))),
+    );
+    ctrl.block_generation_active =
+        Some(in_flight_state(request_id, 0, 1, now + Duration::from_secs(100)));
+    ctrl.last_consensus_finalized_at = Some(now);
+
+    // Consensus progress cursor still at the dispatch slot (the fillers are not yet
+    // notarized), so the fsm check does NOT drop it; leader window still 0.
+    let mut backend = FakeCollationBackend::new(SlotIndex::new(1), WindowIndex::new(0))
+        .with_received(make_candidate_id(2, 0xBB), make_received(2, head_block_id, None));
+    ctrl.on_collation_failed_impl(
+        &mut backend,
+        dispatch_slot,
+        request_id,
+        ton_block::error!("collation error"),
+    );
+
+    let head = ctrl.local_chain_head().expect("allow_empty recovery must publish an empty");
+    assert_eq!(
+        head.slot,
+        SlotIndex::new(3),
+        "the recovery empty re-tags onto local_chain_head.slot + 1, not the occupied failed slot"
+    );
+    assert!(
+        !ctrl.precollated_contains(dispatch_slot),
+        "the failed precollation entry is consumed by the recovery"
+    );
+    assert!(ctrl.block_generation_active.is_none(), "the failed real released the marker");
+    assert!(
+        queue.delayed().is_empty(),
+        "the re-tagged recovery advances the pipeline - it does NOT schedule a restart"
+    );
+}
+
+/// Genuine error whose leader window already moved on (C++ block-producer.cpp):
+/// drop the slot - neither a recovery empty nor a restart - since the next window's
+/// producer now owns the chain. Mirrors on_collation_complete's stale-window discard.
+#[test]
+fn genuine_error_stale_window_drops_without_restart_or_publish() {
+    let description = Arc::new(make_mc_description_spw(1, 4));
+    let now = description.get_time();
+    let (mut ctrl, queue) = ctrl_with_recording_queue(description);
+
+    let request_id = 75;
+    let slot = SlotIndex::new(0);
+    ctrl.insert_precollated(slot, make_precollated(request_id, Some(make_parent_info(0, 0xAA))));
+    ctrl.block_generation_active =
+        Some(in_flight_state(request_id, 0, 0, now + Duration::from_secs(100)));
+    // Even with allow_empty otherwise satisfied, the stale window must take precedence.
+    ctrl.last_consensus_finalized_at = Some(now);
+
+    // Slot 0 is in window 0, but the current leader window is already 1. The fsm cursor
+    // (0) does NOT drop slot 0, so the window guard is the behavior under test.
+    let mut backend = FakeCollationBackend::new(SlotIndex::new(0), WindowIndex::new(1));
+    ctrl.on_collation_failed_impl(
+        &mut backend,
+        slot,
+        request_id,
+        ton_block::error!("collation error"),
+    );
+
+    assert!(
+        ctrl.local_chain_head().is_none(),
+        "a stale-window error must not publish a recovery empty"
+    );
+    assert!(!ctrl.precollated_contains(slot), "a stale-window error drops the precollation entry");
+    assert!(ctrl.block_generation_active.is_none(), "the failed real released the marker");
+    assert!(queue.delayed().is_empty(), "a stale-window error must not schedule a restart");
+}
+
+/// A genuine-error restart must race the SAME window-end budget as the original
+/// attempt: [`CollationController::restart_collation`] re-dispatches with the PINNED
+/// soft/hard cutoffs and budget anchor rather than recomputing them from the (now
+/// advanced) clock. Drives the restart directly - the recording queue drops the
+/// scheduled closure - with a resolvable parent so it reaches a real dispatch, after
+/// advancing the clock well past the original soft window.
+#[test]
+fn restart_collation_reuses_pinned_deadlines_across_clock_advance() {
+    let now = UNIX_EPOCH + Duration::from_millis(1_700_000_000_000);
+    let target_rate = Duration::from_millis(500);
+    let opts = SessionOptions { target_rate, ..SessionOptions::default() };
+    let description = Arc::new(make_description_with_opts(1, ShardIdent::masterchain(), opts));
+    description.set_time(now);
+    let (mut ctrl, _queue) = ctrl_with_recording_queue(description.clone());
+
+    let slot = SlotIndex::new(0);
+    // A resolvable parent (old gen-time) so prepare_collation is Ready and, with no
+    // finalized-seqno lag, dispatch proceeds as a REAL collation.
+    let parent = make_parent_info(3, 0x20);
+    let parent_block = make_block_id(41, 0x20);
+    let mut backend = FakeCollationBackend::new(slot, WindowIndex::new(0))
+        .with_received(make_candidate_id(3, 0x20), make_received(3, parent_block, Some(0)));
+    backend.available_parents.insert(slot, parent);
+
+    // The original attempt's pinned budget, intentionally unrelated to `now + budget`.
+    let pinned = CollationDeadlineContext {
+        soft_deadline: now + Duration::from_secs(7),
+        hard_deadline: now + Duration::from_secs(30),
+        budget_anchor: now - Duration::from_millis(500),
+    };
+
+    // The clock advances well past the original soft window before the restart fires:
+    // a recomputed budget would land ~20s later, so reuse is observable.
+    description.set_time(now + Duration::from_secs(20));
+    ctrl.restart_collation(&mut backend, slot, Some(pinned));
+
+    let active = ctrl.block_generation_active.as_ref().expect("restart must re-dispatch a real");
+    assert_eq!(
+        active.deadlines, pinned,
+        "the restart must reuse the pinned deadline context verbatim, not recompute from now"
+    );
+    let request =
+        ctrl.precollated(slot).expect("restart re-registers the precollation").request.clone();
+    assert_eq!(
+        request.get_collation_hard_deadline(),
+        Some(pinned.hard_deadline),
+        "the re-dispatched request must carry the pinned hard deadline"
+    );
+    assert_eq!(
+        request.get_collation_budget_anchor(),
+        Some(pinned.budget_anchor),
+        "the re-dispatched request must carry the pinned budget anchor"
     );
 }

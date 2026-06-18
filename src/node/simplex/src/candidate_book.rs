@@ -173,9 +173,10 @@ impl CandidateBook {
     }
 
     /// Reverse lookup: find the first received candidate whose `block_id`
-    /// matches `block_id` and return its `RawCandidateId`. Used by the
-    /// composite `resolve_candidate_id_by_block_id` resolver to cover the
-    /// candidate-book half of the lookup.
+    /// matches `block_id` and return its `RawCandidateId`. Covers the
+    /// candidate-book half of the composite `BlockIdExt → RawCandidateId`
+    /// resolve in `CandidateController::ensure_candidate_available` (ORed with
+    /// the collation generated-parent half via the backend).
     pub(crate) fn find_received_by_block_id(
         &self,
         block_id: &BlockIdExt,

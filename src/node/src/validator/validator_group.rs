@@ -107,6 +107,11 @@ const LEGACY_VALIDATION_TIMEOUT: Duration = Duration::from_secs(15);
 /// C++ parity: collation request deadline.
 /// Matches `validator-group.cpp` / `collation-manager.cpp`: `td::Timestamp::in(10.0)`.
 const COLLATION_TIMEOUT: Duration = Duration::from_secs(10);
+/// Extra wall-clock margin added above the Simplex window-end hard deadline for the
+/// outer collation guard, so the collator's internal `stop_flag` (the authoritative
+/// hard cap) fires first. Catchain/tests without a hard deadline keep the static
+/// `COLLATION_TIMEOUT`.
+const COLLATION_TIMEOUT_BACKSTOP: Duration = Duration::from_secs(2);
 
 /// Determines if block candidate should be broadcast publicly via FastSync overlay.
 /// Mirrors C++ `need_send_candidate_broadcast` logic from validator-group.cpp.
@@ -1483,12 +1488,23 @@ impl ValidatorGroup {
     pub async fn on_generate_slot(
         &self,
         source_info: validator_session::BlockSourceInfo,
-        request: validator_session::AsyncRequestPtr,
+        request: validator_session::AsyncCollationRequestPtr,
         parent: CollationParentHint,
         callback: ValidatorBlockCandidateCallback,
     ) {
         let round = source_info.priority.round;
         let request_id = request.get_request_id();
+        // Absolute collation deadlines + budget anchor for this slot, taken from the
+        // consensus engine's `AsyncCollationRequest`. Simplex sets a per-slot soft cutoff,
+        // a window-end hard cap, and the budget anchor (the dispatch instant the collator
+        // measures its soft sub-budgets from, distinct from `get_creation_time()`).
+        // Catchain/tests inherit the trait defaults (`None`) and the collator keeps its
+        // static cutoff/stop timeouts. Copied out here so the spawned collation task can
+        // forward them into `run_collate_query`. `get_creation_time()` (the slot start /
+        // `min_gen_time`) is still used for `min_ts` below.
+        let collation_budget_anchor = request.get_collation_budget_anchor();
+        let soft_deadline = request.get_collation_soft_deadline();
+        let hard_deadline = request.get_collation_hard_deadline();
 
         // Check if request is already cancelled
         if request.is_cancelled() {
@@ -1578,6 +1594,11 @@ impl ValidatorGroup {
             .is_err()
         {
             log::warn!(target: "validator", "Collation pipeline is already running. Skipping collation request.");
+            // Report the failure through the callback rather than dropping the request
+            // silently: under simplex the callback is the only signal back to the
+            // CollationController, and without it the controller's single-in-flight
+            // `block_generation_active` marker would never clear, wedging the pipeline.
+            callback(Err(error!("collation_pipeline_already_running")));
             return;
         }
 
@@ -1746,6 +1767,9 @@ impl ValidatorGroup {
                                 engine.clone(),
                                 is_simplex,
                                 requires_real_state_update,
+                                collation_budget_anchor,
+                                soft_deadline,
+                                hard_deadline,
                             )
                             .await
                             {
@@ -1853,8 +1877,20 @@ impl ValidatorGroup {
                 }
             };
 
+            // Outer wall-clock backstop. When Simplex supplies a window-end hard
+            // deadline the collator arms its own stop_flag at it; size the outer guard
+            // just above so the internal deadline fires first and keeps the empty /
+            // late-publish path in control. Catchain/tests keep the static
+            // COLLATION_TIMEOUT.
+            let outer_collation_timeout = match hard_deadline {
+                Some(hard) => COLLATION_TIMEOUT.max(
+                    hard.duration_since(SystemTime::now()).unwrap_or_default()
+                        + COLLATION_TIMEOUT_BACKSTOP,
+                ),
+                None => COLLATION_TIMEOUT,
+            };
             let (result, result_message) = match tokio::time::timeout(
-                COLLATION_TIMEOUT,
+                outer_collation_timeout,
                 collation_future,
             )
             .await
@@ -1862,7 +1898,7 @@ impl ValidatorGroup {
                 Ok(inner) => inner,
                 Err(_elapsed) => {
                     metrics::counter!("simplex_collation_timeout").increment(1);
-                    let msg = format!("Collation timed out after {:?}", COLLATION_TIMEOUT);
+                    let msg = format!("Collation timed out after {:?}", outer_collation_timeout);
                     log::warn!(
                         target: "validator",
                         "({next_block_descr}): ValidatorGroup::on_generate_slot: {round_info}, {msg}"

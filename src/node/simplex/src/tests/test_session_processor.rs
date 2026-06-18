@@ -23,7 +23,7 @@ use crate::{
     SessionId, SessionNode, SessionOptions, SIMPLEX_ROUNDLESS,
 };
 use consensus_common::{
-    AsyncRequestPtr, BlockPayloadPtr, BlockSourceInfo, CollationParentHint,
+    AsyncCollationRequestPtr, BlockPayloadPtr, BlockSourceInfo, CollationParentHint,
     EnsureCandidateAvailabilityOptions, PublicKey, PublicKeyHash, ResolverPurpose, SessionStats,
     ValidatorBlockCandidateCallback, ValidatorBlockCandidateDecisionCallback,
 };
@@ -336,7 +336,7 @@ impl consensus_common::SessionListener for MockListener {
     fn on_generate_slot(
         &self,
         _source_info: BlockSourceInfo,
-        _request: AsyncRequestPtr,
+        _request: AsyncCollationRequestPtr,
         _parent: CollationParentHint,
         _callback: ValidatorBlockCandidateCallback,
     ) {
@@ -435,7 +435,7 @@ impl consensus_common::SessionListener for RecordingListener {
     fn on_generate_slot(
         &self,
         _source_info: BlockSourceInfo,
-        _request: AsyncRequestPtr,
+        _request: AsyncCollationRequestPtr,
         _parent: CollationParentHint,
         _callback: ValidatorBlockCandidateCallback,
     ) {
@@ -1192,7 +1192,7 @@ fn test_out_of_order_finalized_delivery_emits_immediately_when_body_present() {
 
     let received = fixture
         .processor
-        .candidate_book
+        .candidate_book()
         .received(&candidate_id)
         .expect("candidate should be present")
         .clone();
@@ -1223,7 +1223,7 @@ fn test_out_of_order_finalized_delivery_emits_immediately_when_body_present() {
         "no pending-body retention expected when finalized body is already present"
     );
     assert!(
-        fixture.processor.requested_candidates.is_empty(),
+        fixture.processor.requested_candidates().is_empty(),
         "finalized-driven mode must not request missing candidates"
     );
 }
@@ -1275,7 +1275,7 @@ fn test_out_of_order_finalized_delivery_emits_when_body_arrives_late_and_dedups(
         "no finalized callback before candidate body is available"
     );
     assert!(
-        fixture.processor.requested_candidates.contains_key(&candidate_id),
+        fixture.processor.requested_candidates().contains_key(&candidate_id),
         "recursive finalization must request missing trigger body/cert immediately"
     );
 
@@ -1295,7 +1295,7 @@ fn test_out_of_order_finalized_delivery_emits_when_body_arrives_late_and_dedups(
         "on_block_committed must stay suppressed in out-of-order mode"
     );
     assert!(
-        fixture.processor.requested_candidates.is_empty(),
+        fixture.processor.requested_candidates().is_empty(),
         "request bookkeeping must clear once the missing body arrives"
     );
 
@@ -1338,18 +1338,18 @@ fn test_out_of_order_mode_does_not_run_commit_chain_recovery_for_missing_body() 
         "finalization should be buffered until body arrival"
     );
     assert!(
-        !fixture.processor.candidate_book.contains_received(&finalized_id),
+        !fixture.processor.candidate_book().contains_received(&finalized_id),
         "finalized-driven mode must not seed stubs for missing bodies"
     );
     assert!(
-        fixture.processor.requested_candidates.contains_key(&finalized_id),
+        fixture.processor.requested_candidates().contains_key(&finalized_id),
         "missing finalized trigger body must schedule a repair request"
     );
 
     // Periodic scheduler path should also avoid candidate recovery.
     fixture.processor.check_all();
     assert!(
-        fixture.processor.requested_candidates.contains_key(&finalized_id),
+        fixture.processor.requested_candidates().contains_key(&finalized_id),
         "check_all must keep the pending repair tracked until body arrival"
     );
 }
@@ -1828,7 +1828,10 @@ fn test_cleanup_old_slots_keeps_seqno_dedup_while_received_candidates_are_retain
         old_slot,
         old_block_id.clone(),
     );
-    fixture.processor.candidate_book.insert_received(old_candidate_id.clone(), received.clone());
+    fixture
+        .processor
+        .candidate_book_mut()
+        .insert_received(old_candidate_id.clone(), received.clone());
 
     // cleanup_old_slots(MAX_HISTORY_SLOTS) computes up_to_slot = 1, so slot=0
     // entries would be the only ones cleaned. Using slot=10 above guarantees the
@@ -1840,7 +1843,7 @@ fn test_cleanup_old_slots_keeps_seqno_dedup_while_received_candidates_are_retain
         "pre-existing slot-keyed dedup pruning must continue to work"
     );
     assert!(
-        fixture.processor.candidate_book.contains_received(&old_candidate_id),
+        fixture.processor.candidate_book().contains_received(&old_candidate_id),
         "old received candidates are still retained today; pruning seqno dedup before this \
          metadata is gone would allow duplicate callback emission"
     );
@@ -2081,7 +2084,7 @@ fn test_skip_certificate_cancels_stale_candidate_request_repairs() {
 
     fixture.processor.request_candidate(slot, block_hash.clone(), Some(Duration::from_secs(1)));
     assert!(
-        fixture.processor.requested_candidates.contains_key(&candidate_id),
+        fixture.processor.requested_candidates().contains_key(&candidate_id),
         "request should be scheduled before skip"
     );
 
@@ -2090,7 +2093,7 @@ fn test_skip_certificate_cancels_stale_candidate_request_repairs() {
     fixture.processor.on_certificate(1, tl_cert);
 
     assert!(
-        !fixture.processor.requested_candidates.contains_key(&candidate_id),
+        !fixture.processor.requested_candidates().contains_key(&candidate_id),
         "skip must cancel scheduled requestCandidate repairs for the skipped slot"
     );
 
@@ -2124,11 +2127,11 @@ fn test_handle_notarization_reached_requests_missing_candidate_body() {
 
     // Ensure the candidate body is missing.
     assert!(
-        !fixture.processor.candidate_book.contains_received(&candidate_id),
+        !fixture.processor.candidate_book().contains_received(&candidate_id),
         "test setup: candidate body must be missing"
     );
     assert!(
-        !fixture.processor.requested_candidates.contains_key(&candidate_id),
+        !fixture.processor.requested_candidates().contains_key(&candidate_id),
         "test setup: candidate must not be pre-requested"
     );
 
@@ -2155,7 +2158,7 @@ fn test_handle_notarization_reached_requests_missing_candidate_body() {
     fixture.run_pending_tasks();
 
     assert!(
-        fixture.processor.requested_candidates.contains_key(&candidate_id),
+        fixture.processor.requested_candidates().contains_key(&candidate_id),
         "expected SessionProcessor to schedule requestCandidate for missing notarized block body"
     );
 }
@@ -2265,21 +2268,21 @@ fn test_batch_finalization_notarized_parents_finalized_descendant() {
 
     let block_1 = fixture
         .processor
-        .candidate_book
+        .candidate_book()
         .received(&id_1)
         .expect("slot 31 candidate must exist")
         .block_id
         .clone();
     let block_2 = fixture
         .processor
-        .candidate_book
+        .candidate_book()
         .received(&id_2)
         .expect("slot 32 candidate must exist")
         .block_id
         .clone();
     let block_3 = fixture
         .processor
-        .candidate_book
+        .candidate_book()
         .received(&id_3)
         .expect("slot 33 candidate must exist")
         .block_id
@@ -2548,7 +2551,7 @@ fn insert_received_candidate_with_gen_utime_ms(
     parent_id: Option<RawCandidateId>,
     gen_utime_ms: Option<u64>,
 ) {
-    processor.candidate_book.insert_received(
+    processor.candidate_book_mut().insert_received(
         candidate_id.clone(),
         ReceivedCandidate {
             slot: candidate_id.slot,
@@ -3147,13 +3150,13 @@ fn test_on_candidate_received_non_empty_does_not_wait_for_unresolved_ancestor_ch
         "non-empty candidate must be admitted immediately even if only ancestor metadata is missing"
     );
     assert!(
-        fixture.processor.requested_candidates.is_empty(),
+        fixture.processor.requested_candidates().is_empty(),
         "non-empty admission must not trigger ancestor prefetch requests"
     );
 
     let received = fixture
         .processor
-        .candidate_book
+        .candidate_book()
         .received(&child_id)
         .expect("child candidate must be stored");
     assert!(
@@ -3187,7 +3190,7 @@ fn test_on_candidate_received_empty_waits_in_pending_validation_and_requests_mis
         "empty candidate must enter pending_validations immediately after ingress"
     );
     assert!(
-        fixture.processor.requested_candidates.is_empty(),
+        fixture.processor.requested_candidates().is_empty(),
         "ingress must not prefetch parent metadata before WaitForParent is satisfied"
     );
 
@@ -3204,7 +3207,7 @@ fn test_on_candidate_received_empty_waits_in_pending_validation_and_requests_mis
         "empty candidate must remain pending while parent metadata is still missing"
     );
     assert!(
-        fixture.processor.requested_candidates.contains_key(&parent_id),
+        fixture.processor.requested_candidates().contains_key(&parent_id),
         "validation path must request the missing parent metadata on demand"
     );
     assert!(
@@ -3240,7 +3243,7 @@ fn test_ensure_candidate_available_requests_even_if_slot_skipped() {
     );
 
     assert!(
-        fixture.processor.requested_candidates.contains_key(&candidate_id),
+        fixture.processor.requested_candidates().contains_key(&candidate_id),
         "resolver ensure must request body even for skipped slot"
     );
 
@@ -3311,15 +3314,15 @@ fn test_ensure_candidate_available_requests_parent_chain_when_enabled() {
     );
 
     assert!(
-        fixture.processor.requested_candidates.contains_key(&child_id),
+        fixture.processor.requested_candidates().contains_key(&child_id),
         "child must be requested"
     );
     assert!(
-        fixture.processor.requested_candidates.contains_key(&parent_id),
+        fixture.processor.requested_candidates().contains_key(&parent_id),
         "parent must be requested when include_parent_chain=true"
     );
     assert!(
-        fixture.processor.requested_candidates.contains_key(&root_id),
+        fixture.processor.requested_candidates().contains_key(&root_id),
         "root ancestor must be requested when metadata chain is available"
     );
 }
@@ -3354,15 +3357,15 @@ fn test_ensure_candidate_available_requests_immediate_parent_and_stops_on_missin
     );
 
     assert!(
-        fixture.processor.requested_candidates.contains_key(&child_id),
+        fixture.processor.requested_candidates().contains_key(&child_id),
         "target candidate must be requested"
     );
     assert!(
-        fixture.processor.requested_candidates.contains_key(&parent_id),
+        fixture.processor.requested_candidates().contains_key(&parent_id),
         "immediate parent must be requested even when parent metadata is missing"
     );
     assert_eq!(
-        fixture.processor.requested_candidates.len(),
+        fixture.processor.requested_candidates().len(),
         2,
         "traversal must stop after requesting the first missing parent metadata"
     );
@@ -3487,6 +3490,10 @@ fn test_ensure_candidate_available_deferred_retry_on_missing_mapping() {
             include_parent_chain: false,
         },
     );
+    // The controller schedules its retry through the controller queue, which
+    // bounces an immediate task onto the main queue that then arms the runtime
+    // delayed action; drain that SXMAIN hop before inspecting the timer.
+    fixture.run_pending_tasks();
 
     assert_eq!(
         fixture.processor.runtime.delayed_actions_count(),
@@ -3514,7 +3521,7 @@ fn test_ensure_candidate_available_deferred_retry_on_missing_mapping() {
     fixture.processor.process_delayed_actions();
 
     assert!(
-        fixture.processor.requested_candidates.contains_key(&candidate_id),
+        fixture.processor.requested_candidates().contains_key(&candidate_id),
         "deferred retry must request the candidate once mapping becomes available"
     );
 
@@ -3552,6 +3559,10 @@ fn test_ensure_candidate_available_deferred_retry_gives_up_after_max_retries() {
             include_parent_chain: false,
         },
     );
+    // The retry is scheduled through the controller queue, which bounces an
+    // immediate task onto the main queue that arms the runtime delayed action;
+    // drain that SXMAIN hop so the timer is observable.
+    fixture.run_pending_tasks();
 
     // Repeatedly advance time and process delayed actions until retries are exhausted.
     for i in 0..RESOLVER_AVAILABILITY_MAX_RETRIES {
@@ -3564,6 +3575,9 @@ fn test_ensure_candidate_available_deferred_retry_gives_up_after_max_retries() {
         let advance = RESOLVER_AVAILABILITY_RETRY_DELAY + Duration::from_millis(1);
         fixture.processor.set_time(base_time + advance * (i + 1));
         fixture.processor.process_delayed_actions();
+        // Each still-unresolved retry re-arms the next one through the same
+        // controller-queue bounce; flush it before the next count assertion.
+        fixture.run_pending_tasks();
     }
 
     // After max retries, no more deferred actions should be scheduled.
@@ -4154,11 +4168,10 @@ fn test_self_collation_retry_counts_total_only_once() {
 }
 
 #[test]
-fn test_self_collation_failure_only_on_final_attempt() {
+fn test_self_collation_failure_only_on_terminal_drop() {
     let mut fixture = TestFixture::new(4);
     let slot = SlotIndex::new(0);
     let request_id = 904;
-    let retry_max = fixture.description.opts().collation_retry_max_attempts;
 
     let now = fixture.processor.now();
     fixture.processor.telemetry.record_self_collation_start(
@@ -4171,13 +4184,18 @@ fn test_self_collation_failure_only_on_final_attempt() {
         now,
     );
 
-    // An intermediate attempt failure (will be retried) MUST NOT bump self-collation failure.
-    fixture.processor.on_collation_failed_impl(slot, request_id, error!("first attempt"), 0);
+    // A genuine error while the slot is still current schedules a single
+    // restart sharing the window-end budget - it is NOT terminal, so the
+    // self-collation funnel records no failure (the whole slot is one
+    // self-collation, regardless of how many times the real collation restarts).
+    fixture.processor.on_collation_failed_impl(slot, request_id, error!("transient error"));
     assert_eq!(metrics_counter(&fixture.processor, "simplex_self_collates.failure"), 0);
     assert_eq!(metrics_counter(&fixture.processor, "simplex_self_collates.total"), 1);
 
-    // The terminal attempt (retry_count == retry_max) marks the flow as final failure.
-    fixture.processor.on_collation_failed_impl(slot, request_id, error!("max retries"), retry_max);
+    // Once the slot has progressed past (here: skip-certified by consensus), a
+    // failure for it is terminal and marks the self-collation flow as failed.
+    skip_slot(&mut fixture, slot);
+    fixture.processor.on_collation_failed_impl(slot, request_id, error!("slot already passed"));
 
     assert_eq!(metrics_counter(&fixture.processor, "simplex_self_collates.total"), 1);
     assert_eq!(metrics_counter(&fixture.processor, "simplex_self_collates.success"), 0);
@@ -4228,7 +4246,10 @@ fn test_candidate_query_fallback_cache_hit() {
     let candidate_id = RawCandidateId { slot, hash: block_hash.clone() };
 
     let fake_candidate_bytes = vec![0xCA, 0xFE, 0xBA, 0xBE];
-    fixture.processor.candidate_book.insert_cached_data(candidate_id, fake_candidate_bytes.clone());
+    fixture
+        .processor
+        .candidate_book_mut()
+        .insert_cached_data(candidate_id, fake_candidate_bytes.clone());
 
     let (tx, rx) = channel();
     let callback: crate::QueryResponseCallback = Box::new(move |result| {
@@ -4421,19 +4442,19 @@ fn test_candidate_data_cache_populated_on_candidate_received() {
         make_signed_block_broadcast(&fixture, slot, vec![1u8, 2, 3, 4, 5]);
 
     assert!(
-        !fixture.processor.candidate_book.contains_cached_data(&candidate_id),
+        !fixture.processor.candidate_book().contains_cached_data(&candidate_id),
         "cache should be empty before on_candidate_received"
     );
 
     fixture.processor.on_candidate_received(leader_source, broadcast, None);
 
     assert!(
-        fixture.processor.candidate_book.contains_cached_data(&candidate_id),
+        fixture.processor.candidate_book().contains_cached_data(&candidate_id),
         "cache should be populated after on_candidate_received"
     );
 
     assert!(
-        fixture.processor.candidate_book.contains_received(&candidate_id),
+        fixture.processor.candidate_book().contains_received(&candidate_id),
         "candidate_book should also have the candidate"
     );
 }
@@ -4472,15 +4493,15 @@ fn test_old_slot_broadcast_is_dropped_without_persistence_side_effects() {
     fixture.processor.on_candidate_received(leader_source, broadcast, None /* broadcast */);
 
     assert!(
-        !fixture.processor.candidate_book.contains_cached_data(&candidate_id),
+        !fixture.processor.candidate_book().contains_cached_data(&candidate_id),
         "old-slot broadcast must not populate candidate_data_cache"
     );
     assert!(
-        !fixture.processor.candidate_book.contains_received(&candidate_id),
+        !fixture.processor.candidate_book().contains_received(&candidate_id),
         "old-slot broadcast must not populate candidate_book"
     );
     assert!(
-        !fixture.processor.candidate_book.contains_seen_broadcast(SlotIndex::new(slot)),
+        !fixture.processor.candidate_book().contains_seen_broadcast(SlotIndex::new(slot)),
         "old-slot broadcast should be dropped before broadcast dedup state is updated"
     );
 }
@@ -4496,7 +4517,7 @@ fn test_candidate_precheck_keeps_simple_addition_rule() {
     fixture.processor.on_candidate_received(leader_source, broadcast, None);
 
     assert!(
-        !fixture.processor.candidate_book.contains_cached_data(&candidate_id),
+        !fixture.processor.candidate_book().contains_cached_data(&candidate_id),
         "candidate above the simple-addition bound must be dropped before caching"
     );
     assert_eq!(
@@ -4524,7 +4545,7 @@ fn test_candidate_precheck_progress_gap_uses_progress_cursor() {
     fixture.processor.on_candidate_received(leader_source, broadcast, None);
 
     assert!(
-        fixture.processor.candidate_book.contains_cached_data(&candidate_id),
+        fixture.processor.candidate_book().contains_cached_data(&candidate_id),
         "candidate at the progress-anchored boundary should survive precheck even when finalization lags"
     );
 }
@@ -4577,7 +4598,7 @@ fn test_conflicting_second_broadcast_same_slot_is_dropped_by_precheck() {
     );
 
     assert!(
-        fixture.processor.candidate_book.contains_received(&first_id),
+        fixture.processor.candidate_book().contains_received(&first_id),
         "first broadcast candidate should be accepted"
     );
 
@@ -4592,15 +4613,15 @@ fn test_conflicting_second_broadcast_same_slot_is_dropped_by_precheck() {
     );
 
     assert!(
-        !fixture.processor.candidate_book.contains_received(&second_id),
+        !fixture.processor.candidate_book().contains_received(&second_id),
         "conflicting second broadcast for same slot must be dropped"
     );
     assert!(
-        !fixture.processor.candidate_book.contains_cached_data(&second_id),
+        !fixture.processor.candidate_book().contains_cached_data(&second_id),
         "conflicting second broadcast must not be persisted in candidate_data_cache"
     );
     assert_eq!(
-        fixture.processor.candidate_book.seen_broadcast(SlotIndex::new(slot)).cloned(),
+        fixture.processor.candidate_book().seen_broadcast(SlotIndex::new(slot)).cloned(),
         Some(first_id),
         "slot dedup state should keep first accepted broadcast candidate id"
     );
@@ -4629,15 +4650,15 @@ fn test_relayed_broadcast_from_non_leader_is_accepted() {
     fixture.processor.on_candidate_received(relay_sender, broadcast, None /* broadcast */);
 
     assert!(
-        fixture.processor.candidate_book.contains_received(&candidate_id),
+        fixture.processor.candidate_book().contains_received(&candidate_id),
         "relayed leader-signed broadcast must be accepted into received_candidates"
     );
     assert!(
-        fixture.processor.candidate_book.contains_cached_data(&candidate_id),
+        fixture.processor.candidate_book().contains_cached_data(&candidate_id),
         "relayed leader-signed broadcast must be persisted in candidate_data_cache"
     );
     assert_eq!(
-        fixture.processor.candidate_book.seen_broadcast(SlotIndex::new(slot)).cloned(),
+        fixture.processor.candidate_book().seen_broadcast(SlotIndex::new(slot)).cloned(),
         Some(candidate_id),
         "relayed broadcast must update the slot dedup state"
     );
@@ -4660,10 +4681,11 @@ fn test_has_real_candidate_body_returns_false_for_stub() {
     let candidate_id = RawCandidateId { slot, hash: hash.clone() };
 
     // No entry => false
-    assert!(!fixture.processor.candidate_book.has_real_body(&candidate_id));
+    assert!(!fixture.processor.candidate_book().has_real_body(&candidate_id));
 
     // Insert a finalized-boundary stub (empty candidate_hash_data_bytes)
-    fixture.processor.candidate_book.insert_received(
+    let receive_time = fixture.processor.now();
+    fixture.processor.candidate_book_mut().insert_received(
         candidate_id.clone(),
         ReceivedCandidate {
             slot,
@@ -4677,7 +4699,7 @@ fn test_has_real_candidate_body_returns_false_for_stub() {
                 Vec::new(),
             ),
             gen_utime_ms: None,
-            receive_time: fixture.processor.now(),
+            receive_time,
             is_empty: false,
             parent_id: None,
         },
@@ -4685,21 +4707,21 @@ fn test_has_real_candidate_body_returns_false_for_stub() {
 
     // Stub => false
     assert!(
-        !fixture.processor.candidate_book.has_real_body(&candidate_id),
+        !fixture.processor.candidate_book().has_real_body(&candidate_id),
         "finalized-boundary stub must NOT count as real body"
     );
 
     // Overwrite with real data
     fixture
         .processor
-        .candidate_book
+        .candidate_book_mut()
         .received_mut(&candidate_id)
         .unwrap()
         .candidate_hash_data_bytes = vec![1, 2, 3];
 
     // Now should be true
     assert!(
-        fixture.processor.candidate_book.has_real_body(&candidate_id),
+        fixture.processor.candidate_book().has_real_body(&candidate_id),
         "entry with non-empty candidate_hash_data_bytes must count as real body"
     );
 }
@@ -5185,15 +5207,15 @@ fn test_recovery_seed_received_candidates_preserves_persisted_empty_records() {
     ];
     run_apply_bootstrap(&mut fixture, bootstrap);
 
-    let root = fixture.processor.candidate_book.received(&c1).expect("root record");
+    let root = fixture.processor.candidate_book().received(&c1).expect("root record");
     assert!(!root.is_empty);
 
-    let empty = fixture.processor.candidate_book.received(&c2).expect("empty record");
+    let empty = fixture.processor.candidate_book().received(&c2).expect("empty record");
     assert!(empty.is_empty, "persisted empty MC record must remain marked empty on recovery");
     assert_eq!(empty.parent_id.as_ref(), Some(&c1));
     assert_eq!(empty.block_id, b1);
 
-    let child = fixture.processor.candidate_book.received(&c3).expect("child record");
+    let child = fixture.processor.candidate_book().received(&c3).expect("child record");
     assert!(!child.is_empty);
     assert_eq!(child.parent_id.as_ref(), Some(&c2));
     assert_eq!(child.block_id, b3);
@@ -5402,8 +5424,8 @@ fn test_apply_bootstrap_restores_state_first_commit_strategy() {
     );
 
     // Both finalized records seeded into received_candidates for restart lookups.
-    assert!(fixture.processor.candidate_book.received(&make_candidate_id(5, 0x55)).is_some());
-    assert!(fixture.processor.candidate_book.received(&make_candidate_id(7, 0x77)).is_some());
+    assert!(fixture.processor.candidate_book().received(&make_candidate_id(5, 0x55)).is_some());
+    assert!(fixture.processor.candidate_book().received(&make_candidate_id(7, 0x77)).is_some());
 
     // Last-finalized notification advanced the finalized head to the newest record.
     assert_eq!(fixture.processor.consensus.finalized_head_seqno(), Some(101));
@@ -5522,11 +5544,11 @@ fn test_apply_bootstrap_seeds_persisted_empty_mc_chain() {
 
     run_apply_bootstrap(&mut fixture, bootstrap);
 
-    assert!(fixture.processor.candidate_book.received(&c1).is_some());
-    let mid = fixture.processor.candidate_book.received(&c2).expect("middle record");
+    assert!(fixture.processor.candidate_book().received(&c1).is_some());
+    let mid = fixture.processor.candidate_book().received(&c2).expect("middle record");
     assert!(mid.is_empty, "shared-block-id record must be marked empty on recovery");
     assert_eq!(mid.parent_id.as_ref(), Some(&c1));
-    assert!(fixture.processor.candidate_book.received(&c3).is_some());
+    assert!(fixture.processor.candidate_book().received(&c3).is_some());
 
     // Last-finalized notification still targets the newest final record.
     assert_eq!(fixture.processor.consensus.finalized_head_seqno(), Some(101));
@@ -5906,7 +5928,7 @@ fn test_finalized_callback_not_emitted_when_finalized_record_persist_fails() {
     fixture.processor.on_candidate_received(leader_source, broadcast, None);
     let received = fixture
         .processor
-        .candidate_book
+        .candidate_book()
         .received(&candidate_id)
         .expect("candidate must exist")
         .clone();
@@ -5973,7 +5995,7 @@ fn test_finalized_callback_fires_then_record_eventually_persists() {
         fn on_generate_slot(
             &self,
             _source_info: BlockSourceInfo,
-            _request: AsyncRequestPtr,
+            _request: AsyncCollationRequestPtr,
             _parent: CollationParentHint,
             _callback: ValidatorBlockCandidateCallback,
         ) {
@@ -6043,7 +6065,7 @@ fn test_finalized_callback_fires_then_record_eventually_persists() {
     fixture.processor.on_candidate_received(leader_source, broadcast, None);
     let received = fixture
         .processor
-        .candidate_book
+        .candidate_book()
         .received(&candidate_id)
         .expect("candidate must exist")
         .clone();
@@ -6117,7 +6139,7 @@ fn test_finalized_with_body_advances_committed_seqno() {
 
     let received = fixture
         .processor
-        .candidate_book
+        .candidate_book()
         .received(&candidate_id)
         .expect("candidate must be present")
         .clone();
@@ -6169,7 +6191,7 @@ fn test_finalized_out_of_order_seqno_advances_monotonically() {
         make_signed_block_broadcast(&fixture, slot_high, vec![10, 20, 30]);
     fixture.processor.on_candidate_received(leader_high, broadcast_high, None);
 
-    let received_high = fixture.processor.candidate_book.received(&id_high).unwrap().clone();
+    let received_high = fixture.processor.candidate_book().received(&id_high).unwrap().clone();
 
     let event_high = BlockFinalizedEvent {
         slot: id_high.slot,
@@ -6187,7 +6209,7 @@ fn test_finalized_out_of_order_seqno_advances_monotonically() {
         make_signed_block_broadcast(&fixture, slot_low, vec![40, 50, 60]);
     fixture.processor.on_candidate_received(leader_low, broadcast_low, None);
 
-    let received_low = fixture.processor.candidate_book.received(&id_low).unwrap().clone();
+    let received_low = fixture.processor.candidate_book().received(&id_low).unwrap().clone();
 
     let event_low = BlockFinalizedEvent {
         slot: id_low.slot,
@@ -6237,7 +6259,7 @@ fn test_finalized_duplicate_is_idempotent() {
         make_signed_block_broadcast(&fixture, slot, vec![0xDE, 0xAD]);
     fixture.processor.on_candidate_received(leader_source, broadcast, None);
 
-    let received = fixture.processor.candidate_book.received(&candidate_id).unwrap().clone();
+    let received = fixture.processor.candidate_book().received(&candidate_id).unwrap().clone();
 
     let event = BlockFinalizedEvent {
         slot: candidate_id.slot,
@@ -6290,7 +6312,7 @@ fn test_finalized_empty_block_does_not_advance_seqno() {
         UInt256::rand(),
     );
 
-    fixture.processor.candidate_book.insert_received(
+    fixture.processor.candidate_book_mut().insert_received(
         candidate_id.clone(),
         ReceivedCandidate {
             slot,
@@ -6349,7 +6371,7 @@ fn test_finalized_reverse_order_keeps_highest_seqno() {
             make_signed_block_broadcast(&fixture, slot, vec![slot as u8, 0xFF]);
         fixture.processor.on_candidate_received(leader, bcast, None);
 
-        let received = fixture.processor.candidate_book.received(&cid).unwrap().clone();
+        let received = fixture.processor.candidate_book().received(&cid).unwrap().clone();
         let seqno = received.block_id.seq_no();
         if seqno > highest_seqno {
             highest_seqno = seqno;
@@ -6394,7 +6416,7 @@ fn test_finalized_clears_journal_entry_on_apply() {
         make_signed_block_broadcast(&fixture, slot, vec![0xCA, 0xFE]);
     fixture.processor.on_candidate_received(leader_source, broadcast, None);
 
-    let received = fixture.processor.candidate_book.received(&candidate_id).unwrap().clone();
+    let received = fixture.processor.candidate_book().received(&candidate_id).unwrap().clone();
 
     let event = BlockFinalizedEvent {
         slot: candidate_id.slot,
@@ -6441,7 +6463,7 @@ fn test_recursive_finalization_defers_until_missing_parent_body_arrives() {
     fixture.processor.on_candidate_received(child_leader, child_broadcast, None);
     let child_block = fixture
         .processor
-        .candidate_book
+        .candidate_book()
         .received(&child_id)
         .expect("child body must be present")
         .block_id
@@ -6482,7 +6504,7 @@ fn test_recursive_finalization_defers_until_missing_parent_body_arrives() {
     fixture.processor.on_candidate_received(parent_leader, parent_broadcast, None);
     let parent_block = fixture
         .processor
-        .candidate_book
+        .candidate_book()
         .received(&parent_id)
         .expect("parent body must be present")
         .block_id
@@ -6519,7 +6541,7 @@ fn test_recursive_finalization_defers_until_parent_notar_cert_arrives() {
     fixture.processor.on_candidate_received(parent_leader, parent_broadcast, None);
     let parent_block = fixture
         .processor
-        .candidate_book
+        .candidate_book()
         .received(&parent_id)
         .expect("parent body must exist")
         .block_id
@@ -6534,7 +6556,7 @@ fn test_recursive_finalization_defers_until_parent_notar_cert_arrives() {
     fixture.processor.on_candidate_received(child_leader, child_broadcast, None);
     let child_block = fixture
         .processor
-        .candidate_book
+        .candidate_book()
         .received(&child_id)
         .expect("child body must exist")
         .block_id
@@ -6614,7 +6636,7 @@ fn test_recursive_finalization_traverses_empty_ancestor_without_callback() {
     fixture.processor.on_candidate_received(root_leader, root_broadcast, None);
     let root_block = fixture
         .processor
-        .candidate_book
+        .candidate_book()
         .received(&root_id)
         .expect("root must exist")
         .block_id
@@ -6637,7 +6659,7 @@ fn test_recursive_finalization_traverses_empty_ancestor_without_callback() {
     fixture.processor.on_candidate_received(child_leader, child_broadcast, None);
     let child_block = fixture
         .processor
-        .candidate_book
+        .candidate_book()
         .received(&child_id)
         .expect("child must exist")
         .block_id
@@ -6691,7 +6713,7 @@ fn test_recursive_finalization_dedups_repeated_trigger_and_cert_retry() {
     fixture.processor.on_candidate_received(root_leader, root_broadcast, None);
     let root_block = fixture
         .processor
-        .candidate_book
+        .candidate_book()
         .received(&root_id)
         .expect("root must exist")
         .block_id
@@ -6706,7 +6728,7 @@ fn test_recursive_finalization_dedups_repeated_trigger_and_cert_retry() {
     fixture.processor.on_candidate_received(child_leader, child_broadcast, None);
     let child_block = fixture
         .processor
-        .candidate_book
+        .candidate_book()
         .received(&child_id)
         .expect("child must exist")
         .block_id
@@ -6766,7 +6788,7 @@ fn test_recursive_finalization_masterchain_emits_finalcert_only() {
     fixture.processor.on_candidate_received(child_leader, child_broadcast, None);
     let child_block = fixture
         .processor
-        .candidate_book
+        .candidate_book()
         .received(&child_id)
         .expect("child must exist")
         .block_id
@@ -6832,7 +6854,7 @@ fn test_recursive_finalization_applied_top_floor_skips_older_ancestor_callbacks(
     fixture.processor.on_candidate_received(old_leader, old_broadcast, None);
     let old_block = fixture
         .processor
-        .candidate_book
+        .candidate_book()
         .received(&old_id)
         .expect("old ancestor must exist")
         .block_id
@@ -6847,7 +6869,7 @@ fn test_recursive_finalization_applied_top_floor_skips_older_ancestor_callbacks(
     fixture.processor.on_candidate_received(mid_leader, mid_broadcast, None);
     let mid_block = fixture
         .processor
-        .candidate_book
+        .candidate_book()
         .received(&mid_id)
         .expect("mid ancestor must exist")
         .block_id
@@ -6862,7 +6884,7 @@ fn test_recursive_finalization_applied_top_floor_skips_older_ancestor_callbacks(
     fixture.processor.on_candidate_received(trigger_leader, trigger_broadcast, None);
     let trigger_block = fixture
         .processor
-        .candidate_book
+        .candidate_book()
         .received(&trigger_id)
         .expect("trigger must exist")
         .block_id
@@ -8234,7 +8256,7 @@ fn test_mc_empty_final_trigger_emits_callback_for_non_empty_ancestor_cpp_parity(
     fixture.processor.on_candidate_received(parent_leader, parent_broadcast, None);
     let parent_block = fixture
         .processor
-        .candidate_book
+        .candidate_book()
         .received(&parent_id)
         .expect("parent must exist")
         .block_id
@@ -8307,7 +8329,7 @@ fn test_mc_deep_empty_chain_delivers_finalcert_to_first_non_empty_ancestor() {
     fixture.processor.on_candidate_received(root_leader, root_broadcast, None);
     let root_block = fixture
         .processor
-        .candidate_book
+        .candidate_book()
         .received(&root_id)
         .expect("root must exist")
         .block_id
@@ -8320,8 +8342,13 @@ fn test_mc_deep_empty_chain_delivers_finalcert_to_first_non_empty_ancestor() {
         root_block.clone(),
     );
     fixture.processor.on_candidate_received(e1_leader, e1_broadcast, None);
-    let e1_block =
-        fixture.processor.candidate_book.received(&e1_id).expect("e1 must exist").block_id.clone();
+    let e1_block = fixture
+        .processor
+        .candidate_book()
+        .received(&e1_id)
+        .expect("e1 must exist")
+        .block_id
+        .clone();
 
     let (e2_leader, e2_id, e2_broadcast) = make_signed_empty_block_broadcast_with_parent(
         &fixture,
@@ -8381,7 +8408,7 @@ fn test_mc_walk_stops_after_cert_consumed_by_non_empty_block() {
     fixture.processor.on_candidate_received(parent_leader, parent_broadcast, None);
     let parent_block = fixture
         .processor
-        .candidate_book
+        .candidate_book()
         .received(&parent_id)
         .expect("parent must exist")
         .block_id

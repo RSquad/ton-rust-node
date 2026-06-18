@@ -580,7 +580,7 @@ impl SessionListener for SessionInstance {
     fn on_generate_slot(
         &self,
         source_info: simplex::BlockSourceInfo,
-        request: simplex::AsyncRequestPtr,
+        request: simplex::AsyncCollationRequestPtr,
         parent: consensus_common::CollationParentHint,
         callback: ValidatorBlockCandidateCallback,
     ) {
@@ -796,7 +796,7 @@ impl SessionListener for SessionInstanceListener {
     fn on_generate_slot(
         &self,
         source_info: simplex::BlockSourceInfo,
-        request: simplex::AsyncRequestPtr,
+        request: simplex::AsyncCollationRequestPtr,
         parent: consensus_common::CollationParentHint,
         callback: ValidatorBlockCandidateCallback,
     ) {

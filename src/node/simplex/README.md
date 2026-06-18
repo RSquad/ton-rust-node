@@ -1,6 +1,6 @@
 # Simplex Consensus Protocol
 
-**Version 1.0.0** (June 16, 2026) — [Changelog](CHANGELOG.md)
+**Version 1.1.0** (June 18, 2026) — [Changelog](CHANGELOG.md)
 
 Rust implementation of the [Simplex](https://github.com/ton-blockchain/simplex-docs)
 consensus protocol ("Catchain 2.0") for the TON blockchain. It is wire-compatible
@@ -9,7 +9,7 @@ with the upstream C++ implementation and runs in mixed Rust/C++ validator networ
 | Reference | Location |
 |---|---|
 | Protocol specification | [ton-blockchain/simplex-docs](https://github.com/ton-blockchain/simplex-docs) (`Simplex.md`) |
-| C++ parity baseline | [ton-blockchain/ton](https://github.com/ton-blockchain/ton) (`testnet/validator/consensus/simplex`) |
+| C++ parity baseline | [ton-blockchain/ton](https://github.com/ton-blockchain/ton) `master` @ [`8e6f0917`](https://github.com/ton-blockchain/ton/commit/8e6f09172dc95ba3d302cc52ccc3fa9169ef0760) (2026-05-31), `validator/consensus/simplex` — verified via mixed 5×5 Rust/C++ test (2026-06-18) |
 | Release history | [CHANGELOG.md](CHANGELOG.md) |
 | API reference | crate rustdoc — `cargo doc -p simplex --open` |
 
@@ -29,6 +29,19 @@ with the upstream C++ implementation and runs in mixed Rust/C++ validator networ
 - **Restart is state restoration only.** Startup replays persisted skip / final
   certificates and repairs the progress cursor before accepting live ingress;
   there are no historical replay callbacks.
+- **Window-bounded collation with empty fillers.** A leader runs a single
+  in-flight real collation across its leader window. Message intake is capped at
+  an absolute per-slot soft cutoff (`min(budget_anchor + cutoff_timeout_ms,
+  slot_start + target_rate)`, where the budget anchor is the dispatch instant)
+  while the hard budget is the leader-window end. Slots that elapse while the
+  collation is still running are covered by state-preserving empty fillers and a
+  late real block is re-tagged onto the current chain head; empties are suppressed
+  once consensus has not finalized within `no_empty_blocks_on_error_timeout` (C++
+  `allow_empty`). A genuine collation error recovers with one empty block or a
+  single fixed-backoff restart sharing the same window budget — there is no
+  configurable collation retry loop. The absolute deadlines and budget anchor
+  are exposed through `AsyncCollationRequest`; the shared `AsyncRequest` trait
+  remains generic so validation paths do not carry collation-only timing.
 - **State-resolver bridge.** `SimplexSession::ensure_candidate_available()`
   drives resolver-led repair, and every observed candidate is forwarded via
   `SessionListener::on_candidate_observed()` so the validator-side
@@ -96,29 +109,37 @@ consensus-common (Session/listener traits, overlay interfaces, compression)
 overlay / ADNL / QUIC (lower level, network)
 ```
 
-## Rust vs C++ reference: known differences
+## Parity state
 
-This crate targets wire-compatibility with the upstream **C++ Simplex** implementation in [ton-blockchain/ton](https://github.com/ton-blockchain/ton) (`testnet/validator/consensus/simplex`).
+Rust ↔ C++ parity against the verified baseline (`master` @ `8e6f0917`,
+2026-05-31; see the reference table above). All gaps below are non-blocking and
+do not affect on-wire compatibility at the default configuration.
 
-### Protocol parity gaps (from C++ upstream)
+### Protocol parity gaps (non-blocking)
 
-- External-aware collation pipeline — callback-driven external wait loop. **MEDIUM**
-- Block-sync overlay (C++ #2380 / #2382) — opt-in via `SessionOptions::enable_observers`; the simplex receiver already drops candidate broadcasts on the consensus overlay and computes the block-sync overlay short id (`compute_block_sync_overlay_short_id`), but the full dedicated-overlay candidate distribution is still being rolled out. **MEDIUM**
-- DB-CERT-INDEX follow-up: secondary index for `SimplexDb` cert lookups by `candidate_id` / `slot` to keep `load_*_by_id` / `load_skip_cert_by_slot` O(1) after the cert-storage consolidation. **MEDIUM**
+| Item | C++ ref | Status | Severity |
+|---|---|---|---|
+| External-aware collation pipeline (callback-driven external wait loop) | upstream | Rust uses a budget/deadline model; functional parity via collation-window-budget | MEDIUM |
+| Block-sync overlay (dedicated candidate distribution) | #2380 / #2382 | **opt-in** (`SessionOptions::enable_observers`, default off); receiver already drops consensus-overlay candidate broadcasts and computes the overlay short id (`compute_block_sync_overlay_short_id`) — full dedicated-overlay distribution still rolling out | MEDIUM |
+| DB-CERT-INDEX follow-up | — | secondary index for `SimplexDb` cert lookups by `candidate_id` / `slot` to keep `load_*_by_id` / `load_skip_cert_by_slot` O(1) after the cert-storage consolidation | MEDIUM |
 
-### Implementation parity gaps
+### Implementation parity gaps (optimization / non-wire)
 
-- C++ has `ImprovedStructureLZ4WithState` (BOC compression algo 2) — Rust only supports algos 0 and 1.
-- C++ has `StoreCellHint` for DB commit optimization during MerkleUpdate apply — Rust lacks equivalent.
-- C++ overlay manager can buffer messages for unknown overlays (disabled by default) — Rust lacks equivalent.
+| Item | Note |
+|---|---|
+| `ImprovedStructureLZ4WithState` (BOC compression algo 2) | Rust supports algos 0 and 1 only |
+| `StoreCellHint` (DB commit optimization during MerkleUpdate apply) | no Rust equivalent |
+| Overlay-manager buffering for unknown overlays (disabled by default in C++) | no Rust equivalent |
 
 ### Resolved parity work
 
 The full history of resolved C++ parity items — finalized-driven delivery,
 certificate-order durability, the bootstrap-deadlock fixes, the ghost-parent
 state resolver, DoS hardening, async-DB persistence, restart-recovery base
-repair, two-step FEC broadcast, QUIC transport, and more — is recorded in the
-[CHANGELOG](CHANGELOG.md).
+repair, the collation-window-budget timeout model (absolute soft/hard collation
+deadlines, a single in-flight collation with per-slot empty fillers and late
+re-tag, and the `allow_empty` gate), two-step FEC broadcast, QUIC transport, and
+more — is recorded in the [CHANGELOG](CHANGELOG.md).
 
 ## Architecture
 
@@ -199,8 +220,8 @@ flowchart TD
   net["network (ADNL / QUIC)"] --> rcv["Receiver + receiver_callbacks (SXRCV)"]
   rcv -->|"on_vote / on_certificate / on_candidate_received"| sp["SessionProcessor (SXMAIN coordinator)"]
   sp <-->|"drives / SimplexEvent"| fsm["SimplexState (FSM kernel)"]
-  sp -->|"with_*_backend seams"| ctrls["Phase controllers: Collation / Validation / Consensus"]
-  sp -->|accessors| aspects["Aspects: SessionRuntime / SessionTelemetry / CandidateBook / DatabaseController / SessionCallbacks"]
+  sp -->|"with_*_backend seams"| ctrls["Phase controllers: Collation / Validation / Consensus / Candidate"]
+  sp -->|accessors| aspects["Aspects: SessionRuntime / SessionTelemetry / DatabaseController / SessionCallbacks"]
   aspects -->|listener dispatch| listener["SessionListener (validator-manager)"]
   sp --> rcv
 ```
@@ -307,13 +328,14 @@ node/simplex/
 │   ├── collation_controller.rs # Phase controller: collation, precollation, empty-block recovery
 │   ├── validation_controller.rs# Phase controller: candidate-validation pipeline
 │   ├── consensus_controller.rs # Phase controller: vote/cert ingress+egress, finalization, MC top
+│   ├── candidate_controller.rs # Phase controller: candidate ingress, outbound repair, RequestCandidate serving
 │   ├── controller_queue.rs     # Re-entrancy-safe task-posting seam for controllers
 │   │
 │   ├── session_runtime.rs      # Aspect: runtime context (slot map, scheduler, bootstrap handles)
 │   ├── session_callbacks.rs    # Aspect: SessionListener dispatch (SXCB)
 │   ├── session_telemetry.rs    # Aspect: metrics + structured stall diagnostics
 │   ├── session_description.rs  # Aspect: immutable validator set, thresholds, leader schedule
-│   ├── candidate_book.rs       # Aspect: in-memory received-candidate + data caches
+│   ├── candidate_book.rs       # CandidateController's store: received-candidate + data caches
 │   ├── database_controller.rs  # Aspect: async-DB write registry + DB handle
 │   │
 │   ├── receiver.rs             # Network I/O (SXRCV): dedup, standstill, candidate resolver, peer-ban
@@ -420,6 +442,7 @@ reads coordinator state and applies effects only through its backend trait.
 | `CollationController` | [`collation_controller.rs`](src/collation_controller.rs) | Block generation, precollation pipeline, empty-block recovery, collation pacing |
 | `ValidationController` | [`validation_controller.rs`](src/validation_controller.rs) | The candidate-validation pipeline and missing-parent repair scheduling |
 | `ConsensusController` | [`consensus_controller.rs`](src/consensus_controller.rs) | Vote/cert ingress + outbound, FSM finalization handlers, the recursive finalization walk, MC applied-top tracking |
+| `CandidateController` | [`candidate_controller.rs`](src/candidate_controller.rs) | Candidate ingress (precheck → parse/verify → dedup → book/cache/DB persist) owning the `CandidateBook`, outbound `requestCandidate` repair + throttle, and the `RequestCandidate` serving fallback |
 
 ### Session aspects
 
@@ -430,7 +453,6 @@ coordinator.
 |---|---|---|
 | `SessionRuntime` | [`session_runtime.rs`](src/session_runtime.rs) | Slot map, delayed-action scheduler, wake horizon, bootstrap handles |
 | `SessionTelemetry` | [`session_telemetry.rs`](src/session_telemetry.rs) | Metric registration/dumps and the structured stall-diagnosis dump |
-| `CandidateBook` | [`candidate_book.rs`](src/candidate_book.rs) | Received candidates and candidate-data caches |
 | `DatabaseController` | [`database_controller.rs`](src/database_controller.rs) | Async-DB write registry and the DB handle |
 | `SessionCallbacks` | [`session_callbacks.rs`](src/session_callbacks.rs) | `SessionListener` dispatch (on the SXCB thread when enabled) |
 | `SessionDescription` | [`session_description.rs`](src/session_description.rs) | Immutable validator set, weights, thresholds, leader schedule, replay clock |
@@ -596,12 +618,10 @@ Immutable per-session configuration ([`src/lib.rs`](src/lib.rs)), validated by
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `collation_retry_timeout` | `Duration` | `500ms` | Delay between collation retries |
-| `collation_retry_max_attempts` | `u32` | `3` | Max collation retries (0 = none) |
 | `validation_retry_attempts` | `u32` | `0` | Validation retry attempts (0 = none) |
 | `validation_retry_timeout` | `Duration` | `1s` | Delay between validation retries |
 | `empty_block_mc_lag_threshold` | `Option<u32>` | `None` | Shard empty-block MC lag threshold; must be `None` for masterchain |
-| `no_empty_blocks_on_error_timeout` | `Duration` | `15s` | Suppress empty blocks after a failed collation (C++ parity) |
+| `no_empty_blocks_on_error_timeout` | `Duration` | `15s` | Empty-filler suppression: stop emitting empty blocks once consensus has not finalized for this long (C++ `allow_empty`) |
 
 **Candidate resolver & standstill**
 
@@ -683,8 +703,11 @@ impl SessionListener for MyListener {
         // Call callback with decision
     }
 
-    fn on_generate_slot(&self, source_info, request, callback) {
+    fn on_generate_slot(&self, source_info, request, parent, callback) {
         // Generate new block when we're leader
+        // `request` is an AsyncCollationRequestPtr: cancellation + optional
+        // absolute collation deadlines/budget anchor for Simplex.
+        // `parent` is an explicit Simplex parent hint or an implicit Catchain hint.
         // Call callback with block candidate
     }
 
@@ -704,7 +727,7 @@ impl SessionListener for MyListener {
 
 ## Tests
 
-**Total: 750 tests + 6 doctests** — 734 unit (`cargo test -p simplex --lib`),
+**Total: 793 tests + 6 doctests** — 777 unit (`cargo test -p simplex --lib`),
 16 integration (`cargo test -p simplex --tests`), and 6 illustrative doctests
 (`cargo test -p simplex --doc`, all marked `ignore`).
 
@@ -783,6 +806,7 @@ Crate-private unit tests with access to internal symbols.
 | `test_receiver.rs` | Receiver behavior, standstill cache, certificate send/receive, candidate resolver flow |
 | `test_candidate_resolver.rs` | CandidateResolverCache unit tests (late-joiner repair) |
 | `test_session_processor.rs` | SessionProcessor unit tests (manual clock, delayed actions, scheduling, finalized delivery) |
+| `test_collation_controller.rs` | Collation controller policy: `prepare_collation` timing, absolute soft/hard `collation_deadlines`, single in-flight guard, per-slot deadline wake (filler / staleness suppression / re-arm / stale-wake no-op), late re-tag, `allow_empty` gate, genuine-error recovery / single-restart with pinned deadlines, and stale-window `block_generation_active` cleanup |
 | `test_restart.rs` | Restart byte-level tests (crate-private) |
 | `test_simplex_state.rs` | FSM logic + invariants (included via `#[path]`) |
 | `test_slot_bounds.rs` | Slot bounds validation |
@@ -894,7 +918,7 @@ All metrics use the `simplex_` prefix. Latency histograms use `time:` prefix (va
 | `simplex_candidate_relayed_broadcast` | Candidate broadcasts relayed to peers | candidate relay |
 | `simplex_candidate_precheck_drop_old_slot` / `_future_slot` / `_conflicting_slot` | Candidate ingress precheck drops | candidate precheck |
 | `simplex_generated_candidate_validation_missed` | Locally generated candidates that missed self-validation | collation watch |
-| `simplex_collation_starts` | Unified collation entry attempts across async, retry, precollated, and empty-block paths | `check_collation()`, `invoke_collation()` |
+| `simplex_collation_starts` | Unified collation entry attempts across async, restart, precollated, and empty-block paths | `check_collation()`, `invoke_collation()` |
 | `simplex_precollation_requests` | Precollation requests sent | precollation |
 | `simplex_precollation_results` | Precollation results received | precollation |
 | `simplex_async_db_timeout_total` | Async DB persist continuations that hit their deadline | `process_pending_async_db_results()` |
@@ -1220,7 +1244,7 @@ counter and gauge.
 ## References
 
 - Protocol specification: [ton-blockchain/simplex-docs](https://github.com/ton-blockchain/simplex-docs) (`Simplex.md`)
-- C++ implementation (parity baseline): [ton-blockchain/ton](https://github.com/ton-blockchain/ton) (`testnet/validator/consensus/simplex`)
+- C++ implementation (parity baseline): [ton-blockchain/ton](https://github.com/ton-blockchain/ton) `master` @ [`8e6f0917`](https://github.com/ton-blockchain/ton/commit/8e6f09172dc95ba3d302cc52ccc3fa9169ef0760) (2026-05-31), `validator/consensus/simplex`
 - Release history: [CHANGELOG.md](CHANGELOG.md)
 - Crate API reference: `cargo doc -p simplex --open`
 - Source map: [Package Structure](#package-structure) and [Components](#components)

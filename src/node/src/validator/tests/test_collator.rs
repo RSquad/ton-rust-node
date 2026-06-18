@@ -27,7 +27,7 @@ use pretty_assertions::assert_eq;
 use std::{
     fs::{create_dir_all, remove_dir_all},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use storage::{
     block_handle_db::{BlockHandle, BlockHandleStorage},
@@ -50,6 +50,101 @@ fn test_cycle_vec() {
     assert_eq!(vec.move_next(), Some(&1));
     vec.remove_current();
     assert_eq!(vec.move_next(), None);
+}
+
+#[test]
+fn soft_cutoff_clamps_to_cutoff_timeout() {
+    // Deadline far away (~whole leader window): bound the soft cutoff to
+    // `start + cutoff_timeout_ms` so intake never stretches to the window end.
+    let start = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    let soft = start + Duration::from_millis(9_600);
+    assert_eq!(
+        effective_soft_cutoff(Some(soft), Some(start), 1_500),
+        Some(start + Duration::from_millis(1_500)),
+    );
+}
+
+#[test]
+fn soft_cutoff_uses_deadline_when_sooner() {
+    // Deadline closer than `cutoff_timeout_ms`: fire at the deadline, leaving the rest of
+    // the window for notarization/finalization.
+    let start = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    let soft = start + Duration::from_millis(800);
+    assert_eq!(effective_soft_cutoff(Some(soft), Some(start), 1_500), Some(soft),);
+}
+
+#[test]
+fn soft_cutoff_without_deadline_uses_cutoff_from_start() {
+    let start = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    assert_eq!(
+        effective_soft_cutoff(None, Some(start), 1_500),
+        Some(start + Duration::from_millis(1_500)),
+    );
+}
+
+#[test]
+fn soft_cutoff_without_start_falls_back() {
+    // No `start` anchor (catchain/tests): caller uses the monotonic static budget instead.
+    let t = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    assert_eq!(effective_soft_cutoff(Some(t), None, 1_500), None);
+    assert_eq!(effective_soft_cutoff(None, None, 1_500), None);
+}
+
+#[test]
+fn cutoff_budget_shard_soft_equals_slot_start_is_nonzero() {
+    // Shard regression: the soft deadline equals the slot start and the request is
+    // dispatched `target_rate` early, so the budget anchor precedes the soft deadline.
+    // The scaling budget must be that early-dispatch lead (`target_rate`), not zero -
+    // anchoring at the slot start instead collapsed every shard sub-budget to 0.
+    let slot_start = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    let target_rate = Duration::from_millis(2_400);
+    let anchor = slot_start - target_rate;
+    assert_eq!(
+        effective_cutoff_budget_ms(Some(slot_start), Some(anchor), 9_600),
+        2_400,
+        "shard budget should be the early-dispatch lead, never zero",
+    );
+    // Degenerate anchor == soft (the old slot-start anchoring) is what produced the zero
+    // budget; documented here so the plumbing keeps anchoring at the earlier dispatch.
+    assert_eq!(effective_cutoff_budget_ms(Some(slot_start), Some(slot_start), 9_600), 0);
+}
+
+#[test]
+fn cutoff_budget_clamped_by_static_cutoff() {
+    // Masterchain-style: soft deadline a full slot out, but the scaling budget is bounded
+    // by the static `cutoff_timeout_ms` so it tracks one slot, not the whole window.
+    let anchor = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    let soft = anchor + Duration::from_millis(9_600);
+    assert_eq!(effective_cutoff_budget_ms(Some(soft), Some(anchor), 1_500), 1_500);
+}
+
+#[test]
+fn cutoff_budget_without_anchor_uses_static_fallback() {
+    // No simplex anchor (catchain/tests): fall back to the static budget regardless of
+    // any soft deadline that may be present.
+    assert_eq!(effective_cutoff_budget_ms(None, None, 1_500), 1_500);
+    let soft = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    assert_eq!(effective_cutoff_budget_ms(Some(soft), None, 1_500), 1_500);
+}
+
+#[test]
+fn external_finish_clamped_to_soft_cutoff_on_late_start() {
+    // Late start: `now` is already close to the soft cutoff, so the fractional budget added
+    // on top would overshoot it. The finish time must be clamped down to the soft cutoff.
+    let soft_ms = 100_000;
+    assert_eq!(
+        external_messages_finish_ms(99_800, 2_400, 750, Some(soft_ms)),
+        soft_ms,
+        "late-start external intake must not extend past the absolute soft cutoff",
+    );
+    // Early start with headroom: the fractional budget applies unclamped.
+    assert_eq!(external_messages_finish_ms(90_000, 2_400, 750, Some(soft_ms)), 91_800);
+}
+
+#[test]
+fn external_finish_without_soft_cutoff_is_unclamped() {
+    // No simplex soft cutoff (catchain/tests): keep the monotonic fractional budget.
+    assert_eq!(external_messages_finish_ms(99_800, 2_400, 750, None), 101_600);
 }
 
 struct TestPipelineCollatorEngine {

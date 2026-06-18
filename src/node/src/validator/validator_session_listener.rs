@@ -9,7 +9,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use super::consensus::{
-    get_elapsed_time, AsyncRequestPtr, BlockHash, BlockPayloadPtr, BlockSourceInfo,
+    get_elapsed_time, AsyncCollationRequestPtr, BlockHash, BlockPayloadPtr, BlockSourceInfo,
     CandidateObservedFlags, CollationParentHint, ConsensusReplayListener, PublicKey, PublicKeyHash,
     SessionId, SessionListener, SessionStats, ValidatorBlockCandidateCallback,
     ValidatorBlockCandidateDecisionCallback,
@@ -48,7 +48,7 @@ pub enum ValidationAction {
     },
     OnGenerateSlot {
         source_info: BlockSourceInfo,
-        request: AsyncRequestPtr,
+        request: AsyncCollationRequestPtr,
         parent: CollationParentHint,
         callback: ValidatorBlockCandidateCallback,
     },
@@ -211,7 +211,7 @@ impl SessionListener for ValidatorSessionListener {
     fn on_generate_slot(
         &self,
         source_info: BlockSourceInfo,
-        request: AsyncRequestPtr,
+        request: AsyncCollationRequestPtr,
         parent: CollationParentHint,
         callback: ValidatorBlockCandidateCallback,
     ) {

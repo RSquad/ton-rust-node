@@ -20,6 +20,7 @@ use ton_block::{
     signature::SigPubKey, validators::ValidatorDescr, Ed25519KeyOption, KeyId, Serializable,
     ZeroizingBytes,
 };
+use validator_session::AsyncRequest;
 
 #[derive(Default)]
 struct DummyEngine;
@@ -232,6 +233,103 @@ async fn test_on_candidate_observed_caches_observation_when_body_deserialize_fai
     assert!(entry.data.is_none(), "invalid body must not be stored");
     assert!(entry.flags.body_present, "body_present flag must be preserved");
     assert!(entry.flags.parent_ready, "parent_ready flag must be preserved");
+}
+
+/// A catchain group so `on_generate_slot` reaches the shared `is_collating`
+/// compare-and-swap guard without taking the simplex parent-availability path
+/// (which a simplex group would require an `Explicit` parent and a wired resolver
+/// backend for). Construction mirrors [`make_simplex_group_for_resolver_tests`].
+fn make_catchain_group_for_cas_tests() -> Arc<ValidatorGroup> {
+    let local_key: PrivateKey =
+        Ed25519KeyOption::<ZeroizingBytes>::generate().expect("key must be generated");
+    let validator_descr = ValidatorDescr::with_params(
+        SigPubKey::from_bytes(local_key.pub_key().expect("pubkey bytes"))
+            .expect("valid sig pubkey"),
+        1,
+        None,
+    );
+    let validator_set =
+        ValidatorSet::with_cc_seqno(0, 0, 0, 1, vec![validator_descr]).expect("validator set");
+    let session_info = Arc::new(GeneralSessionInfo {
+        shard: ShardIdent::masterchain(),
+        opts_hash: UInt256::default(),
+        catchain_seqno: 1,
+        key_seqno: 0,
+        max_vertical_seqno: 0,
+    });
+    let group = ValidatorGroup::new(
+        session_info,
+        local_key,
+        UInt256::rand(),
+        UInt256::rand(),
+        validator_set,
+        0,
+        ConsensusOptions::Catchain(Default::default()),
+        Arc::new(DummyEngine),
+        false,
+        None,
+    );
+    Arc::new(group)
+}
+
+/// Non-cancelled [`AsyncCollationRequest`] mock: `on_generate_slot` only reads its id /
+/// cancelled flag / creation time before reaching the guard under test (collation
+/// deadlines inherit the trait defaults).
+struct CasDummyRequest;
+
+impl AsyncRequest for CasDummyRequest {
+    fn cancel(&self) {}
+    fn get_request_id(&self) -> u32 {
+        0
+    }
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+    fn get_creation_time(&self) -> SystemTime {
+        SystemTime::UNIX_EPOCH
+    }
+}
+
+impl validator_session::AsyncCollationRequest for CasDummyRequest {}
+
+/// `on_generate_slot` must not silently drop a collation request when the
+/// single-collation guard is already held. Under simplex the callback is the only
+/// signal back to the `CollationController`, so a dropped request would strand its
+/// `block_generation_active` marker and wedge the pipeline. When the `is_collating`
+/// CAS fails, the request is reported as failed through the callback and the guard
+/// belonging to the in-flight collation is left untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn on_generate_slot_reports_error_when_already_collating() {
+    let group = make_catchain_group_for_cas_tests();
+
+    // A collation pipeline is already running: the CAS check must fail.
+    group.is_collating.store(true, Ordering::Relaxed);
+
+    let source = Ed25519KeyOption::<ZeroizingBytes>::generate().expect("generate key");
+    let source_info = validator_session::BlockSourceInfo {
+        source,
+        priority: consensus_common::BlockCandidatePriority {
+            round: 0,
+            priority: 0,
+            first_block_round: 0,
+        },
+    };
+    let request: validator_session::AsyncCollationRequestPtr = Arc::new(CasDummyRequest);
+
+    let outcome = Arc::new(Mutex::new(None));
+    let sink = outcome.clone();
+    let callback: ValidatorBlockCandidateCallback = Box::new(move |res| {
+        *sink.lock().expect("callback sink poisoned") = Some(res.is_err());
+    });
+
+    group.on_generate_slot(source_info, request, CollationParentHint::Implicit, callback).await;
+
+    assert_eq!(
+        *outcome.lock().expect("callback sink poisoned"),
+        Some(true),
+        "a CAS failure must report the request as failed through the callback, not drop it"
+    );
+    assert!(group.is_collating(), "the CAS failure must not reset the in-flight collation's guard");
 }
 
 #[test]

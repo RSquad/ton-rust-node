@@ -257,7 +257,7 @@ impl TraceCollector {
 
     /// Record session identity event (emitted once at session start).
     ///
-    /// C++ reference: `simplex/pool.cpp:317`
+    /// C++ reference: `simplex/pool.cpp`
     pub(crate) fn record_id(
         &self,
         session_id: &SessionId,
@@ -278,7 +278,12 @@ impl TraceCollector {
             max_collated_data_size: opts.max_collated_data_size as i32,
             standstill_timeout_ms: duration_to_ms_i32(opts.standstill_timeout),
             validation_retry_attempts: opts.validation_retry_attempts as i32,
-            collation_retry_max_attempts: opts.collation_retry_max_attempts as i32,
+            // The configurable collation retry loop was removed (the
+            // `collation_retry_max_attempts` SessionOptions field no longer exists);
+            // a genuine collation error now recovers with an empty block or a single
+            // fixed-backoff restart. This telemetry field is retained for wire
+            // compatibility and reported as 0 (no configured retry attempts).
+            collation_retry_max_attempts: 0,
             use_quic: opts.use_quic.into(),
         };
 
@@ -298,7 +303,7 @@ impl TraceCollector {
 
     /// Record collation started event.
     ///
-    /// C++ reference: `block-producer.cpp:115`
+    /// C++ reference: `block-producer.cpp`
     pub(crate) fn record_collate_started(&self, session_id: &SessionId, slot: SlotIndex) {
         let event = stats::event::CollateStarted { target_slot: slot.value() as i32 };
         self.record(session_id, event.into_boxed());
@@ -306,7 +311,7 @@ impl TraceCollector {
 
     /// Record collation finished event (normal block).
     ///
-    /// C++ reference: `block-producer.cpp:139`
+    /// C++ reference: `block-producer.cpp`
     pub(crate) fn record_collate_finished(
         &self,
         session_id: &SessionId,
@@ -322,7 +327,7 @@ impl TraceCollector {
 
     /// Record empty block collated event.
     ///
-    /// C++ reference: `block-producer.cpp:108`
+    /// C++ reference: `block-producer.cpp`
     pub(crate) fn record_collated_empty(&self, session_id: &SessionId, id: &CandidateId) {
         let event = stats::event::CollatedEmpty { id: make_tl_candidate_id(id) };
         self.record(session_id, event.into_boxed());
@@ -330,7 +335,7 @@ impl TraceCollector {
 
     /// Record candidate received event (from collator or network).
     ///
-    /// C++ reference: `block-producer.cpp:154` (collator), `private-overlay.cpp:182` (network)
+    /// C++ reference: `block-producer.cpp` (collator), `private-overlay.cpp` (network)
     pub(crate) fn record_candidate_received(
         &self,
         session_id: &SessionId,
@@ -368,7 +373,7 @@ impl TraceCollector {
 
     /// Record validation started event.
     ///
-    /// C++ reference: `block-validator.cpp:29`
+    /// C++ reference: `block-validator.cpp`
     pub(crate) fn record_validation_started(&self, session_id: &SessionId, id: &CandidateId) {
         let event = stats::event::ValidationStarted { id: make_tl_candidate_id(id) };
         self.record(session_id, event.into_boxed());
@@ -376,7 +381,7 @@ impl TraceCollector {
 
     /// Record validation finished event.
     ///
-    /// C++ reference: `block-validator.cpp:55`
+    /// C++ reference: `block-validator.cpp`
     pub(crate) fn record_validation_finished(&self, session_id: &SessionId, id: &CandidateId) {
         let event = stats::event::ValidationFinished { id: make_tl_candidate_id(id) };
         self.record(session_id, event.into_boxed());
@@ -384,7 +389,7 @@ impl TraceCollector {
 
     /// Record block accepted event.
     ///
-    /// C++ reference: `block-accepter.cpp:42`
+    /// C++ reference: `block-accepter.cpp`
     pub(crate) fn record_block_accepted(&self, session_id: &SessionId, id: &CandidateId) {
         let event = stats::event::BlockAccepted { id: make_tl_candidate_id(id) };
         self.record(session_id, event.into_boxed());
@@ -392,7 +397,7 @@ impl TraceCollector {
 
     /// Record voted event (we broadcast a vote).
     ///
-    /// C++ reference: `simplex/pool.cpp:540`
+    /// C++ reference: `simplex/pool.cpp`
     pub(crate) fn record_voted(&self, session_id: &SessionId, vote: &Vote) {
         if let Some(unsigned_vote) = vote_to_tl_unsigned(vote) {
             let event = stats::consensus::simplex::stats::event::Voted { vote: unsigned_vote };
@@ -402,7 +407,7 @@ impl TraceCollector {
 
     /// Record certificate observed event (notarize or finalize threshold reached).
     ///
-    /// C++ reference: `simplex/pool.cpp:708-744`
+    /// C++ reference: `simplex/pool.cpp`
     pub(crate) fn record_cert_observed(&self, session_id: &SessionId, vote: &Vote) {
         if let Some(unsigned_vote) = vote_to_tl_unsigned(vote) {
             let event =

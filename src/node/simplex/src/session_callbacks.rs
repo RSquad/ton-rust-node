@@ -33,8 +33,8 @@
 
 use crate::{
     task_queue::{post_callback_closure, CallbackTaskQueuePtr},
-    AsyncRequestPtr, BlockHash, BlockPayloadPtr, BlockSourceInfo, MetricsHandle, PublicKeyHash,
-    SessionId, SessionListenerPtr, ValidatorBlockCandidateCallback,
+    AsyncCollationRequestPtr, BlockHash, BlockPayloadPtr, BlockSourceInfo, MetricsHandle,
+    PublicKeyHash, SessionId, SessionListenerPtr, ValidatorBlockCandidateCallback,
     ValidatorBlockCandidateDecisionCallback,
 };
 use consensus_common::{check_execution_time, CandidateObservedFlags, CollationParentHint};
@@ -249,7 +249,7 @@ impl SessionCallbacks {
     pub(crate) fn notify_generate_slot(
         &self,
         source_info: BlockSourceInfo,
-        request: AsyncRequestPtr,
+        request: AsyncCollationRequestPtr,
         parent_hint: CollationParentHint,
         callback: ValidatorBlockCandidateCallback,
     ) {

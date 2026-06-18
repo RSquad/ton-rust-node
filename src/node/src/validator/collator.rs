@@ -46,7 +46,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use ton_block::{
     error, fail, Account, AccountDispatchQueue, AccountId, AccountStorageDictProof, AddSub,
@@ -265,7 +265,7 @@ struct CollatorData {
     rejected_ext_messages: Vec<UInt256>,
     usage_tree: UsageTree,
     external_messages: Vec<(Arc<Message>, UInt256)>, // for bundle in case of error
-    imported_visited: ahash::AHashSet<UInt256>,
+    imported_visited: Option<Arc<ahash::AHashSet<UInt256>>>,
     last_dispatch_queue_emitted_lt: HashMap<AccountId, u64>,
     unprocessed_deferred_messages: HashMap<AccountId, usize>, // number of messages from dispatch queue in new_msgs
     sender_generated_messages_count: HashMap<AccountId, usize>,
@@ -346,7 +346,7 @@ impl CollatorData {
             rejected_ext_messages: Default::default(),
             usage_tree,
             external_messages: Vec::new(),
-            imported_visited: ahash::AHashSet::default(),
+            imported_visited: None,
             unprocessed_deferred_messages: HashMap::new(),
             sender_generated_messages_count: HashMap::new(),
             last_dispatch_queue_emitted_lt: HashMap::new(),
@@ -1875,7 +1875,7 @@ impl Collator {
             // delete delivered messages from output queue for a limited time
             let now = Instant::now();
             let cc = self.engine.collator_config();
-            let clean_timeout_nanos = (cc.cutoff_timeout_ms as i128)
+            let clean_timeout_nanos = (self.effective_cutoff_timeout_ms() as i128)
                 * 1_000_000
                 * (cc.clean_timeout_percentage_points as i128)
                 / 1000;
@@ -2566,7 +2566,8 @@ impl Collator {
             prev_chain,
             collator_data.config.has_capability(GlobalCapabilities::CapFullCollatedData),
         )?;
-        MsgQueueManager::init(
+        let mut imported_visited = ahash::AHashSet::new();
+        let msg_queue_manager = MsgQueueManager::init(
             &self.engine,
             mc_data.state(),
             self.shard.clone(),
@@ -2578,11 +2579,14 @@ impl Collator {
             self.after_split,
             Some(&self.stop_flag),
             Some(&collator_data.usage_tree),
-            Some(&mut collator_data.imported_visited),
+            Some(&mut imported_visited),
             Some(self.collated_block_descr.clone()),
             states_manager,
         )
-        .await
+        .await?;
+        collator_data.imported_visited = Some(Arc::new(imported_visited));
+
+        Ok(msg_queue_manager)
     }
 
     fn adjust_shard_config(
@@ -3402,7 +3406,7 @@ impl Collator {
                     log::warn!(
                         "{}: TIMEOUT ({}ms) is elapsed, stop processing internal messages",
                         self.collated_block_descr,
-                        self.engine.collator_config().cutoff_timeout_ms
+                        self.effective_cutoff_timeout_ms()
                     );
                     collator_data.register_dispatch_queue_op(true)?;
                     break;
@@ -3653,7 +3657,7 @@ impl Collator {
                 log::warn!(
                     "{}: TIMEOUT ({}ms) is elapsed, stop processing internal messages",
                     self.collated_block_descr,
-                    self.engine.collator_config().cutoff_timeout_ms
+                    self.effective_cutoff_timeout_ms()
                 );
                 break;
             }
@@ -4330,8 +4334,10 @@ impl Collator {
         // Self::_check_visited_integrity(&prev_data.state_root, &visited, &mut visited_from_root);
         // assert_eq!(visited.len(), visited_from_root.len());
 
-        let state_update =
-            self.create_merkle_update(prev_data, collator_data, &new_ss_root).inspect_err(|e| {
+        let state_update = self
+            .create_merkle_update(prev_data, collator_data, &new_ss_root)
+            .await
+            .inspect_err(|e| {
                 log::error!("{}: create_merkle_update {:?}", self.collated_block_descr, e);
             })?;
 
@@ -4526,7 +4532,7 @@ impl Collator {
         Ok(())
     }
 
-    fn create_merkle_update(
+    async fn create_merkle_update(
         &self,
         prev_data: &PrevData,
         collator_data: &CollatorData,
@@ -4543,23 +4549,29 @@ impl Collator {
             self.collator_settings.is_bundle || self.collator_settings.requires_real_state_update;
         #[cfg(not(test))]
         let need_full_state_update = true;
-        let state_update;
-        if need_full_state_update {
+        if !need_full_state_update {
+            return Ok(MerkleUpdate::default());
+        }
+
+        let prev_state_root = prev_data.state_root.clone();
+        let new_ss_root = new_ss_root.clone();
+        let usage_tree = collator_data.usage_tree.clone();
+        let imported_visited = collator_data.imported_visited.clone();
+        let collated_block_descr = self.collated_block_descr.clone();
+        let state_update = tokio::task::spawn_blocking(move || -> Result<MerkleUpdate> {
             let now = Instant::now();
-            state_update = MerkleUpdate::create_fast(&prev_data.state_root, new_ss_root, |h| {
-                collator_data.usage_tree.contains(h) || collator_data.imported_visited.contains(h)
+            let state_update = MerkleUpdate::create_fast(&prev_state_root, &new_ss_root, |h| {
+                usage_tree.contains(h) || imported_visited.as_ref().is_some_and(|v| v.contains(h))
             })?;
             log::trace!(
                 "{}: TIME: merkle update creating {}ms;",
-                self.collated_block_descr,
+                collated_block_descr,
                 now.elapsed().as_millis()
             );
-        } else {
-            state_update = MerkleUpdate::default();
-        }
-
-        // let new_root2 = state_update.apply_for(&prev_data.state_root)?;
-        // assert_eq!(new_root2.repr_hash(), new_ss_root.repr_hash());
+            Ok(state_update)
+        })
+        .await
+        .map_err(|e| error!("create_merkle_update join error: {}", e))??;
 
         Ok(state_update)
     }
@@ -5095,21 +5107,40 @@ impl Collator {
 
     fn init_timeout(&mut self) {
         self.started = Instant::now();
+        let cc = self.engine.collator_config();
+        let now = self.now_system();
 
-        let stop_deadline = Instant::now()
-            + Duration::from_millis(self.engine.collator_config().stop_timeout_ms as u64);
-        let stop_flag = self.stop_flag.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep_until(stop_deadline.into()).await;
-            stop_flag.cancel();
-        });
-
-        let cutoff_deadline = Instant::now()
-            + Duration::from_millis(self.engine.collator_config().cutoff_timeout_ms as u64);
+        // SOFT cutoff -> cancel_ext: stop message intake, let the collation finalize
+        // (C++ `soft_timeout`). Fire at `min(budget_anchor + cutoff_timeout_ms,
+        // soft_deadline)` (see `effective_soft_cutoff`): the static cutoff bounds intake to
+        // ~one slot so it never stretches to the window end, while the absolute simplex
+        // soft deadline pulls it in earlier when the window boundary is close. Absolute, so
+        // collator-init latency and a pinned restart of the same slot cannot shift when it
+        // fires.
+        let cutoff_delay = match effective_soft_cutoff(
+            self.collator_settings.soft_deadline,
+            self.collator_settings.collation_budget_anchor,
+            cc.cutoff_timeout_ms as u64,
+        ) {
+            Some(cutoff_at) => cutoff_at.duration_since(now).unwrap_or_default(),
+            None => Duration::from_millis(cc.cutoff_timeout_ms as u64),
+        };
         let cancel_ext = self.cancel_ext.clone();
         tokio::spawn(async move {
-            tokio::time::sleep_until(cutoff_deadline.into()).await;
+            tokio::time::sleep(cutoff_delay).await;
             cancel_ext.cancel();
+        });
+
+        // HARD cap -> stop_flag: `check_stop_flag()` then fails the whole collation
+        // (C++ `hard_timeout` -> `alarm()` -> `fatal_error`).
+        let stop_delay = match self.collator_settings.hard_deadline {
+            Some(hard) => hard.duration_since(now).unwrap_or_default(),
+            None => Duration::from_millis(cc.stop_timeout_ms as u64),
+        };
+        let stop_flag = self.stop_flag.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(stop_delay).await;
+            stop_flag.cancel();
         });
     }
 
@@ -5117,27 +5148,76 @@ impl Collator {
         self.cancel_ext.is_cancelled()
     }
 
+    /// Engine wall-clock `now` as `SystemTime`, matching the clock of the absolute
+    /// deadlines and `AsyncRequest::get_creation_time()`.
+    fn now_system(&self) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_millis(self.engine.now_ms())
+    }
+
+    /// Total SOFT (message-intake) budget in ms used to size the percentage-based
+    /// sub-budgets (out-queue clean, external-message intake): `min(cutoff_timeout_ms,
+    /// soft_deadline - budget_anchor)` (see `effective_soft_cutoff`). Measured from the
+    /// budget anchor (the dispatch instant), NOT the slot start, so for shardchains —
+    /// where the soft deadline equals the slot start — the window is the early-dispatch
+    /// lead (`target_rate`) rather than zero. Falls back to the static `cutoff_timeout_ms`
+    /// without a simplex budget anchor (catchain/tests).
+    fn effective_cutoff_timeout_ms(&self) -> u64 {
+        effective_cutoff_budget_ms(
+            self.collator_settings.soft_deadline,
+            self.collator_settings.collation_budget_anchor,
+            self.engine.collator_config().cutoff_timeout_ms as u64,
+        )
+    }
+
     fn get_remaining_cutoff_time_limit_nanos(&self) -> i128 {
-        let cutoff_timeout_nanos =
-            self.engine.collator_config().cutoff_timeout_ms as i128 * 1_000_000;
-        let elapsed_nanos = self.started.elapsed().as_nanos() as i128;
-        cutoff_timeout_nanos - elapsed_nanos
+        let cc = self.engine.collator_config();
+        match effective_soft_cutoff(
+            self.collator_settings.soft_deadline,
+            self.collator_settings.collation_budget_anchor,
+            cc.cutoff_timeout_ms as u64,
+        ) {
+            // Time left until the effective soft cutoff (negative once it is exceeded).
+            Some(cutoff_at) => match cutoff_at.duration_since(self.now_system()) {
+                Ok(remaining) => remaining.as_nanos() as i128,
+                Err(overshoot) => -(overshoot.duration().as_nanos() as i128),
+            },
+            // Catchain/tests: static budget minus monotonic elapsed since start.
+            None => {
+                let cutoff_timeout_nanos = cc.cutoff_timeout_ms as i128 * 1_000_000;
+                cutoff_timeout_nanos - self.started.elapsed().as_nanos() as i128
+            }
+        }
     }
 
     fn get_remaining_clean_time_limit_nanos(&self) -> i128 {
         let remaining_cutoff_timeout_nanos = self.get_remaining_cutoff_time_limit_nanos();
         let cc = self.engine.collator_config();
-        let max_secondary_clean_timeout_nanos = (cc.cutoff_timeout_ms as i128)
+        let max_secondary_clean_timeout_nanos = (self.effective_cutoff_timeout_ms() as i128)
             * 1_000_000
             * (cc.max_secondary_clean_timeout_percentage_points as i128)
             / 1000;
         remaining_cutoff_timeout_nanos.min(max_secondary_clean_timeout_nanos)
     }
 
+    /// Absolute effective soft cutoff as engine unix-ms, or `None` without a simplex
+    /// budget anchor (catchain/tests). Same instant `cancel_ext` is armed for.
+    fn effective_soft_cutoff_ms(&self) -> Option<u64> {
+        effective_soft_cutoff(
+            self.collator_settings.soft_deadline,
+            self.collator_settings.collation_budget_anchor,
+            self.engine.collator_config().cutoff_timeout_ms as u64,
+        )
+        .map(|t| t.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis() as u64)
+    }
+
     fn get_external_messages_finish_time_micros(&self) -> u64 {
-        let now = self.engine.now_ms();
         let cc = self.engine.collator_config();
-        now + (cc.cutoff_timeout_ms * cc.external_messages_timeout_percentage_points / 1000) as u64
+        external_messages_finish_ms(
+            self.engine.now_ms(),
+            self.effective_cutoff_timeout_ms(),
+            cc.external_messages_timeout_percentage_points as u64,
+            self.effective_soft_cutoff_ms(),
+        )
     }
 
     fn check_stop_flag(&self) -> Result<()> {
@@ -5319,7 +5399,13 @@ impl Collator {
             for state in prev_states {
                 let proof = MerkleProof::create_with_subtrees(
                     &state,
-                    |hash| stat.is_loaded(hash) || collator_data.imported_visited.contains(hash),
+                    |hash| {
+                        stat.is_loaded(hash)
+                            || collator_data
+                                .imported_visited
+                                .as_ref()
+                                .is_some_and(|v| v.contains(hash))
+                    },
                     |hash| roots_to_include.contains(hash),
                 )?;
                 roots.push(proof.serialize()?);
@@ -5362,6 +5448,77 @@ fn test_count_bits_u64() {
             "test case: {}",
             test_case
         );
+    }
+}
+
+/// Effective absolute SOFT cutoff instant for message intake: the earlier of
+/// `budget_anchor + cutoff_timeout_ms` and the simplex `soft` deadline
+/// (`min(cutoff, deadline)`).
+///
+/// Bounding by the static `cutoff_timeout_ms` keeps intake to roughly one slot (C++
+/// `soft_timeout = slot_start + target_rate` in block-producer.cpp) so it can never
+/// stretch to the whole leader window; the window's remaining time is left for
+/// notarization/finalization. C++ does not subtract a margin from a window-end deadline:
+/// it keeps the expensive collation running past the slot up to a generous `hard_timeout`
+/// (`slot_start + max(3*target_rate, 60s)`) and fills the intervening slots with empty
+/// blocks. `budget_anchor` is the dispatch instant (shardchains dispatch `target_rate`
+/// before the slot start, the masterchain at the slot start); anchoring here — not at the
+/// slot start — keeps the intake window non-zero for shardchains and lets a pinned restart
+/// of the same slot share one absolute cutoff. Returns `None` without a `budget_anchor`
+/// (catchain/tests), where the caller falls back to a monotonic `cutoff_timeout_ms`
+/// budget.
+fn effective_soft_cutoff(
+    soft: Option<SystemTime>,
+    budget_anchor: Option<SystemTime>,
+    cutoff_timeout_ms: u64,
+) -> Option<SystemTime> {
+    let budget_anchor = budget_anchor?;
+    let by_cutoff = budget_anchor + Duration::from_millis(cutoff_timeout_ms);
+    Some(match soft {
+        Some(soft) => by_cutoff.min(soft),
+        None => by_cutoff,
+    })
+}
+
+/// Soft-window budget magnitude (ms) that scales the collator's percentage-based
+/// message-intake sub-budgets: the span from the `budget_anchor` to
+/// [`effective_soft_cutoff`], i.e. `min(cutoff_timeout_ms, soft_deadline - budget_anchor)`.
+///
+/// Measuring from the dispatch instant (the `budget_anchor`) rather than the slot start is
+/// what keeps this nonzero for shardchains, whose soft deadline *is* the slot start: the
+/// budget becomes the early-dispatch lead (`target_rate`) instead of collapsing to zero.
+/// Falls back to the static `cutoff_timeout_ms` with no `budget_anchor` (catchain/tests).
+/// Mirrors the C++ `soft_timeout - now` window that sizes the fractions in collator.cpp.
+fn effective_cutoff_budget_ms(
+    soft: Option<SystemTime>,
+    budget_anchor: Option<SystemTime>,
+    cutoff_timeout_ms: u64,
+) -> u64 {
+    match (effective_soft_cutoff(soft, budget_anchor, cutoff_timeout_ms), budget_anchor) {
+        (Some(cutoff_at), Some(anchor)) => {
+            cutoff_at.duration_since(anchor).unwrap_or_default().as_millis() as u64
+        }
+        _ => cutoff_timeout_ms,
+    }
+}
+
+/// External-message intake finish time (engine unix-ms): `now + budget * pct / 1000`,
+/// clamped to the absolute soft cutoff when one is known.
+///
+/// The fractional budget is added to the *current* `now`, so a late collation start could
+/// otherwise push this sub-phase past the soft cutoff (where `cancel_ext` stops intake
+/// anyway). C++ bounds it the same way by construction:
+/// `external_msg_timeout_ = now + 0.75 * (soft_timeout - now) <= soft_timeout` (collator.cpp).
+fn external_messages_finish_ms(
+    now_ms: u64,
+    budget_ms: u64,
+    pct_points: u64,
+    soft_cutoff_ms: Option<u64>,
+) -> u64 {
+    let finish = now_ms + budget_ms * pct_points / 1000;
+    match soft_cutoff_ms {
+        Some(soft_ms) => finish.min(soft_ms),
+        None => finish,
     }
 }
 

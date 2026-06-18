@@ -18,7 +18,7 @@
 //! `on_collation_complete`, `on_collation_failed_impl`, `generated_block`,
 //! `precollate_block`, `prepare_collation`): these read `SessionProcessor`
 //! state and apply effects only through the [`CollationBackend`] seam, and
-//! bounce re-entrant work (collation retries via `invoke_collation_retry`,
+//! bounce re-entrant work (genuine-error restarts via `restart_collation`,
 //! the next-slot self-loop) back onto `SessionProcessor` through the
 //! controller task queue rather than recursing synchronously.
 //!
@@ -68,10 +68,9 @@
 //!   whether anything was actually removed so the caller can update
 //!   `precollation_results_counter` without inspecting the inner map.
 //! - `resolve_parent_block_id(parent, &CandidateBook) -> Option<BlockIdExt>`
-//!   and `resolve_candidate_id_by_block_id(block_id, &CandidateBook) ->
-//!   Option<RawCandidateId>` — composite parent / candidate lookup over
-//!   the synchronous generated-parent cache and the candidate book.
-//! - `try_begin_collation_slot(slot, attempt) -> Option<ValidatorIndex>` —
+//!   — composite parent lookup over the synchronous generated-parent cache
+//!   and the candidate book.
+//! - `try_begin_collation_slot(slot) -> Option<ValidatorIndex>` —
 //!   gate keeping the local collation entry point: returns the local
 //!   validator index iff no precollation entry already exists for `slot`
 //!   and the local node is the leader for `slot`.
@@ -82,12 +81,12 @@
 //!   by `target_rate` from the held description clock; mirrors C++
 //!   `block-producer.cpp target_time += target_rate_ms`.
 //! - The collation pipeline proper — `check_collation`, `invoke_collation` /
-//!   `invoke_collation_retry`, `execute_collation_attempt`,
+//!   `restart_collation`, `execute_collation_attempt`,
 //!   `dispatch_collation_request`, `on_collation_complete` /
 //!   `on_collation_failed_impl`, `generated_block`, and `precollate_block` —
 //!   ports the original `SessionProcessor` method bodies, reading FSM and
 //!   finalization state and applying effects through the [`CollationBackend`]
-//!   seam. Re-entrant steps (retry re-dispatch, the next-slot self-loop)
+//!   seam. Re-entrant steps (genuine-error restart, the next-slot self-loop)
 //!   enqueue a closure on the controller task queue so `SessionProcessor`
 //!   drains them without synchronous recursion.
 //!
@@ -221,6 +220,12 @@ use ton_block::{error, fail, sha256_digest, BlockIdExt, BocFlags, Error, Result,
 /// `SessionProcessor`; read only by [`CollationController::make_collation_callback`].
 const MAX_GENERATION_TIME: Duration = Duration::from_millis(1000);
 
+/// Backoff before a single genuine-error collation restart, mirroring the C++
+/// producer's `coro_sleep(td::Timestamp::in(0.1))` in `block-producer.cpp`. There
+/// is no attempt counter: a restart reuses the SAME absolute window-end deadline,
+/// so retries race the same budget and the window-end hard stop bounds them.
+const COLLATION_ERROR_RESTART_BACKOFF: Duration = Duration::from_millis(100);
+
 /*
     Precollated block
     Reference: validator-session/src/session_processor.rs PrecollatedBlock
@@ -268,28 +273,6 @@ pub(crate) struct LocalChainHead {
     pub(crate) parent_info: crate::block::CandidateParentInfo,
     /// Exact generation time extracted from ConsensusExtraData, if available.
     pub(crate) gen_utime_ms: Option<u64>,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) enum CollationAttempt {
-    Initial,
-    Retry { retry_count: u32 },
-}
-
-impl CollationAttempt {
-    fn log_context(self) -> &'static str {
-        match self {
-            Self::Initial => "invoke_collation",
-            Self::Retry { .. } => "invoke_collation_retry",
-        }
-    }
-
-    fn failure_retry_count(self) -> u32 {
-        match self {
-            Self::Initial => 0,
-            Self::Retry { retry_count } => retry_count,
-        }
-    }
 }
 
 /*
@@ -370,12 +353,93 @@ pub(crate) struct CollationTiming {
     pub(crate) parent_gen_utime_ms: Option<u64>,
 }
 
+/// Absolute per-slot SOFT cutoff and window-end HARD cap for a real collation.
+///
+/// Mirrors the C++ producer in `block-producer.cpp`: the soft cutoff is
+/// `slot_start + target_rate` for the masterchain and `slot_start` for shardchains;
+/// the collator bounds message intake to it (further clamped by its static
+/// `cutoff_timeout_ms`). The hard cap is bounded to the leader-window end rather
+/// than C++'s `slot_start + max(3*target_rate, 60s)`: a real collation may outlive
+/// its dispatch slot (the per-slot wake covers the elapsed slots with empty fillers
+/// and re-tags the late real when it completes) but must not outlive its leader
+/// window, which the next leader's producer owns. `min_gen_time` is the slot start
+/// (C++ keeps it at `slot_start` even when shard collation dispatches early); `slot`
+/// locates it within its window.
+pub(crate) fn collation_deadlines(
+    slot: SlotIndex,
+    min_gen_time: SystemTime,
+    target_rate: Duration,
+    slots_per_leader_window: u32,
+    is_masterchain: bool,
+) -> (SystemTime, SystemTime) {
+    let soft_deadline = if is_masterchain {
+        min_gen_time.checked_add(target_rate).unwrap_or(min_gen_time)
+    } else {
+        min_gen_time
+    };
+
+    let spw = slots_per_leader_window.max(1);
+    // Slots from this slot's start to the leader-window end: `1..=spw`.
+    let slots_to_window_end = spw - slot.offset_in_window(spw);
+    let hard_deadline = min_gen_time
+        .checked_add(target_rate.saturating_mul(slots_to_window_end))
+        .unwrap_or(min_gen_time);
+
+    (soft_deadline, hard_deadline)
+}
+
 /// Outcome of [`CollationController::prepare_collation`]: ready to dispatch,
 /// deferred until the carried dispatch time, or blocked on an unresolved parent.
 pub(crate) enum CollationPreparation {
     Ready(PreparedCollation),
     Deferred(SystemTime),
     WaitingForParent,
+}
+
+/// Absolute deadline context for a single real collation attempt: the soft / hard
+/// cutoffs handed to the collator plus the budget anchor the collator measures its
+/// percentage sub-budgets from. Computed once when a slot is first dispatched and
+/// then PINNED across a genuine-error restart so every attempt for the slot races the
+/// SAME window-end budget (rather than each restart recomputing a fresh window-length
+/// budget from the advanced clock).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CollationDeadlineContext {
+    /// Absolute SOFT cutoff (message-intake) — C++ `soft_timeout`.
+    pub(crate) soft_deadline: SystemTime,
+    /// Absolute window-end HARD cap — C++ `hard_timeout` (bounded to the leader window).
+    pub(crate) hard_deadline: SystemTime,
+    /// Absolute start of the budget window (the dispatch instant); the collator's soft
+    /// sub-budgets span `soft_deadline - budget_anchor`.
+    pub(crate) budget_anchor: SystemTime,
+}
+
+/// Bookkeeping for the single in-flight REAL collation, mirroring the C++ block
+/// producer's `block_generation_active` + `block_generation` locals in
+/// `block-producer.cpp`. Held in [`CollationController::block_generation_active`]
+/// from real dispatch until the collation completes, fails, or the pipeline is
+/// `reset()`. It lets one collation stay alive across slots while the per-slot wake
+/// covers the elapsed slots with empty fillers and re-tags the late real.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RealCollationState {
+    /// Leader window the collation was dispatched in; a window change drops it via
+    /// `reset()`.
+    window: WindowIndex,
+    /// Slot the collation was dispatched for.
+    slot_dispatched: SlotIndex,
+    /// `AsyncRequest` id of the in-flight collation, so that completion/failure of a
+    /// different request (e.g. an empty filler) does not clear this marker.
+    request_id: u32,
+    /// Next per-slot filler horizon, mirroring the C++
+    /// `await_with_timeout(slot_start + target_rate)`: when it elapses while the
+    /// collation is still running, the per-slot wake emits an empty filler and
+    /// re-arms the next one. The live horizon is carried by the scheduled wake, so
+    /// this stored copy is bookkeeping only asserted by the unit tests.
+    #[allow(dead_code)]
+    next_slot_deadline: SystemTime,
+    /// Absolute soft/hard cutoffs and budget anchor handed to the collator. Read on a
+    /// genuine-error failure so the restart can reuse the SAME budget instead of
+    /// recomputing it from the (now advanced) clock.
+    deadlines: CollationDeadlineContext,
 }
 
 /// Session-owned reads a deferred collation re-entry needs but cannot reach
@@ -461,12 +525,6 @@ pub(crate) trait CollationBackend {
     /// Book-seam companion to [`Self::book_received_block_id`], used by
     /// [`CollationController::resolve_parent_gen_utime_ms`] for collation timing.
     fn book_received_gen_utime_ms(&self, id: &RawCandidateId) -> Option<u64>;
-
-    /// Reverse book lookup: the received candidate id matching `block_id`.
-    ///
-    /// `SessionProcessor`-owned (`CandidateBook::find_received_by_block_id`).
-    /// Book-seam read for [`CollationController::resolve_candidate_id_by_block_id`].
-    fn book_candidate_id_by_block_id(&self, block_id: &BlockIdExt) -> Option<RawCandidateId>;
 
     /// Before-split flag recorded for the block identified by `parent_block_id`,
     /// if known.
@@ -712,6 +770,22 @@ pub(crate) struct CollationController {
     /// `if let Some(tc) = &self.trace_collector`. Cheap-to-clone handle cloned
     /// from `SessionProcessor` at construction
     trace_collector: Option<TraceCollector>,
+    /// In-flight REAL collation, mirroring C++ `block_generation_active` /
+    /// `block_generation` in `block-producer.cpp`. `Some` from real dispatch until
+    /// the collation completes, fails, or the pipeline is `reset()`. The
+    /// single-in-flight guard reads it to keep one collation alive across slots
+    /// while the per-slot wake covers the elapsed slots with empty fillers.
+    block_generation_active: Option<RealCollationState>,
+    /// Wall-clock time of the last observed consensus-finalization advance, mirroring
+    /// C++ `last_consensus_finalized_at_` in `block-producer.cpp`. Refreshed by
+    /// [`Self::refresh_finalization_timestamp`] from both `check_collation` and the
+    /// per-slot wake whenever the consensus-finalized seqno increases; the
+    /// `allow_empty` gate ([`Self::empties_allowed_by_finalization`], bounded by
+    /// `no_empty_blocks_on_error_timeout`) reads it.
+    last_consensus_finalized_at: Option<SystemTime>,
+    /// Highest consensus-finalized seqno observed so far. Only used to detect the
+    /// advance that bumps `last_consensus_finalized_at`.
+    last_observed_finalized_seqno: Option<u32>,
 }
 
 // ======================================================================
@@ -759,6 +833,9 @@ impl CollationController {
             generated_parent_cache: HashMap::new(),
             generated_parent_gen_utime_ms_cache: HashMap::new(),
             trace_collector,
+            block_generation_active: None,
+            last_consensus_finalized_at: None,
+            last_observed_finalized_seqno: None,
         }
     }
 
@@ -983,7 +1060,7 @@ impl CollationController {
     }
 
     /// Find a generated-parent `RawCandidateId` by `BlockIdExt`.
-    fn find_generated_parent_id_by_block_id(
+    pub(crate) fn find_generated_parent_id_by_block_id(
         &self,
         block_id: &BlockIdExt,
     ) -> Option<RawCandidateId> {
@@ -1047,18 +1124,6 @@ impl CollationController {
         self.resolve_generated_parent_block_id(&parent_id)
             .cloned()
             .or_else(|| backend.book_received_block_id(&parent_id))
-    }
-
-    /// Reverse lookup: find a candidate id by `BlockIdExt`, preferring the
-    /// synchronous generated-parent cache and falling back to the
-    /// supplied `CandidateBook`.
-    pub(crate) fn resolve_candidate_id_by_block_id(
-        &self,
-        block_id: &BlockIdExt,
-        backend: &dyn CollationBackend,
-    ) -> Option<RawCandidateId> {
-        self.find_generated_parent_id_by_block_id(block_id)
-            .or_else(|| backend.book_candidate_id_by_block_id(block_id))
     }
 
     // ----- collation gating -----
@@ -1159,16 +1224,11 @@ impl CollationController {
     /// already exists for `slot` and (b) the local validator is the
     /// leader for `slot`. Returns `None` otherwise, emitting the matching
     /// trace log so call-site visibility is preserved.
-    fn try_begin_collation_slot(
-        &self,
-        slot: SlotIndex,
-        attempt: CollationAttempt,
-    ) -> Option<ValidatorIndex> {
+    fn try_begin_collation_slot(&self, slot: SlotIndex) -> Option<ValidatorIndex> {
         if self.precollated_contains(slot) {
             log::trace!(
-                "Session {} {}: slot {} already pending",
+                "Session {} invoke_collation: slot {} already pending",
                 self.session_id().to_hex_string(),
-                attempt.log_context(),
                 slot
             );
             return None;
@@ -1178,9 +1238,8 @@ impl CollationController {
         let leader = self.description.get_leader(slot);
         if leader != self_idx {
             log::trace!(
-                "Session {} {}: not leader for slot {} (leader={})",
+                "Session {} invoke_collation: not leader for slot {} (leader={})",
                 self.session_id().to_hex_string(),
-                attempt.log_context(),
                 slot,
                 leader
             );
@@ -1198,11 +1257,21 @@ impl CollationController {
         slot: SlotIndex,
         parent: Option<CandidateParentInfo>,
         min_gen_time: SystemTime,
+        soft_deadline: Option<SystemTime>,
+        hard_deadline: Option<SystemTime>,
+        budget_anchor: Option<SystemTime>,
     ) -> (u32, Arc<AsyncRequestImpl>) {
         self.note_precollated_slot(slot);
 
         let request_id = self.next_precollation_request_id();
-        let request = AsyncRequestImpl::new(request_id, true, min_gen_time);
+        let request = AsyncRequestImpl::new_with_deadlines(
+            request_id,
+            true,
+            min_gen_time,
+            soft_deadline,
+            hard_deadline,
+            budget_anchor,
+        );
         let precollated_block = PrecollatedBlock { request: request.clone(), result: None, parent };
         self.insert_precollated(slot, precollated_block);
 
@@ -1272,6 +1341,10 @@ impl CollationController {
             backend.forget_self_collation_tracking(slot, "precollation_pipeline_reset");
         }
         self.invalidate_local_chain_head();
+        // Drop the in-flight REAL-collation marker: reset() cancels the pending
+        // AsyncRequests, so no completion will arrive to clear it. C++ replaces
+        // `cancellation_source_` / `block_generation` on each new leader window.
+        self.block_generation_active = None;
     }
 }
 
@@ -1363,6 +1436,16 @@ impl CollationController {
     /// pending-generate write all go through the borrowing [`CollationBackend`].
     pub(crate) fn check_collation(&mut self, backend: &mut dyn CollationBackend) {
         instrument!();
+
+        // Maintain the consensus-finalization timestamp (C++ block-producer.cpp):
+        // bump it whenever the consensus-finalized seqno advances.
+        self.refresh_finalization_timestamp(backend);
+
+        // Drop a stuck in-flight real-collation marker left over from a superseded leader
+        // window before any of the stale-window early-returns below (which can bypass the
+        // `reset()` further down when the progress cursor lags). Otherwise the
+        // single-in-flight guard would decline every real collation in the new window.
+        self.clear_stale_block_generation(backend);
 
         // Don't collate faster than target_rate (block-producer.cpp
         // coro_sleep(target_time)).
@@ -1517,7 +1600,7 @@ impl CollationController {
         parent: Option<CandidateParentInfo>,
     ) {
         instrument!();
-        let Some(self_idx) = self.try_begin_collation_slot(slot, CollationAttempt::Initial) else {
+        let Some(self_idx) = self.try_begin_collation_slot(slot) else {
             return;
         };
 
@@ -1533,30 +1616,26 @@ impl CollationController {
             );
         }
         self.set_last_generated_slot(Some(slot));
-        self.execute_collation_attempt(
-            backend,
-            slot,
-            parent,
-            self_idx,
-            CollationAttempt::Initial,
-            true,
-            true,
-        );
+        self.execute_collation_attempt(backend, slot, parent, self_idx, true, true, None);
     }
 
-    /// Invoke collation for a retry attempt (tracks retry count). Moved from
-    /// `SessionProcessor`: re-captures the FSM available parent at retry time and
-    /// re-enters [`Self::execute_collation_attempt`] with the retry flags.
-    fn invoke_collation_retry(
+    /// Restart a collation for `slot` after a genuine error (the C++ genuine-error
+    /// retry in `block-producer.cpp`). Re-captures the FSM available parent and
+    /// re-enters [`Self::execute_collation_attempt`] as a normal dispatch - so it
+    /// re-arms the per-slot deadline wake exactly like the initial attempt - but
+    /// with the lenient flags (no pending-generate clear, no progress-slot
+    /// assertion) since the caller has already re-gated the slot. `pinned_deadlines`
+    /// carries the ORIGINAL attempt's soft/hard cutoffs + budget anchor so the restart
+    /// races the SAME window-end budget rather than a fresh window recomputed from the
+    /// (now advanced) clock.
+    fn restart_collation(
         &mut self,
         backend: &mut dyn CollationBackend,
         slot: SlotIndex,
-        retry_count: u32,
+        pinned_deadlines: Option<CollationDeadlineContext>,
     ) {
         instrument!();
-        let Some(self_idx) =
-            self.try_begin_collation_slot(slot, CollationAttempt::Retry { retry_count })
-        else {
+        let Some(self_idx) = self.try_begin_collation_slot(slot) else {
             return;
         };
 
@@ -1567,9 +1646,9 @@ impl CollationController {
             slot,
             parent,
             self_idx,
-            CollationAttempt::Retry { retry_count },
             false,
             false,
+            pinned_deadlines,
         );
     }
 
@@ -1588,13 +1667,37 @@ impl CollationController {
         slot: SlotIndex,
         parent: Option<CandidateParentInfo>,
         self_idx: ValidatorIndex,
-        attempt: CollationAttempt,
         clear_pending_generate_on_not_ready: bool,
         enforce_progress_slot_invariant: bool,
+        pinned_deadlines: Option<CollationDeadlineContext>,
     ) {
         // Trace: collation attempt started for this slot (fires on every attempt).
         if let Some(tc) = &self.trace_collector {
             tc.record_collate_started(self.session_id(), slot);
+        }
+        // Single in-flight guard (C++ block-producer.cpp): never begin a new REAL
+        // collation while one is already running. Release is guaranteed by
+        // on_collation_complete / on_collation_failed_impl / reset() plus the
+        // window-end hard stop_flag and the outer collation timeout, so a wedged
+        // collator can never block the pipeline indefinitely. Empty fillers are NOT
+        // dispatched here - the per-slot deadline wake emits them without
+        // re-entering this path. Clearing pending_generate lets a later tick
+        // re-evaluate the slot once the in-flight collation resolves.
+        if let Some((active_slot, active_request_id)) =
+            self.block_generation_active.as_ref().map(|s| (s.slot_dispatched, s.request_id))
+        {
+            log::trace!(
+                "Session {} invoke_collation: declining real collation for slot {} - collation \
+                slot {} (request_id={}) already in flight (single in-flight)",
+                &self.session_id().to_hex_string()[..8],
+                slot,
+                active_slot,
+                active_request_id,
+            );
+            if clear_pending_generate_on_not_ready {
+                backend.set_pending_generate(slot, false);
+            }
+            return;
         }
 
         let session_start_prev_blocks = backend.session_start_prev_blocks();
@@ -1603,9 +1706,8 @@ impl CollationController {
                 CollationPreparation::Ready(prepared) => prepared,
                 CollationPreparation::Deferred(slot_start_time) => {
                     log::trace!(
-                        "Session {} {}: deferring slot {} until {:?}",
+                        "Session {} invoke_collation: deferring slot {} until {:?}",
                         self.session_id().to_hex_string(),
-                        attempt.log_context(),
                         slot,
                         slot_start_time
                     );
@@ -1618,10 +1720,9 @@ impl CollationController {
                 CollationPreparation::WaitingForParent => {
                     if let Some(parent_info) = parent.as_ref() {
                         log::trace!(
-                            "Session {} {}: waiting for resolved parent BlockIdExt for slot {slot} \
-                            (parent={parent_info})",
+                            "Session {} invoke_collation: waiting for resolved parent BlockIdExt \
+                            for slot {slot} (parent={parent_info})",
                             self.session_id().to_hex_string(),
-                            attempt.log_context(),
                         );
                     }
                     if clear_pending_generate_on_not_ready {
@@ -1648,10 +1749,10 @@ impl CollationController {
         ) {
             assert!(
                 !is_first_session_block,
-                "CollationController INVARIANT VIOLATION: {} should_generate_empty_block({}) \
-                returned true but no parent available. First block in epoch cannot be empty. \
-                finalized_head_seqno={:?}, last_mc_finalized_seqno={:?}",
-                attempt.log_context(),
+                "CollationController INVARIANT VIOLATION: invoke_collation \
+                should_generate_empty_block({}) returned true but no parent available. First \
+                block in epoch cannot be empty. finalized_head_seqno={:?}, \
+                last_mc_finalized_seqno={:?}",
                 new_seqno,
                 backend.finalized_head_seqno(),
                 backend.last_mc_finalized_seqno()
@@ -1659,26 +1760,15 @@ impl CollationController {
             let parent_block_id = prev_block_ids.first().cloned().expect(
                 "non-first Simplex collation attempt must have one resolved parent block id",
             );
-            match attempt {
-                CollationAttempt::Initial => log::debug!(
-                    "Session {} invoke_collation: generating EMPTY block for slot {}! \
-                    new_seqno={}, finalized_head_seqno={:?}, last_mc_finalized_seqno={:?}",
-                    self.session_id().to_hex_string(),
-                    slot,
-                    new_seqno,
-                    backend.finalized_head_seqno(),
-                    backend.last_mc_finalized_seqno()
-                ),
-                CollationAttempt::Retry { .. } => log::debug!(
-                    "Session {} invoke_collation_retry: generating EMPTY block for slot {} \
-                    on retry! new_seqno={}, finalized_head_seqno={:?}, last_mc_finalized_seqno={:?}",
-                    self.session_id().to_hex_string(),
-                    slot,
-                    new_seqno,
-                    backend.finalized_head_seqno(),
-                    backend.last_mc_finalized_seqno()
-                ),
-            }
+            log::debug!(
+                "Session {} invoke_collation: generating EMPTY block for slot {}! \
+                new_seqno={}, finalized_head_seqno={:?}, last_mc_finalized_seqno={:?}",
+                self.session_id().to_hex_string(),
+                slot,
+                new_seqno,
+                backend.finalized_head_seqno(),
+                backend.last_mc_finalized_seqno()
+            );
             self.finish_empty_collation_attempt(
                 backend,
                 slot,
@@ -1708,7 +1798,7 @@ impl CollationController {
             timing,
             new_seqno,
             self_idx,
-            attempt,
+            pinned_deadlines,
         );
     }
 
@@ -1728,10 +1818,78 @@ impl CollationController {
         timing: CollationTiming,
         new_seqno: u32,
         self_idx: ValidatorIndex,
-        attempt: CollationAttempt,
+        pinned_deadlines: Option<CollationDeadlineContext>,
     ) {
-        let (request_id, request) =
-            self.create_pending_collation_request(slot, parent.clone(), timing.min_gen_time);
+        // PRECONDITION (C++ block-producer.cpp single-in-flight): no REAL collation
+        // may already be active when we dispatch another. The explicit dispatch
+        // guard in `execute_collation_attempt` enforces it, backed by
+        // clear-before-redispatch in `on_collation_complete` /
+        // `on_collation_failed_impl`, forward-only precollation chaining, and
+        // `reset()`. `debug_assert!` so a future regression trips in CI/tests
+        // without aborting a validator in release.
+        debug_assert!(
+            self.block_generation_active.is_none(),
+            "single in-flight real collation invariant violated: \
+             block_generation_active={:?} at real dispatch of slot {}",
+            self.block_generation_active,
+            slot,
+        );
+
+        // Absolute soft/hard cutoffs + budget anchor for this attempt. A genuine-error
+        // restart passes the ORIGINAL context (`pinned_deadlines`) so every attempt for
+        // the slot races the SAME window-end budget; a fresh dispatch derives it from the
+        // slot timing. `collation_deadlines` gives the C++ soft cutoff
+        // (`slot_start[+ target_rate]`) and the window-end hard cap; the budget anchor is
+        // the dispatch instant (shard `slot_start - target_rate`, MC `slot_start`) so the
+        // collator's percentage sub-budgets span the real intake window instead of
+        // collapsing to zero on shardchains where the soft cutoff equals the slot start.
+        let deadlines = pinned_deadlines.unwrap_or_else(|| {
+            let (soft_deadline, hard_deadline) = collation_deadlines(
+                slot,
+                timing.min_gen_time,
+                self.description.opts().target_rate,
+                self.description.opts().slots_per_leader_window,
+                self.description.get_shard().is_masterchain(),
+            );
+            CollationDeadlineContext {
+                soft_deadline,
+                hard_deadline,
+                budget_anchor: timing.dispatch_time,
+            }
+        });
+        let (request_id, request) = self.create_pending_collation_request(
+            slot,
+            parent.clone(),
+            timing.min_gen_time,
+            Some(deadlines.soft_deadline),
+            Some(deadlines.hard_deadline),
+            Some(deadlines.budget_anchor),
+        );
+
+        // Track this as the single in-flight REAL collation (C++
+        // `block_generation_active` in block-producer.cpp). `next_slot_deadline`
+        // mirrors the C++ `await_with_timeout` horizon (`slot_start + target_rate`):
+        // the first slot boundary at which, if the collation is still running, the
+        // per-slot wake keeps it alive and emits an empty filler.
+        let next_slot_deadline = timing
+            .min_gen_time
+            .checked_add(self.description.opts().target_rate)
+            .unwrap_or(timing.min_gen_time);
+        self.block_generation_active = Some(RealCollationState {
+            window: slot.window_index(self.description.opts().slots_per_leader_window.max(1)),
+            slot_dispatched: slot,
+            request_id,
+            next_slot_deadline,
+            deadlines,
+        });
+
+        // Arm the per-slot deadline wake (C++ `await_with_timeout(block_generation,
+        // slot_start + target_rate)` in block-producer.cpp). Every real dispatch
+        // arms it - including a genuine-error restart, which re-enters this path via
+        // restart_collation and so gets its own fresh wake. The wake re-arms itself
+        // for the next loop slot while the same real collation stays in flight,
+        // publishing a state-preserving empty filler on each elapsed slot.
+        self.arm_slot_deadline_wake(slot, request_id, next_slot_deadline);
 
         self.telemetry.precollation_requests_counter.increment(1);
         let now = self.now();
@@ -1739,13 +1897,12 @@ impl CollationController {
         self.telemetry.collates_expire_counter.total_increment();
 
         log::info!(
-            "Session {} COLLATION_TIMING: slot={}, request_id={}, attempt={}, shard={:?}, \
+            "Session {} COLLATION_TIMING: slot={}, request_id={}, shard={:?}, \
             parent={:?}, parent_gen_utime_ms={:?}, dispatch_at_ms={}, min_gen_time_ms={}, \
             start_collate_before_ms={}, min_gen_from_now_ms={}, dispatch_lag_ms={}",
             &self.session_id().to_hex_string()[..8],
             slot,
             request_id,
-            attempt.log_context(),
             self.description.get_shard(),
             parent.as_ref().map(|p| format!("{}:{}", p.slot, &p.hash.to_hex_string()[..8])),
             timing.parent_gen_utime_ms,
@@ -1756,49 +1913,29 @@ impl CollationController {
             Self::system_time_delta_ms(now, timing.dispatch_time),
         );
 
-        match attempt {
-            CollationAttempt::Initial => {
-                log::debug!(
-                    "Session {} COLLATION request: slot={}, expected_seqno={}, parent={:?}",
-                    &self.session_id().to_hex_string()[..8],
-                    slot,
-                    new_seqno,
-                    parent.as_ref().map(|p| format!("{}:{}", p.slot, &p.hash.to_hex_string()[..8]))
-                );
-                log::trace!(
-                    "Session {} invoke_collation: requesting block for slot={slot}, \
-                    expected_seqno={new_seqno}, request_id={request_id}",
-                    self.session_id().to_hex_string(),
-                );
-            }
-            CollationAttempt::Retry { retry_count } => {
-                log::trace!(
-                    "Session {} invoke_collation_retry: requesting block for slot {} \
-                    (request_id={}, retry={}/{}, parent={:?})",
-                    self.session_id().to_hex_string(),
-                    slot,
-                    request_id,
-                    retry_count,
-                    self.description.opts().collation_retry_max_attempts,
-                    parent.as_ref().map(|p| format!("{}:{}", p.slot, &p.hash.to_hex_string()[..8]))
-                );
-            }
-        }
+        log::debug!(
+            "Session {} COLLATION request: slot={}, expected_seqno={}, parent={:?}",
+            &self.session_id().to_hex_string()[..8],
+            slot,
+            new_seqno,
+            parent.as_ref().map(|p| format!("{}:{}", p.slot, &p.hash.to_hex_string()[..8]))
+        );
+        log::trace!(
+            "Session {} invoke_collation: requesting block for slot={slot}, \
+            expected_seqno={new_seqno}, request_id={request_id}",
+            self.session_id().to_hex_string(),
+        );
 
         let source_info = self.make_roundless_collation_source_info(self_idx);
-        let callback = self.make_collation_callback(slot, request_id, request.clone(), attempt);
+        let callback = self.make_collation_callback(slot, request_id, request.clone());
 
         self.telemetry.record_collation_start();
         let now = self.now();
-        let retry_count = match attempt {
-            CollationAttempt::Initial => None,
-            CollationAttempt::Retry { retry_count } => Some(retry_count),
-        };
         self.telemetry.record_self_collation_start(
             &self.description,
             slot,
             new_seqno,
-            retry_count,
+            None,
             parent.as_ref().map(|p| (p.slot, &p.hash)),
             &prev_block_ids,
             now,
@@ -1813,6 +1950,265 @@ impl CollationController {
             prev_block_ids,
             callback,
         );
+    }
+
+    /// Refresh [`Self::last_consensus_finalized_at`] from the backend's
+    /// consensus-finalized seqno.
+    ///
+    /// Mirrors C++, where the `Start` / `FinalizeBlock` handlers stamp
+    /// `last_consensus_finalized_at_ = now()` independently of the producer loop
+    /// in `block-producer.cpp`. Bumps the timestamp only when the finalized seqno
+    /// strictly advances, so it is cheap and idempotent. Called from both the main
+    /// pipeline ([`Self::check_collation`]) and the per-slot wake
+    /// ([`Self::on_slot_deadline`]) so the `allow_empty` gate always reads the
+    /// freshest finalization state, not a value frozen at the last
+    /// `check_collation`.
+    fn refresh_finalization_timestamp(&mut self, backend: &dyn CollationBackend) {
+        let finalized_seqno = backend.last_consensus_finalized_seqno();
+        if finalized_seqno > self.last_observed_finalized_seqno {
+            self.last_observed_finalized_seqno = finalized_seqno;
+            self.last_consensus_finalized_at = Some(self.now());
+        }
+    }
+
+    /// C++ `allow_empty` finalization-staleness gate in `block-producer.cpp`:
+    /// `!(last_consensus_finalized_at_ + no_empty_blocks_on_error_timeout_).is_in_past()`.
+    ///
+    /// Empty fillers are suppressed once consensus has not finalized anything for
+    /// `no_empty_blocks_on_error_timeout` (default 15s): continuing to fill while
+    /// finalization is wedged only deepens the stall, so the producer instead
+    /// keeps waiting for a real block. `last_consensus_finalized_at` is seeded at
+    /// the first observed finalization (C++ `Start`) and refreshed on every advance
+    /// (C++ `FinalizeBlock`); `None` (nothing finalized yet) keeps empties
+    /// suppressed, matching C++'s default-constructed (in-the-past) timestamp.
+    ///
+    /// The `is_first_block` half of the C++ gate is enforced separately by
+    /// [`Self::emit_slot_filler`] (no parent => cannot place an empty).
+    fn empties_allowed_by_finalization(&self) -> bool {
+        match self.last_consensus_finalized_at {
+            Some(at) => {
+                match at.checked_add(self.description.opts().no_empty_blocks_on_error_timeout) {
+                    // !(deadline).is_in_past()
+                    Some(deadline) => self.now() <= deadline,
+                    // Overflow => deadline is effectively never in the past.
+                    None => true,
+                }
+            }
+            None => false,
+        }
+    }
+
+    /// Arm the per-slot deadline wake for the in-flight real collation at
+    /// `loop_slot`.
+    ///
+    /// Mirrors the C++ `co_await await_with_timeout(block_generation.get(),
+    /// slot_start + target_rate)` horizon in `block-producer.cpp`: the wake fires
+    /// at `deadline`, and if the real collation `request_id` is still the active
+    /// one, [`Self::on_slot_deadline`] publishes an empty filler for `loop_slot`,
+    /// keeps the real alive, and re-arms the next loop slot's deadline. Posted onto
+    /// the controller queue so it runs serialized against the rest of the pipeline
+    /// rather than recursing.
+    fn arm_slot_deadline_wake(&self, loop_slot: SlotIndex, request_id: u32, deadline: SystemTime) {
+        self.queue().clone().post_delayed(deadline, move |collation, backend| {
+            collation.on_slot_deadline(backend, loop_slot, request_id, deadline);
+        });
+    }
+
+    /// Per-slot deadline wake handler (the C++ `await_with_timeout` timeout branch
+    /// in `block-producer.cpp`).
+    ///
+    /// Fires once the in-flight real collation has overrun the `loop_slot`
+    /// boundary. The wake is stale - and does nothing - if the tracked real
+    /// collation already resolved (completion / failure / `reset`), a different
+    /// real is now active, the leader window moved on, or `loop_slot` ran past the
+    /// leader window (C++ `slot < end_slot`). Otherwise the slot elapsed while the
+    /// real is still running: subject to the `allow_empty` gate, emit a
+    /// state-preserving empty filler for `loop_slot` (keeping the real alive),
+    /// advance the per-slot horizon by `target_rate`, and re-arm for the next loop
+    /// slot - exactly the C++ loop publishing an empty at `slot`, advancing
+    /// `parent = id`, and continuing to `await` the same `block_generation`. When
+    /// the gate (or `emit_slot_filler`'s first-block check) declines the empty, the
+    /// horizon still advances but the wake re-arms on the SAME loop slot, mirroring
+    /// the C++ `--slot; continue;` retry.
+    fn on_slot_deadline(
+        &mut self,
+        backend: &mut dyn CollationBackend,
+        loop_slot: SlotIndex,
+        request_id: u32,
+        deadline: SystemTime,
+    ) {
+        instrument!();
+
+        // Stale wake: the tracked real collation changed (completed / failed /
+        // reset) or a different real is now active.
+        let (active_window, slot_dispatched) = match self.block_generation_active.as_ref() {
+            Some(active) if active.request_id == request_id => {
+                (active.window, active.slot_dispatched)
+            }
+            _ => return,
+        };
+
+        // Leader window moved on under us: drop the stale in-flight marker (cancelling
+        // its pending request) so the single-in-flight guard cannot wedge the new window,
+        // then stop. `reset()` usually clears it first, but the per-slot wake can fire
+        // before the next `check_collation`, so clear it here too.
+        if active_window != backend.current_leader_window_idx() {
+            self.clear_stale_block_generation(backend);
+            return;
+        }
+
+        // The loop slot ran past the leader window (C++ `slot < end_slot`): stop
+        // filling. The still-in-flight real will re-tag onto the head when it
+        // completes, or be discarded if the window has changed by then.
+        if self.description.get_window_idx(loop_slot) != active_window {
+            return;
+        }
+
+        // Refresh the finalization timestamp from the backend so the allow_empty
+        // gate reads the freshest consensus state (C++ stamps
+        // last_consensus_finalized_at_ via the independent FinalizeBlock handler),
+        // not a value frozen at the last check_collation.
+        self.refresh_finalization_timestamp(backend);
+
+        // The slot elapsed while the real collation is still in flight: publish a
+        // state-preserving empty filler for it and keep the real alive. Two gates
+        // can decline the filler, in which case we keep waiting on the SAME slot,
+        // mirroring the C++ `--slot; continue;` timeout branch:
+        //   * allow_empty: empties are suppressed once consensus has not finalized
+        //     within no_empty_blocks_on_error_timeout;
+        //   * is_first_block: a slot with no available parent cannot be empty -
+        //     enforced inside emit_slot_filler.
+        let emitted = if self.empties_allowed_by_finalization() {
+            self.emit_slot_filler(backend, loop_slot, slot_dispatched, request_id)
+        } else {
+            log::debug!(
+                "Session {} on_slot_deadline: suppressing empty filler for slot {} - no \
+                consensus finalization within no_empty_blocks_on_error_timeout; keep waiting \
+                for the real collation (request_id={})",
+                &self.session_id().to_hex_string()[..8],
+                loop_slot,
+                request_id
+            );
+            false
+        };
+        let next_loop_slot = if emitted { loop_slot + 1 } else { loop_slot };
+
+        // Advance the per-slot horizon by target_rate and re-arm, clamping to the
+        // future so a late wake cannot busy-spin (C++ `slot_start = max(slot_start,
+        // now())`).
+        let target_rate = self.description.opts().target_rate;
+        let now = self.now();
+        let mut next_deadline = deadline.checked_add(target_rate).unwrap_or(deadline);
+        if next_deadline <= now {
+            next_deadline = now.checked_add(target_rate).unwrap_or(now);
+        }
+
+        if let Some(active) = self.block_generation_active.as_mut() {
+            active.next_slot_deadline = next_deadline;
+        }
+        self.arm_slot_deadline_wake(next_loop_slot, request_id, next_deadline);
+    }
+
+    /// Publish a state-preserving empty filler for `loop_slot` while the real
+    /// collation `request_id` (dispatched for `slot_dispatched`) keeps running.
+    ///
+    /// Mirrors the C++ await-timeout branch publishing an empty at the current
+    /// loop slot and advancing `parent = id` WITHOUT disturbing the real's
+    /// in-flight collation: the empty goes through
+    /// [`Self::publish_candidate`] (no precollation entry), so
+    /// `precollated_blocks[slot_dispatched]` and `block_generation_active` are left
+    /// intact for the eventual late re-tag. The empty re-uses the parent block's
+    /// `BlockIdExt` (seqno preserved), so the real - collated against that same
+    /// state - re-parents cleanly onto the last filler when it completes.
+    ///
+    /// Returns `true` if a filler was published; `false` if none could be placed
+    /// (first block in an epoch cannot be empty, the parent `BlockIdExt` is not
+    /// resolvable yet, or - for a non-first filler - the head does not chain to
+    /// `loop_slot`, which would fork). On `false` the caller keeps waiting on the
+    /// same slot.
+    fn emit_slot_filler(
+        &mut self,
+        backend: &mut dyn CollationBackend,
+        loop_slot: SlotIndex,
+        slot_dispatched: SlotIndex,
+        request_id: u32,
+    ) -> bool {
+        // Chain off the current head when it directly precedes this loop slot in
+        // the same window (C++ `parent = id`). For the very first filler fall back
+        // to the parent the real itself locked at dispatch (the same underlying
+        // block). A non-first filler whose head does not chain cannot place a
+        // state-preserving empty without forking, so it declines.
+        let loop_window = self.description.get_window_idx(loop_slot);
+        let head_parent = self.local_chain_head().and_then(|head| {
+            if head.window == loop_window && head.slot + 1 == loop_slot {
+                Some(head.parent_info.clone())
+            } else {
+                None
+            }
+        });
+        let parent = match head_parent {
+            Some(p) => Some(p),
+            None if loop_slot == slot_dispatched => {
+                self.precollated(slot_dispatched).and_then(|pb| pb.parent.clone())
+            }
+            None => {
+                log::warn!(
+                    "Session {} emit_slot_filler: head does not chain to filler slot {} \
+                    (request_id={}); declining to fill (would fork)",
+                    &self.session_id().to_hex_string()[..8],
+                    loop_slot,
+                    request_id
+                );
+                return false;
+            }
+        };
+
+        let Some(parent) = parent else {
+            // First block in the epoch cannot be empty (C++ is_first_block).
+            log::debug!(
+                "Session {} emit_slot_filler: no parent for slot {} (first block in epoch \
+                cannot be empty); keep waiting for real collation (request_id={})",
+                &self.session_id().to_hex_string()[..8],
+                loop_slot,
+                request_id
+            );
+            return false;
+        };
+
+        let Some(parent_block_id) = self.resolve_parent_block_id(&parent, backend) else {
+            log::warn!(
+                "Session {} emit_slot_filler: parent BlockIdExt not resolved yet for slot {} \
+                (parent={}); keep waiting (request_id={})",
+                &self.session_id().to_hex_string()[..8],
+                loop_slot,
+                parent,
+                request_id
+            );
+            return false;
+        };
+
+        log::debug!(
+            "Session {} emit_slot_filler: real collation (request_id={}, dispatched slot {}) \
+            overran slot {}; publishing state-preserving empty filler (parent={}) and keeping \
+            the real alive",
+            &self.session_id().to_hex_string()[..8],
+            request_id,
+            slot_dispatched,
+            loop_slot,
+            parent
+        );
+
+        // `None` funnel slot: an empty filler is not a self-collation and must not
+        // consume the real's start record (keyed at `slot_dispatched`), which the
+        // late re-tag needs intact.
+        self.publish_candidate(
+            backend,
+            loop_slot,
+            Some(parent),
+            CollationResult::Empty { parent_block_id },
+            None,
+        );
+        true
     }
 
     /// Generate an empty block for `slot` directly (no `on_generate_slot`
@@ -1831,7 +2227,7 @@ impl CollationController {
         parent_block_id: BlockIdExt,
     ) {
         let (request_id, _request) =
-            self.create_pending_collation_request(slot, parent, min_gen_time);
+            self.create_pending_collation_request(slot, parent, min_gen_time, None, None, None);
         self.telemetry.record_collation_start();
         self.on_collation_complete(
             backend,
@@ -1843,6 +2239,62 @@ impl CollationController {
     }
 
     /* Completion & failure */
+
+    /// Clear the single in-flight REAL-collation marker, but only when `request_id`
+    /// is that collation's request: empty fillers (and any chained precollation)
+    /// carry their own request ids and must leave a still-running real collation
+    /// untouched. C++ parity: `block_generation_active` is reset only when the real
+    /// `block_generation` future resolves in `block-producer.cpp`.
+    fn clear_block_generation_if(&mut self, request_id: u32) {
+        if matches!(&self.block_generation_active, Some(s) if s.request_id == request_id) {
+            self.block_generation_active = None;
+        }
+    }
+
+    /// Drop the in-flight real-collation marker (and cancel its pending request) when
+    /// its leader window is no longer the current one.
+    ///
+    /// `reset()` already clears the marker on the normal window-change path, but the
+    /// stale-window early-returns in [`Self::check_collation`] and
+    /// [`Self::on_slot_deadline`] can be reached BEFORE that `reset()` when the FSM
+    /// progress cursor (or the local chain head) lags the consensus leader window.
+    /// Without this, the marker would stay set for the dead window and the
+    /// single-in-flight guard in [`Self::execute_collation_attempt`] would decline every
+    /// real collation in the new window, wedging block production. Mirrors the C++ block
+    /// producer replacing `cancellation_source_` / `block_generation` on each new
+    /// `OurLeaderWindowStarted`. Returns `true` when a stale marker was cleared.
+    fn clear_stale_block_generation(&mut self, backend: &dyn CollationBackend) -> bool {
+        let current_window = backend.current_leader_window_idx();
+        let Some((stale_slot, stale_window, stale_request_id)) = self
+            .block_generation_active
+            .as_ref()
+            .filter(|s| s.window != current_window)
+            .map(|s| (s.slot_dispatched, s.window, s.request_id))
+        else {
+            return false;
+        };
+
+        log::debug!(
+            "Session {} clearing stale in-flight real collation: dispatch slot {} window {} != \
+            current window {} (request_id={})",
+            &self.session_id().to_hex_string()[..8],
+            stale_slot,
+            stale_window,
+            current_window,
+            stale_request_id,
+        );
+
+        // Cancel the pending AsyncRequest so the collator stops and its (now stale)
+        // completion/failure callback is a no-op for the superseded window, then drop the
+        // precollation entry and its self-collation telemetry like `reset()` does.
+        if let Some(precollated) = self.precollated(stale_slot) {
+            precollated.request.cancel();
+        }
+        self.remove_precollated_block(stale_slot);
+        backend.forget_self_collation_tracking(stale_slot, "stale_window_block_generation_cleared");
+        self.block_generation_active = None;
+        true
+    }
 
     /// Handle a successful collation result. Moved from `SessionProcessor`
     /// matching origin/master: classifies the candidate against the FSM progress
@@ -1858,6 +2310,15 @@ impl CollationController {
     ) {
         instrument!();
         check_execution_time!(50_000);
+
+        // The real collation has resolved; release the single-in-flight marker. Empty
+        // fillers carry a different request id, so this leaves them untouched.
+        // Capture whether this result IS that tracked real collation BEFORE clearing,
+        // so the late re-tag below can tell a real that overran its slot (and had
+        // empty fillers published past it) apart from any other late callback.
+        let was_tracked_real =
+            matches!(&self.block_generation_active, Some(s) if s.request_id == request_id);
+        self.clear_block_generation_if(request_id);
 
         // C++ parity: the post-collation publication gate is the current leader
         // window, not the Rust progress cursor alone. The C++ block producer
@@ -1885,6 +2346,53 @@ impl CollationController {
             self.telemetry.collates_expire_counter.success();
             self.remove_precollated_block(slot);
             return;
+        }
+
+        // Late re-tag (C++ block-producer.cpp). If this is the tracked real
+        // collation and the per-slot wake already published empty fillers at/past
+        // its dispatch slot, the real cannot publish at its original `slot` - an
+        // empty filler already occupies it, and a second candidate there would
+        // equivocate. Publish the real at the current chain position re-parented to
+        // the last filler, exactly as the C++ loop emits the real at the
+        // then-current `slot` with `parent = id`. The fillers preserve the parent
+        // block's seqno, so the real (collated against that same state) re-parents
+        // cleanly. The locked precollation entry is consumed here.
+        if was_tracked_real {
+            let retag = self.local_chain_head().and_then(|head| {
+                if head.window == current_window && head.slot >= slot {
+                    Some((head.slot + 1, head.parent_info.clone()))
+                } else {
+                    None
+                }
+            });
+            if let Some((retag_slot, retag_parent)) = retag {
+                log::info!(
+                    "Session {} on_collation_complete: re-tagging late real from dispatch slot \
+                    {} to current slot {} re-parented to filler {} (request_id={})",
+                    self.session_id().to_hex_string(),
+                    slot,
+                    retag_slot,
+                    retag_parent,
+                    request_id
+                );
+                self.telemetry.collates_counter.success();
+                // The self-collation funnel start is keyed at the dispatch `slot`;
+                // emit "generated" and link against that slot, but publish at
+                // `retag_slot`.
+                self.telemetry.record_self_collation_generated(
+                    slot,
+                    "published_late_retagged_real",
+                    &self.description,
+                    self.now(),
+                );
+                self.telemetry.collates_expire_counter.failure();
+                self.publish_candidate(backend, retag_slot, Some(retag_parent), result, Some(slot));
+                self.remove_precollated_block(slot);
+                // C++ parity: after publishing, start precollation for the next slot
+                // in the same window (block-producer.cpp `++slot; parent = id;`).
+                self.precollate_block(backend, retag_slot + 1);
+                return;
+            }
         }
 
         if slot == fsm_first_non_progressed_slot {
@@ -2002,38 +2510,73 @@ impl CollationController {
         }
     }
 
-    /// Handle a failed collation attempt with retry-count tracking. Moved from
-    /// `SessionProcessor` matching origin/master: classifies the failure against
-    /// the FSM progress cursor and the retry budget inline (drop-progressed-past /
-    /// drop-max-retries / schedule-retry), and schedules the delayed retry
-    /// through the controller's own deferred-work queue, re-gating it when it
-    /// fires before re-dispatching [`Self::invoke_collation_retry`].
+    /// Handle a genuinely failed collation attempt — the collator returned an
+    /// error, as opposed to the per-slot deadline wake, which keeps a
+    /// slow-but-healthy collation alive and emits empty fillers.
+    ///
+    /// Faithful port of the C++ genuine-error branch in `block-producer.cpp`,
+    /// after releasing the single-in-flight marker and dropping the slot if it has
+    /// already progressed or its leader window moved on:
+    ///   * `allow_empty` — consensus finalized within
+    ///     `no_empty_blocks_on_error_timeout` AND a parent is available
+    ///     (`is_first_block == false`): recover by publishing ONE empty block for
+    ///     the failed slot and advancing, so the real is retried at the next slot
+    ///     through the normal pipeline. If the per-slot wake already published empty
+    ///     fillers past this slot, the recovery empty is re-tagged onto the current
+    ///     chain head to avoid equivocating with the filler that already occupies
+    ///     the dispatch slot.
+    ///   * `!allow_empty` — first block, or finalization stalled past
+    ///     `no_empty_blocks_on_error_timeout`: schedule one delayed restart of the
+    ///     SAME slot after a short backoff ([`COLLATION_ERROR_RESTART_BACKOFF`], C++
+    ///     `coro_sleep(0.1s)`).
+    ///
+    /// There is no attempt counter and no fixed restart cap: a restart re-dispatches
+    /// through [`Self::restart_collation`] reusing the ORIGINAL attempt's soft/hard
+    /// cutoffs + budget anchor ([`CollationDeadlineContext`]), so a further genuine error
+    /// schedules another delayed restart, but every attempt races the SAME absolute
+    /// window-end hard deadline — the leader window, not a counter, bounds the total. A
+    /// genuine hard-timeout is therefore end-of-window and is not retried; there is no
+    /// configurable collation retry loop.
     pub(crate) fn on_collation_failed_impl(
         &mut self,
         backend: &mut dyn CollationBackend,
         slot: SlotIndex,
         request_id: u32,
         err: Error,
-        retry_count: u32,
     ) {
         instrument!();
 
-        // `simplex_collates` increments per attempt for legacy reasons.
-        // Self-collation flows count attempts as ONE (initial + retries), so we
-        // only mark the self-collation flow as failed once we know no further
-        // retry will be scheduled (slot passed or max retries reached).
+        // Capture the original attempt's deadline context (soft/hard cutoffs + budget
+        // anchor) BEFORE releasing the single-in-flight marker, so a genuine-error
+        // restart reuses the SAME window-end budget instead of recomputing a fresh
+        // window-length budget from the (now advanced) clock.
+        let pinned_deadlines = self
+            .block_generation_active
+            .as_ref()
+            .filter(|s| s.request_id == request_id)
+            .map(|s| s.deadlines);
+
+        // The real collation has resolved (with an error); release the
+        // single-in-flight marker before the restart re-dispatches.
+        self.clear_block_generation_if(request_id);
+
+        // `simplex_collates` counts every attempt; the self-collation funnel counts
+        // the whole slot as ONE, so it records a terminal failure only when the slot
+        // is dropped (progressed past) below — a restart is not terminal.
         self.telemetry.collates_counter.failure();
 
-        // Use the FSM progress cursor to check if the slot has already
-        // progressed. Collation follows notarized/skipped progress, not
-        // finalization.
+        // Use the FSM progress cursor to check if the slot has already progressed.
+        // Collation follows notarized/skipped progress, not finalization.
         let fsm_first_non_progressed_slot = backend.first_non_progressed_slot();
-
         if slot < fsm_first_non_progressed_slot {
             log::warn!(
-                "Session {} on_collation_failed: slot {} already passed, ignoring",
+                "Session {} on_collation_failed: slot {} already passed (current={}), not \
+                restarting (error: {}, request_id={})",
                 self.session_id().to_hex_string(),
-                slot
+                slot,
+                fsm_first_non_progressed_slot,
+                err,
+                request_id
             );
             // Trace: collation failed because the slot progressed during the attempt.
             if let Some(tc) = &self.trace_collector {
@@ -2053,31 +2596,34 @@ impl CollationController {
             return;
         }
 
-        let retry_timeout = self.description.opts().collation_retry_timeout;
-        let retry_max = self.description.opts().collation_retry_max_attempts;
-
-        // Check if we've exceeded max retries.
-        if retry_count >= retry_max {
+        // Window moved on (C++ block-producer.cpp): a real that errored after its
+        // leader window ended cannot publish anything — neither a recovery empty nor a
+        // restart, since the next window's producer owns the chain now. Drop it,
+        // mirroring the stale-window discard in on_collation_complete.
+        let current_window = backend.current_leader_window_idx();
+        let slot_window = self.description.get_window_idx(slot);
+        if slot_window != current_window {
             log::warn!(
-                "Session {} on_collation_failed: max retries ({}) reached for slot {}, \
-                not scheduling retry (error: {}, request_id={})",
+                "Session {} on_collation_failed: discarding slot {} - window {} != current {} \
+                (error: {}, request_id={})",
                 self.session_id().to_hex_string(),
-                retry_max,
                 slot,
+                slot_window,
+                current_window,
                 err,
                 request_id
             );
-            // Trace: collation failed after exhausting all retries.
+            // Trace: collation dropped because its leader window moved on.
             if let Some(tc) = &self.trace_collector {
                 tc.record_collate_failed(
                     self.session_id(),
                     slot,
-                    &format!("max_retries_exhausted: {}", err),
+                    &format!("stale_window_error_discarded: {}", err),
                 );
             }
             self.telemetry.record_self_collation_final_failure(
                 slot,
-                &format!("max_retries_exhausted: {}", err),
+                "stale_window_error_discarded",
                 &self.description,
                 self.now(),
             );
@@ -2085,69 +2631,134 @@ impl CollationController {
             return;
         }
 
-        // Trace: per-attempt failure, a retry is being scheduled.
+        // Trace: a genuine collation error for this slot. This is not a per-attempt
+        // retry — the slot is either recovered with an empty block (allow_empty) or
+        // restarted once below.
         if let Some(tc) = &self.trace_collector {
             tc.record_collate_failed(
                 self.session_id(),
                 slot,
-                &format!(
-                    "retry_scheduled (attempt {}/{}): {}",
-                    retry_count + 1,
-                    retry_max + 1,
-                    err
-                ),
+                &format!("recover_or_restart: {}", err),
             );
         }
 
         log::info!(
-            "Session {} COLLATION_FLOW attempt_failed: expected_block_id={} slot={} \
-            attempt_failure={}/{} reason={}",
+            "Session {} COLLATION_FLOW collation_failed: expected_block_id={} slot={} reason={}",
             &self.session_id().to_hex_string()[..8],
             self.telemetry
                 .self_collation_start(slot)
                 .map(|(_, exp)| self.format_expected_block_id(exp))
                 .unwrap_or_else(|| "unknown".to_string()),
             slot,
-            retry_count + 1,
-            retry_max + 1,
             err,
         );
 
-        let next_retry_count = retry_count + 1;
-        let expiration_time = self.now() + retry_timeout;
+        // Capture the parent locked at dispatch before dropping the failed entry, so
+        // the recovery empty / restart can chain off the same parent the real used.
+        let locked_parent = self.precollated(slot).and_then(|pb| pb.parent.clone());
+        self.remove_precollated_block(slot);
 
+        // allow_empty (C++ block-producer.cpp): when consensus has finalized within
+        // no_empty_blocks_on_error_timeout AND a parent is available
+        // (is_first_block == false), recover from the genuine error by publishing ONE
+        // empty block for the failed slot and advancing — the real is retried at the
+        // next slot via the normal pipeline. Refresh the finalization timestamp first
+        // so the gate reads the freshest state (as the per-slot wake does).
+        self.refresh_finalization_timestamp(backend);
+        if self.empties_allowed_by_finalization() {
+            // Equivocation guard / re-tag (C++ block-producer.cpp): if the
+            // per-slot wake already published empty fillers at/past this slot
+            // (advancing local_chain_head within the current window), the failed slot
+            // is already occupied — publish the recovery empty at the current chain
+            // position re-parented to the last filler instead, exactly like the
+            // on_collation_complete late re-tag. Otherwise publish at the failed slot
+            // chained onto the real's locked parent.
+            let (publish_slot, parent) = match self.local_chain_head() {
+                Some(head) if head.window == current_window && head.slot >= slot => {
+                    (head.slot + 1, Some(head.parent_info.clone()))
+                }
+                _ => (slot, locked_parent),
+            };
+            if let Some(parent) = parent {
+                if let Some(parent_block_id) = self.resolve_parent_block_id(&parent, backend) {
+                    log::warn!(
+                        "Session {} on_collation_failed: collation error for slot {}, recovering \
+                        with an empty block at slot {} (allow_empty) (error: {}, request_id={})",
+                        self.session_id().to_hex_string(),
+                        slot,
+                        publish_slot,
+                        err,
+                        request_id
+                    );
+                    // The real self-collation for `slot` produced no block; close its
+                    // funnel as a (recovered) failure and publish the empty as a
+                    // non-self-collation filler (None funnel), mirroring the wake filler.
+                    self.telemetry.record_self_collation_final_failure(
+                        slot,
+                        &format!("collation_error_recovered_with_empty: {err}"),
+                        &self.description,
+                        self.now(),
+                    );
+                    self.publish_candidate(
+                        backend,
+                        publish_slot,
+                        Some(parent),
+                        CollationResult::Empty { parent_block_id },
+                        None,
+                    );
+                    // C++ parity: after publishing, start precollation for the next
+                    // slot (block-producer.cpp `++slot; parent = id;`), which
+                    // re-dispatches the real.
+                    self.precollate_block(backend, publish_slot + 1);
+                    return;
+                }
+            }
+            // allow_empty held but no resolvable parent (is_first_block): fall through
+            // to the restart path below.
+        }
+
+        let restart_at = self.now() + COLLATION_ERROR_RESTART_BACKOFF;
         log::warn!(
-            "Session {} on_collation_failed: scheduling retry {}/{} for slot {} in {:?} \
-            (error: {}, request_id={})",
+            "Session {} on_collation_failed: collation error for slot {}, scheduling one delayed \
+            restart in {:?} bounded by the shared window-end budget (error: {}, request_id={})",
             self.session_id().to_hex_string(),
-            next_retry_count,
-            retry_max,
             slot,
-            retry_timeout,
+            COLLATION_ERROR_RESTART_BACKOFF,
             err,
             request_id
         );
 
-        // Remove the failed precollation entry.
-        self.remove_precollated_block(slot);
-
-        // Schedule the retry through the controller's deferred-work queue. The
-        // retry-gate policy (has `slot` progressed, been superseded by a later
-        // precollated slot, or already completed?) is re-evaluated when the
-        // delayed task fires; when it clears, the re-dispatch runs through
-        // `invoke_collation_retry` against the freshly rebuilt `(&mut self,
-        // backend)` view.
-        self.queue().clone().post_delayed(expiration_time, move |collation, backend| {
+        // Schedule one delayed restart for this error after the backoff. The gate — slot
+        // progressed, a real collation already back in flight (single in-flight),
+        // superseded by a later precollated slot, or already completed — is re-evaluated
+        // when the delayed task fires; when it clears, the re-dispatch runs through
+        // `restart_collation` (which re-arms a fresh per-slot wake) reusing the ORIGINAL
+        // `pinned_deadlines`. The restart is not capped at a fixed count: a further
+        // genuine error reschedules another delayed restart, but every attempt shares the
+        // same absolute window-end hard deadline, so the leader window bounds the total.
+        self.queue().clone().post_delayed(restart_at, move |collation, backend| {
             let fsm_first_non_progressed_slot = backend.first_non_progressed_slot();
 
             // Slot already passed.
             if slot < fsm_first_non_progressed_slot {
                 log::trace!(
-                    "Session {} on_collation_failed retry: slot {} already passed \
-                    (current={}), skipping",
+                    "Session {} on_collation_failed restart: slot {} already passed (current={}), \
+                    skipping",
                     collation.session_id().to_hex_string(),
                     slot,
                     fsm_first_non_progressed_slot
+                );
+                return;
+            }
+
+            // A real collation is already back in flight (single in-flight guard);
+            // restarting would only be declined by `execute_collation_attempt`.
+            if collation.block_generation_active.is_some() {
+                log::trace!(
+                    "Session {} on_collation_failed restart: a real collation is already in \
+                    flight, skipping restart of slot {}",
+                    collation.session_id().to_hex_string(),
+                    slot
                 );
                 return;
             }
@@ -2156,8 +2767,8 @@ impl CollationController {
             if let Some(max_slot) = collation.precollated_blocks_max_slot {
                 if slot != max_slot {
                     log::trace!(
-                        "Session {} on_collation_failed retry: slot {} is not max \
-                        precollated slot (max={}), skipping",
+                        "Session {} on_collation_failed restart: slot {} is not max precollated \
+                        slot (max={}), skipping",
                         collation.session_id().to_hex_string(),
                         slot,
                         max_slot
@@ -2166,12 +2777,12 @@ impl CollationController {
                 }
             }
 
-            // Already precollated (completed successfully while we were waiting).
+            // Already precollated (completed while we were waiting).
             if let Some(precollated) = collation.precollated_blocks.get(&slot) {
                 if precollated.result.is_some() {
                     log::trace!(
-                        "Session {} on_collation_failed retry: slot {} already \
-                        precollated, skipping",
+                        "Session {} on_collation_failed restart: slot {} already precollated, \
+                        skipping",
                         collation.session_id().to_hex_string(),
                         slot
                     );
@@ -2180,28 +2791,26 @@ impl CollationController {
             }
 
             log::trace!(
-                "Session {} on_collation_failed retry: retrying slot {} (attempt {}/{})",
+                "Session {} on_collation_failed restart: restarting slot {}",
                 collation.session_id().to_hex_string(),
-                slot,
-                next_retry_count,
-                collation.description.opts().collation_retry_max_attempts
+                slot
             );
-
-            // Invoke collation with the retry count passed via the closure.
-            collation.invoke_collation_retry(backend, slot, next_retry_count);
+            collation.restart_collation(backend, slot, pinned_deadlines);
         });
     }
 
     /* Block generation & chaining */
 
-    /// Process a successfully generated block. Moved from `SessionProcessor`:
-    /// validates the leader-window freshness, builds the block descriptor
-    /// (normal or empty), persists candidate-info, seeds the synchronous
-    /// generated-parent cache + window-local chain head BEFORE the async
-    /// self-receive loop, broadcasts, loops the candidate back through
-    /// `on_candidate_received`, and updates the per-slot generated state. The
-    /// DB persist / broadcast / self-receive / per-slot writes go through the
-    /// borrowing [`CollationBackend`].
+    /// Process a successfully generated block for its original request slot.
+    ///
+    /// Thin precollation-aware wrapper over [`Self::publish_candidate`]: resolve
+    /// the parent locked at collation start, drop the precollation entry, then
+    /// publish at the request `slot` chained onto that locked parent. This is the
+    /// common path (a collation that completed before its slot's soft horizon).
+    /// The per-slot empty filler and the late-real re-tag bypass this wrapper and
+    /// call [`Self::publish_candidate`] directly with an explicit slot/parent so
+    /// they can publish off the current chain head without disturbing
+    /// `precollated_blocks`.
     ///
     /// Reference: C++ block-producer.cpp generate_candidates() loop.
     fn generated_block(
@@ -2210,9 +2819,6 @@ impl CollationController {
         slot: SlotIndex,
         result: CollationResult,
     ) {
-        instrument!();
-        check_execution_time!(100_000);
-
         // Get the parent from the precollated block BEFORE removing it. The
         // parent was locked at collation start to avoid races with consensus
         // events.
@@ -2220,6 +2826,45 @@ impl CollationController {
 
         // Remove from precollated blocks.
         self.remove_precollated_block(slot);
+
+        // A real collation completing at its own request slot: the self-collation
+        // funnel start record is keyed at that slot.
+        self.publish_candidate(backend, slot, parent, result, Some(slot));
+    }
+
+    /// Publish a generated candidate at `slot` chained onto `parent`,
+    /// independent of the precollation store.
+    ///
+    /// Carved out of [`Self::generated_block`] so the per-slot empty filler and
+    /// the late-real re-tag can publish at a slot and parent that differ from the
+    /// collation's original request slot / locked parent — exactly the C++
+    /// `build_id_with(slot)` / `parent = id` decoupling in `block-producer.cpp` —
+    /// without touching `precollated_blocks`.
+    ///
+    /// Validates leader-window freshness, builds the descriptor (normal or
+    /// empty), persists candidate-info, seeds the synchronous generated-parent
+    /// cache + window-local chain head BEFORE the async self-receive loop,
+    /// broadcasts, loops the candidate back through `on_candidate_received`, and
+    /// updates the per-slot generated state. DB persist / broadcast /
+    /// self-receive / per-slot writes go through the borrowing
+    /// [`CollationBackend`].
+    ///
+    /// `self_collation_funnel_slot` selects the slot whose self-collation start
+    /// record this publish links to (so end-to-end self-collation acceptance can
+    /// be matched on the candidate id): `Some(request_slot)` for a real collation
+    /// (the common path and the late re-tag both pass the original request slot,
+    /// not `slot`), `None` for an empty filler (an empty is NOT a self-collation
+    /// and must never consume a real's start record).
+    fn publish_candidate(
+        &mut self,
+        backend: &mut dyn CollationBackend,
+        slot: SlotIndex,
+        parent: Option<CandidateParentInfo>,
+        result: CollationResult,
+        self_collation_funnel_slot: Option<SlotIndex>,
+    ) {
+        instrument!();
+        check_execution_time!(100_000);
 
         // Stale window guard (C++ parity: block-producer.cpp generation loop,
         // consensus.cpp start_generation). Discard candidates whose leader window
@@ -2282,7 +2927,7 @@ impl CollationController {
         }
 
         log::trace!(
-            "Session {} generated_block: using locked parent for slot {}: {:?}",
+            "Session {} generated_block: parent for slot {}: {:?}",
             self.session_id().to_hex_string(),
             slot,
             parent.as_ref().map(|p| format!("{}:{}", p.slot, &p.hash.to_hex_string()[..8]))
@@ -2391,7 +3036,13 @@ impl CollationController {
         let candidate_parent_info =
             CandidateParentInfo { slot, hash: prepared.candidate_hash.clone() };
         let raw_id = RawCandidateId { slot, hash: prepared.candidate_hash.clone() };
-        self.telemetry.link_self_collation_candidate(slot, &raw_id, &self.description);
+        // Link the self-collation funnel start (real collations only) to this
+        // candidate id; empty fillers pass `None` so they never consume a real's
+        // start record (the re-tag links the dispatch slot's record to the
+        // re-tagged candidate id here).
+        if let Some(funnel_slot) = self_collation_funnel_slot {
+            self.telemetry.link_self_collation_candidate(funnel_slot, &raw_id, &self.description);
+        }
         self.insert_generated_parent(raw_id.clone(), prepared.block_id_ext.clone());
         if let Some(gen_utime_ms) = prepared.gen_utime_ms {
             self.insert_generated_parent_gen_utime_ms(
@@ -2606,7 +3257,7 @@ impl CollationController {
         backend: &dyn CollationBackend,
         slot: SlotIndex,
         source_info: crate::BlockSourceInfo,
-        request: crate::AsyncRequestPtr,
+        request: crate::AsyncCollationRequestPtr,
         parent: Option<CandidateParentInfo>,
         prev_block_ids: Vec<BlockIdExt>,
         callback: crate::ValidatorBlockCandidateCallback,
@@ -2817,7 +3468,6 @@ impl CollationController {
         slot: SlotIndex,
         request_id: u32,
         request: Arc<AsyncRequestImpl>,
-        attempt: CollationAttempt,
     ) -> crate::ValidatorBlockCandidateCallback {
         let session_id = self.session_id().clone();
         let description = self.description.clone();
@@ -2829,9 +3479,8 @@ impl CollationController {
         Box::new(move |result: ton_block::Result<ValidatorBlockCandidatePtr>| {
             if request_clone.is_cancelled() {
                 log::warn!(
-                    "Session {} {}: request {} for slot {} was cancelled",
+                    "Session {} invoke_collation: request {} for slot {} was cancelled",
                     session_id.to_hex_string(),
-                    attempt.log_context(),
                     request_id,
                     slot
                 );
@@ -2850,9 +3499,9 @@ impl CollationController {
 
             if generation_duration > MAX_GENERATION_TIME {
                 log::warn!(
-                    "Session {} {}: block generation took {:.3}s (expected <{:.3}s) for slot {}",
+                    "Session {} invoke_collation: block generation took {:.3}s (expected <{:.3}s) \
+                    for slot {}",
                     session_id.to_hex_string(),
-                    attempt.log_context(),
                     generation_duration.as_secs_f64(),
                     MAX_GENERATION_TIME.as_secs_f64(),
                     slot
@@ -2868,31 +3517,19 @@ impl CollationController {
                         .unwrap_or_else(|| "unknown".to_string());
                     log::info!(
                         "Session {} COLLATION_FLOW callback: expected_block_id={} slot={} \
-                        attempt={} outcome=generated generation_ms={} candidate_block_id={}",
+                        outcome=generated generation_ms={} candidate_block_id={}",
                         &collation.session_id().to_hex_string()[..8],
                         expected_block_id,
                         slot,
-                        Self::collation_attempt_label(attempt),
                         generation_duration.as_millis(),
                         candidate.id,
                     );
-                    match attempt {
-                        CollationAttempt::Initial => log::trace!(
-                            "Session {} invoke_collation: block generated for slot {} \
-                            (request_id={})",
-                            collation.session_id().to_hex_string(),
-                            slot,
-                            request_id
-                        ),
-                        CollationAttempt::Retry { retry_count } => log::trace!(
-                            "Session {} invoke_collation_retry: block generated for slot {} \
-                            (request_id={}, retry={})",
-                            collation.session_id().to_hex_string(),
-                            slot,
-                            request_id,
-                            retry_count
-                        ),
-                    }
+                    log::trace!(
+                        "Session {} invoke_collation: block generated for slot {} (request_id={})",
+                        collation.session_id().to_hex_string(),
+                        slot,
+                        request_id
+                    );
                     collation.on_collation_complete(
                         backend,
                         slot,
@@ -2908,36 +3545,19 @@ impl CollationController {
                         .unwrap_or_else(|| "unknown".to_string());
                     log::info!(
                         "Session {} COLLATION_FLOW callback: expected_block_id={} slot={} \
-                        attempt={} outcome=callback_failure generation_ms={} error={}",
+                        outcome=callback_failure generation_ms={} error={}",
                         &collation.session_id().to_hex_string()[..8],
                         expected_block_id,
                         slot,
-                        Self::collation_attempt_label(attempt),
                         generation_duration.as_millis(),
                         err,
                     );
-                    match attempt {
-                        CollationAttempt::Initial => log::warn!(
-                            "Session {} invoke_collation: block generation failed for slot \
-                            {slot}: {err}",
-                            collation.session_id().to_hex_string(),
-                        ),
-                        CollationAttempt::Retry { retry_count } => log::warn!(
-                            "Session {} invoke_collation_retry: block generation failed for slot \
-                            {} (retry={}): {}",
-                            collation.session_id().to_hex_string(),
-                            slot,
-                            retry_count,
-                            err
-                        ),
-                    }
-                    collation.on_collation_failed_impl(
-                        backend,
-                        slot,
-                        request_id,
-                        err,
-                        attempt.failure_retry_count(),
+                    log::warn!(
+                        "Session {} invoke_collation: block generation failed for slot {slot}: \
+                        {err}",
+                        collation.session_id().to_hex_string(),
                     );
+                    collation.on_collation_failed_impl(backend, slot, request_id, err);
                 }
             });
         })
@@ -3274,16 +3894,6 @@ impl CollationController {
 // ======================================================================
 // Stateless formatting / time-arithmetic helpers.
 impl CollationController {
-    /// `initial` / `retry-N` label for a collation attempt, used in the
-    /// COLLATION_FLOW callback log lines. Moved verbatim from `SessionProcessor`.
-    #[inline]
-    fn collation_attempt_label(attempt: CollationAttempt) -> String {
-        match attempt {
-            CollationAttempt::Initial => "initial".to_string(),
-            CollationAttempt::Retry { retry_count } => format!("retry-{retry_count}"),
-        }
-    }
-
     /// Milliseconds since the Unix epoch (collation-timing log helper). Moved
     /// verbatim from `SessionProcessor`.
     fn system_time_ms(time: SystemTime) -> u128 {
@@ -3313,6 +3923,8 @@ impl std::fmt::Debug for CollationController {
                 "generated_parent_gen_utime_ms_cache",
                 &self.generated_parent_gen_utime_ms_cache.len(),
             )
+            .field("block_generation_active", &self.block_generation_active)
+            .field("last_consensus_finalized_at", &self.last_consensus_finalized_at)
             .finish_non_exhaustive()
     }
 }
