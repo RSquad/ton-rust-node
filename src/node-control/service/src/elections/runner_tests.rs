@@ -4072,3 +4072,10 @@ async fn subject_election_id_populated_for_election_events() {
         assert_node_target(&ev.target, node_id, ELECTION_ID);
     }
 }
+
+#[test]
+fn withdraw_process_batch_and_gas_scales_with_queue_len() {
+    assert_eq!(super::withdraw_process_batch_and_gas(3), (3, 3 * 220_000_000));
+    assert_eq!(super::withdraw_process_batch_and_gas(10), (10, 10 * 220_000_000));
+    assert_eq!(super::withdraw_process_batch_and_gas(40), (10, 10 * 220_000_000));
+}

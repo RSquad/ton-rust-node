@@ -70,13 +70,20 @@ const WALLET_STORAGE_RESERVE: u64 = 1_000_000_000;
 /// ```
 /// where `my_balance` is already decreased by storage fees which we want to cover.
 const EXTRA_STORAGE_FEES: u64 = 5_000_000;
-/// Gas attached to `process_withdraw_requests` (TONCore op = 2). Must cover compute for
-/// `load_data` + dict iteration + payouts + `save_data`; 0.5 TON was too low (exit -14 on
-/// masterchain). Empirically ~0.9 TON gasFees for limit=10 on singlehost; 1 TON leaves margin.
-const WITHDRAW_PROCESS_GAS: u64 = 1_000_000_000; // 1 TON
+/// Per-request gas budget attached to `process_withdraw_requests` (TONCore op = 2).
+/// Mainnet empirics: ~0.18 TON/request on masterchain pools with many nominators;
+/// 0.22 TON/request leaves margin against exit -14 (Out of gas).
+const WITHDRAW_PROCESS_GAS_PER_REQUEST: u64 = 220_000_000;
 /// Withdraw requests processed per `process_withdraw_requests` call. Batched to stay within
-/// the gas credit from [`WITHDRAW_PROCESS_GAS`] (limit=100 with 0.5 TON consistently OOG).
+/// the per-request gas budget from [`WITHDRAW_PROCESS_GAS_PER_REQUEST`].
 const WITHDRAW_PROCESS_LIMIT: u8 = 10;
+
+/// Returns `(batch_limit, message_value)` for one `process_withdraw_requests` call.
+fn withdraw_process_batch_and_gas(queue_len: u32) -> (u8, u64) {
+    let batch = queue_len.min(WITHDRAW_PROCESS_LIMIT as u32).max(1) as u8;
+    let gas = batch as u64 * WITHDRAW_PROCESS_GAS_PER_REQUEST;
+    (batch, gas)
+}
 
 type OnStatusChange = Arc<dyn Fn(HashMap<String, BindingStatus>) + Send + Sync>;
 
@@ -1218,7 +1225,29 @@ impl ElectionRunner {
             return Ok(false);
         }
 
-        let fee = WITHDRAW_PROCESS_GAS + WALLET_COMPUTE_FEE;
+        let queue_len = match pool.get_pool_data().await {
+            Ok(data) => nominator::withdraw_requests_queue_len(data.withdraw_requests.as_ref())
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        "node [{}] withdraw requests count parse failed (using limit={} for gas estimate): {:#}",
+                        node_id,
+                        WITHDRAW_PROCESS_LIMIT,
+                        e
+                    );
+                    WITHDRAW_PROCESS_LIMIT as u32
+                }),
+            Err(e) => {
+                tracing::warn!(
+                    "node [{}] withdraw requests count failed (using limit={} for gas estimate): {:#}",
+                    node_id,
+                    WITHDRAW_PROCESS_LIMIT,
+                    e
+                );
+                WITHDRAW_PROCESS_LIMIT as u32
+            }
+        };
+        let (batch_limit, withdraw_gas) = withdraw_process_batch_and_gas(queue_len);
+        let fee = withdraw_gas + WALLET_COMPUTE_FEE;
         let wallet_balance = node.wallet_balance().await?;
         if wallet_balance < fee {
             tracing::warn!(
@@ -1232,12 +1261,7 @@ impl ElectionRunner {
 
         let wallet = node.wallet.clone();
         let msg = pool
-            .send_process_withdraw_requests(
-                wallet,
-                UnixTime::now(),
-                WITHDRAW_PROCESS_LIMIT,
-                WITHDRAW_PROCESS_GAS,
-            )
+            .send_process_withdraw_requests(wallet, UnixTime::now(), batch_limit, withdraw_gas)
             .await
             .context("build process_withdraw_requests message")?;
         let msg_boc = write_boc(&msg).context("encode process_withdraw_requests boc")?;
@@ -1260,9 +1284,11 @@ impl ElectionRunner {
         }
 
         tracing::info!(
-            "node [{}] process_withdraw_requests sent (limit={}, election_id={})",
+            "node [{}] process_withdraw_requests sent (queue={}, limit={}, gas={} TON, election_id={})",
             node_id,
-            WITHDRAW_PROCESS_LIMIT,
+            queue_len,
+            batch_limit,
+            withdraw_gas as f64 / 1_000_000_000.0,
             election_id
         );
         self.audit
