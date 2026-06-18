@@ -69,7 +69,8 @@ Defaults: 100 MiB per file, 10 files → ~1 GiB total history.
 ## Configuration
 
 All fields live under the `audit_log` key in the nodectl config file.
-None of them require a service restart — the values are read at startup.
+The values are read once at startup, so changing any of them requires a
+service restart to take effect.
 
 | Field | Default | Description |
 |---|---|---|
@@ -120,8 +121,9 @@ are personal data.
 
 - `record_client_ip = false` (default): no IP is ever written.
 - `record_client_ip = true`, `ip_anonymize = false`: full IP written.
-- `record_client_ip = true`, `ip_anonymize = true`: last IPv4 octet zeroed,
-  last two IPv6 groups masked (`::0:0`).
+- `record_client_ip = true`, `ip_anonymize = true`: last IPv4 octet zeroed
+  (`a.b.c.0`); for IPv6 only the first three groups are kept and the
+  remaining five are zeroed (`a:b:c:0:0:0:0:0`).
 
 Retention is bounded by `max_size_bytes × max_files`. Tune for your policy.
 Log files are **not** automatically deleted after a time-based retention period —

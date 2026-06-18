@@ -146,7 +146,7 @@ def resolve_audit_log_path(config_path: Path) -> Path:
 
     try:
         cfg = json.loads(config_path.read_text())
-        audit_path_str = cfg.get("audit", {}).get("path", "")
+        audit_path_str = cfg.get("audit_log", {}).get("path", "")
         if audit_path_str:
             p = Path(audit_path_str)
             if p.is_absolute():
