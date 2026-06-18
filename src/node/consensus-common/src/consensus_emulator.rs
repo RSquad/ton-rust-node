@@ -72,12 +72,13 @@
 //! synchronously without deadlocking.
 
 use crate::{
-    AsyncRequest, AsyncRequestPtr, BlockCandidatePriority, BlockHash, BlockPayloadPtr,
-    BlockSourceInfo, CandidateObservedFlags, CollationParentHint, ConsensusCommonFactory, Emulator,
-    EmulatorDelaySpec, EmulatorLeaderRotation, EmulatorOptions, EmulatorParams, EmulatorPtr,
-    EmulatorSignerSubset, EnsureCandidateAvailabilityOptions, PrivateKey, PublicKeyHash, Result,
-    Session, SessionId, SessionListenerPtr, SessionNode, ValidatorBlockCandidateCallback,
-    ValidatorBlockCandidateDecisionCallback, ValidatorBlockCandidatePtr, ValidatorWeight,
+    AsyncCollationRequest, AsyncCollationRequestPtr, AsyncRequest, BlockCandidatePriority,
+    BlockHash, BlockPayloadPtr, BlockSourceInfo, CandidateObservedFlags, CollationParentHint,
+    ConsensusCommonFactory, Emulator, EmulatorDelaySpec, EmulatorLeaderRotation, EmulatorOptions,
+    EmulatorParams, EmulatorPtr, EmulatorSignerSubset, EnsureCandidateAvailabilityOptions,
+    PrivateKey, PublicKeyHash, Result, Session, SessionId, SessionListenerPtr, SessionNode,
+    ValidatorBlockCandidateCallback, ValidatorBlockCandidateDecisionCallback,
+    ValidatorBlockCandidatePtr, ValidatorWeight,
 };
 use crossbeam::channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 use rand::{rngs::SmallRng, thread_rng, Rng, SeedableRng};
@@ -396,6 +397,8 @@ impl AsyncRequest for EmulatorAsyncRequest {
         self.cancelled.store(true, Ordering::SeqCst);
     }
 }
+
+impl AsyncCollationRequest for EmulatorAsyncRequest {}
 
 /// Marks an emulator worker thread as stopped on normal return and during
 /// panic unwinding, without catching the panic. `stop()` later joins the
@@ -1095,7 +1098,7 @@ impl EmulatorCore {
             });
             main_for_cb.post_closure(MainTaskMsg { spec: EmulatorDelaySpec::ZERO, work });
         });
-        let request_ptr: AsyncRequestPtr = request;
+        let request_ptr: AsyncCollationRequestPtr = request;
         self.callbacks_queue.post_closure(Box::new(move || {
             listener.on_generate_slot(source_info, request_ptr, parent_hint, cb);
         }));

@@ -124,6 +124,9 @@ pub type ValidatorBlockCandidateCallback =
 /// Pointer to async request
 pub type AsyncRequestPtr = Arc<dyn AsyncRequest + Send + Sync>;
 
+/// Pointer to an async collation request (carries the collation deadlines).
+pub type AsyncCollationRequestPtr = Arc<dyn AsyncCollationRequest + Send + Sync>;
+
 /// Pointer to SessionListener
 pub type SessionListenerPtr = Weak<dyn SessionListener + Send + Sync>;
 
@@ -1313,7 +1316,11 @@ pub struct ValidatorBlockCandidate {
 // Async Request
 // ============================================================================
 
-/// Async request tracking interface
+/// Async request tracking interface.
+///
+/// Shared by both the collation (`on_generate_slot`) and validation request paths,
+/// so it carries only the generic request lifecycle. Collation-specific deadlines
+/// live on the [`AsyncCollationRequest`] sub-trait.
 pub trait AsyncRequest: Send + Sync {
     /// Get unique request identifier
     fn get_request_id(&self) -> u32;
@@ -1326,6 +1333,44 @@ pub trait AsyncRequest: Send + Sync {
 
     /// Cancel the request
     fn cancel(&self);
+}
+
+/// Async request for a collation (`on_generate_slot`) attempt: an [`AsyncRequest`]
+/// extended with the absolute collation deadlines and budget anchor the collator
+/// honors. Kept separate from [`AsyncRequest`] so the shared validation path is not
+/// burdened with collation-only timing. Simplex supplies the deadlines; the defaults
+/// (`None`) keep Catchain and tests on the collator's static budgets.
+pub trait AsyncCollationRequest: AsyncRequest {
+    /// Absolute SOFT collation deadline for this generate-slot request (message-intake
+    /// cutoff). `None` means the collator falls back to its static `cutoff_timeout_ms`.
+    /// Simplex sets the per-slot deadline; the default keeps Catchain and tests on the
+    /// static budget. Absolute `SystemTime` (not a budget) so latency between the
+    /// simplex dispatch and the collator start cannot shift it.
+    fn get_collation_soft_deadline(&self) -> Option<std::time::SystemTime> {
+        None
+    }
+
+    /// Absolute HARD collation deadline for this generate-slot request (whole-collation
+    /// abort cap, the collation window end). `None` means the collator falls back to its
+    /// static `stop_timeout_ms`. Simplex sets this; the default keeps Catchain and tests
+    /// on the static budget.
+    fn get_collation_hard_deadline(&self) -> Option<std::time::SystemTime> {
+        None
+    }
+
+    /// Absolute start of the collation budget window for this request — the point the
+    /// collator's percentage-based message-intake sub-budgets are measured from (the
+    /// remaining soft window is `get_collation_soft_deadline - get_collation_budget_anchor`).
+    ///
+    /// This is the dispatch instant (C++ `block-producer.cpp` dispatches shardchains at
+    /// `slot_start - target_rate` and the masterchain at `slot_start`), which is distinct
+    /// from `get_creation_time()`: the latter stays the slot start (`min_gen_time`) used
+    /// for the block's `gen_utime` / `min_ts`, while this anchor predates it for shards so
+    /// the soft window does not collapse to zero. `None` means the collator falls back to
+    /// its static `cutoff_timeout_ms` (Catchain and tests).
+    fn get_collation_budget_anchor(&self) -> Option<std::time::SystemTime> {
+        None
+    }
 }
 
 // ============================================================================
@@ -1406,7 +1451,7 @@ pub trait SessionListener: Send + Sync {
     fn on_generate_slot(
         &self,
         source_info: BlockSourceInfo,
-        request: AsyncRequestPtr,
+        request: AsyncCollationRequestPtr,
         parent: CollationParentHint,
         callback: ValidatorBlockCandidateCallback,
     );

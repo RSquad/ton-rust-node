@@ -35,8 +35,8 @@ use crate::{
     BlockSourceInfo, MetricsHandle, SessionId, ValidatorBlockCandidateDecisionCallback,
 };
 use consensus_common::{
-    AsyncRequest, BlockCandidatePriority, CandidateObservedFlags, CollationParentHint,
-    ConsensusCommonFactory, SessionListener, ValidatorBlockCandidateCallback,
+    AsyncCollationRequest, AsyncRequest, BlockCandidatePriority, CandidateObservedFlags,
+    CollationParentHint, ConsensusCommonFactory, SessionListener, ValidatorBlockCandidateCallback,
 };
 use std::{
     collections::VecDeque,
@@ -142,7 +142,7 @@ impl SessionListener for RecordingListener {
     fn on_generate_slot(
         &self,
         _source_info: BlockSourceInfo,
-        _request: AsyncRequestPtr,
+        _request: AsyncCollationRequestPtr,
         parent: CollationParentHint,
         _callback: ValidatorBlockCandidateCallback,
     ) {
@@ -203,8 +203,8 @@ impl SessionListener for RecordingListener {
     }
 }
 
-/// Minimal `AsyncRequest` mock — `notify_generate_slot` takes an
-/// `AsyncRequestPtr` payload but never invokes any of its methods inside
+/// Minimal `AsyncCollationRequest` mock — `notify_generate_slot` takes an
+/// `AsyncCollationRequestPtr` payload but never invokes any of its methods inside
 /// `SessionCallbacks`; the trait is only satisfied so the listener can
 /// receive a live handle.
 struct DummyAsyncRequest;
@@ -221,6 +221,8 @@ impl AsyncRequest for DummyAsyncRequest {
         SystemTime::UNIX_EPOCH
     }
 }
+
+impl AsyncCollationRequest for DummyAsyncRequest {}
 
 /*
     Construction helpers
@@ -448,7 +450,7 @@ fn notify_generate_slot_dispatches_to_listener_inline() {
     let (listener, listener_ptr) = make_listener();
     let (callbacks, _queue) = make_callbacks_with_listener(stop, false, listener_ptr);
 
-    let request: AsyncRequestPtr = Arc::new(DummyAsyncRequest);
+    let request: AsyncCollationRequestPtr = Arc::new(DummyAsyncRequest);
     let parent = CollationParentHint::Implicit;
     let generation_callback: ValidatorBlockCandidateCallback =
         Box::new(|_: consensus_common::Result<consensus_common::ValidatorBlockCandidatePtr>| {});

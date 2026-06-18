@@ -19,7 +19,7 @@
 //! 4. `set_params(...)` mutates cadence at runtime.
 
 use consensus_common::{
-    AsyncRequestPtr, BlockHash, BlockPayloadPtr, BlockSourceInfo, CandidateObservedFlags,
+    AsyncCollationRequestPtr, BlockHash, BlockPayloadPtr, BlockSourceInfo, CandidateObservedFlags,
     CollationParentHint, ConsensusCommonFactory, EmulatorDelaySpec, EmulatorLeaderRotation,
     EmulatorOptions, EmulatorParams, EmulatorPtr, EmulatorSignerSubset, PublicKey, PublicKeyHash,
     SessionId, SessionListener, SessionListenerPtr, SessionNode, ValidatorBlockCandidate,
@@ -149,7 +149,7 @@ impl SessionListener for Recorder {
     fn on_generate_slot(
         &self,
         source_info: BlockSourceInfo,
-        _request: AsyncRequestPtr,
+        _request: AsyncCollationRequestPtr,
         _parent: CollationParentHint,
         callback: ValidatorBlockCandidateCallback,
     ) {

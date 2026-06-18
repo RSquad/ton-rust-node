@@ -176,7 +176,7 @@ impl SessionListener for RestartSingleSessionListener {
     fn on_generate_slot(
         &self,
         source_info: BlockSourceInfo,
-        request: AsyncRequestPtr,
+        request: AsyncCollationRequestPtr,
         parent: consensus_common::CollationParentHint,
         callback: ValidatorBlockCandidateCallback,
     ) {

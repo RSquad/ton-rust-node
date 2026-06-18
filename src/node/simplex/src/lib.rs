@@ -150,6 +150,7 @@
 // crate-internal `#[cfg(test)]` test module.
 mod block;
 mod candidate_book;
+mod candidate_controller;
 mod certificate;
 mod collation_controller;
 mod consensus_controller;
@@ -194,6 +195,10 @@ pub use consensus_common::utils::MetricsHandle;
 pub use consensus_common::ActivityNode;
 /// Activity node pointer
 pub use consensus_common::ActivityNodePtr;
+/// Async collation request interface (collation deadlines)
+pub use consensus_common::AsyncCollationRequest;
+/// Async collation request pointer
+pub use consensus_common::AsyncCollationRequestPtr;
 /// Async request interface
 pub use consensus_common::AsyncRequest;
 /// Async request pointer
@@ -447,12 +452,6 @@ pub struct SessionOptions {
     /// Timeout between validation retry attempts
     pub validation_retry_timeout: Duration,
 
-    /// Collation retry timeout
-    pub collation_retry_timeout: Duration,
-
-    /// Collation retry max attempts
-    pub collation_retry_max_attempts: u32,
-
     /// Standstill timeout - if no finalization occurs within this period,
     /// re-broadcast all our votes for tracked slots
     /// Default: 10 seconds (matches C++ standstill_timeout_s)
@@ -529,8 +528,10 @@ pub struct SessionOptions {
     // C++ candidate-resolver.cpp parity (1-second sliding window per peer).
     pub candidate_resolve_rate_limit: u32,
 
-    // TODO: wire into empty-block error backoff. C++ block-producer.cpp suppresses
-    // empty blocks for this period after a failed normal collation.
+    // Empty-block suppression window (C++ `allow_empty` in block-producer.cpp):
+    // once consensus has not finalized anything for this period, the producer stops
+    // emitting empty fillers and keeps waiting for a real block. Read by the
+    // collation controller's per-slot deadline wake.
     pub no_empty_blocks_on_error_timeout: Duration,
 
     /// Label set attached to per-session metrics that are republished to the
@@ -579,8 +580,6 @@ impl Default for SessionOptions {
             use_callback_thread: true,
             validation_retry_attempts: 0,
             validation_retry_timeout: Duration::from_secs(1),
-            collation_retry_timeout: Duration::from_millis(500),
-            collation_retry_max_attempts: 3,
             standstill_timeout: Duration::from_secs(10),
             empty_block_mc_lag_threshold: None,
             wait_for_db_init: false,
@@ -627,13 +626,6 @@ impl SessionOptions {
         if self.first_block_timeout.is_zero() {
             fail!("first_block_timeout must be > 0")
         }
-
-        // Collation flow parameters
-        if self.collation_retry_timeout.is_zero() {
-            fail!("collation_retry_timeout must be > 0")
-        }
-
-        // collation_retry_max_attempts = 0 is valid (no retries)
 
         if self.health_alert_cooldown.is_zero() {
             fail!("health_alert_cooldown must be > 0")

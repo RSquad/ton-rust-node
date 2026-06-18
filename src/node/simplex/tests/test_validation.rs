@@ -113,7 +113,7 @@ impl SessionListener for ValidationTestListener {
     fn on_generate_slot(
         &self,
         source_info: simplex::BlockSourceInfo,
-        request: simplex::AsyncRequestPtr,
+        request: simplex::AsyncCollationRequestPtr,
         parent: consensus_common::CollationParentHint,
         callback: ValidatorBlockCandidateCallback,
     ) {

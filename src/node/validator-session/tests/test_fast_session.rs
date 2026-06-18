@@ -64,7 +64,7 @@ impl SessionListener for DummySessionListener {
     fn on_generate_slot(
         &self,
         source_info: validator_session::BlockSourceInfo,
-        _request: validator_session::AsyncRequestPtr,
+        _request: validator_session::AsyncCollationRequestPtr,
         parent: validator_session::CollationParentHint,
         callback: ValidatorBlockCandidateCallback,
     ) {

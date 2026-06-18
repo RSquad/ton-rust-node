@@ -180,7 +180,7 @@ impl consensus_common::SessionListener for NoopSessionListener {
     fn on_generate_slot(
         &self,
         _source_info: consensus_common::BlockSourceInfo,
-        _request: consensus_common::AsyncRequestPtr,
+        _request: consensus_common::AsyncCollationRequestPtr,
         _parent: consensus_common::CollationParentHint,
         _callback: consensus_common::ValidatorBlockCandidateCallback,
     ) {

@@ -35,6 +35,8 @@ use catchain::CatchainPtr;
 // Re-export common types from consensus-common
 pub use consensus_common::{
     // Session types
+    AsyncCollationRequest,
+    AsyncCollationRequestPtr,
     AsyncRequest,
     AsyncRequestPtr,
     BlockCandidatePriority,

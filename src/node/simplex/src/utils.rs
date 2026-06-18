@@ -36,7 +36,9 @@
 //! This matches C++ reference implementation (`consensus-types.cpp`).
 //!
 
-use crate::{AsyncRequest, PrivateKey, PublicKey, SessionId, ValidatorWeight};
+use crate::{
+    AsyncCollationRequest, AsyncRequest, PrivateKey, PublicKey, SessionId, ValidatorWeight,
+};
 use std::{
     any::Any,
     backtrace::Backtrace,
@@ -942,7 +944,7 @@ pub fn extract_before_split_flag(block_data: &[u8]) -> Result<bool> {
 
 /// Compute the block-sync overlay short id from a session id.
 ///
-/// Mirrors C++ `block-sync-overlay.cpp:48-50`:
+/// Mirrors C++ `block-sync-overlay.cpp`:
 ///   overlay_seed = serialize(consensus.blockSyncOverlayId{ session_id })
 ///   overlay_full_id = OverlayIdFull{ overlay_seed }
 ///   overlay_short_id = overlay_full_id.compute_short_id()
@@ -973,6 +975,18 @@ pub(crate) struct AsyncRequestImpl {
     request_id: u32,
     /// Time when request was created
     creation_time: SystemTime,
+    /// Absolute per-slot SOFT cutoff (message-intake) deadline for a real
+    /// collation, or `None` for non-collation / empty-block requests. Surfaced to
+    /// the collator via [`AsyncCollationRequest::get_collation_soft_deadline`].
+    soft_deadline: Option<SystemTime>,
+    /// Absolute window-end HARD cap for a real collation, or `None`. Surfaced to the
+    /// collator via [`AsyncCollationRequest::get_collation_hard_deadline`].
+    hard_deadline: Option<SystemTime>,
+    /// Absolute start of the collation budget window (the dispatch instant), or `None`.
+    /// Distinct from `creation_time` (the slot start / `min_gen_time`): for shardchains
+    /// it predates the slot start by `target_rate` so the collator's soft sub-budgets do
+    /// not collapse. Surfaced via [`AsyncCollationRequest::get_collation_budget_anchor`].
+    budget_anchor: Option<SystemTime>,
     /// Flag indicating request was cancelled
     cancelled: Arc<AtomicBool>,
     /// Whether to cancel on drop
@@ -980,14 +994,35 @@ pub(crate) struct AsyncRequestImpl {
 }
 
 impl AsyncRequestImpl {
+    /// Test-only convenience constructor for a request with no collation deadlines;
+    /// production always supplies them via [`Self::new_with_deadlines`].
+    #[cfg(test)]
     pub(crate) fn new(
         request_id: u32,
         cancel_on_drop: bool,
         creation_time: SystemTime,
     ) -> Arc<Self> {
+        Self::new_with_deadlines(request_id, cancel_on_drop, creation_time, None, None, None)
+    }
+
+    /// Like [`Self::new`] but carries the absolute collation soft/hard deadlines and
+    /// budget anchor Simplex computes for the slot (see
+    /// `CollationController::collation_deadlines`). Non-collation and empty-block
+    /// requests use [`Self::new`] (deadlines and anchor all `None`).
+    pub(crate) fn new_with_deadlines(
+        request_id: u32,
+        cancel_on_drop: bool,
+        creation_time: SystemTime,
+        soft_deadline: Option<SystemTime>,
+        hard_deadline: Option<SystemTime>,
+        budget_anchor: Option<SystemTime>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             request_id,
             creation_time,
+            soft_deadline,
+            hard_deadline,
+            budget_anchor,
             cancelled: Arc::new(AtomicBool::new(false)),
             cancel_on_drop,
         })
@@ -1009,6 +1044,20 @@ impl AsyncRequest for AsyncRequestImpl {
 
     fn get_creation_time(&self) -> SystemTime {
         self.creation_time
+    }
+}
+
+impl AsyncCollationRequest for AsyncRequestImpl {
+    fn get_collation_soft_deadline(&self) -> Option<SystemTime> {
+        self.soft_deadline
+    }
+
+    fn get_collation_hard_deadline(&self) -> Option<SystemTime> {
+        self.hard_deadline
+    }
+
+    fn get_collation_budget_anchor(&self) -> Option<SystemTime> {
+        self.budget_anchor
     }
 }
 
