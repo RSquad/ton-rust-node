@@ -2,10 +2,7 @@ name: CI
 
 on:
   pull_request:
-    branches:
-      - master
-      - release/**
-      - feature/sma-99-audit-log-architecture  # delete after merge into release branch
+    branches: ["master", "release/**"]
     paths-ignore:
       - "**/*.md"
       - "docs/**"
