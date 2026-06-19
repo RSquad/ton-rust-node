@@ -390,8 +390,12 @@ fn store_opt_std_addr<T: OperationBehavior>(
         }
         Ok(false) => {
             if T::quiet() && none_allowed {
-                // inconsistent here for quiet version
-                engine.cc.stack.push_slice(Default::default());
+                if engine.block_version() >= 14 {
+                    engine.cc.stack.push(var);
+                } else {
+                    // v13 behavior returned an empty slice instead of the invalid value
+                    engine.cc.stack.push_slice(Default::default());
+                }
                 engine.cc.stack.push_builder(builder);
                 engine.cc.stack.push_bool(true);
             } else {

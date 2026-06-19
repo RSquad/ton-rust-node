@@ -68,10 +68,19 @@ fn test_division_primitives_names() {
     for mode in 0..64 {
         let mode = DivMode::with_flags(mode << 2);
         if let Ok(name) = mode.command_name() {
-            println!("(0b{:08b}, [\"{name}C\", \"{name}\", \"{name}R\"]),", mode.flags);
+            // println!("(0b{:08b}, [\"{name}C\", \"{name}\", \"{name}R\"]),", mode.flags);
             assert_eq!(name, mode.command_name_static().unwrap())
         } else {
-            assert!(!mode.is_valid());
+            assert!(!mode.is_valid(false));
+        }
+    }
+    for mode in 0..64 {
+        let mode = DivMode::with_flags(mode << 2);
+        if let Ok(name) = mode.command_name() {
+            // println!("(0b{:08b}, [\"Q{name}C\", \"Q{name}\", \"Q{name}R\"]),", mode.flags);
+            assert_eq!(name, mode.command_name_static().unwrap())
+        } else {
+            assert!(!mode.is_valid(true));
         }
     }
 }
@@ -81,11 +90,23 @@ fn test_division_primitives_execution() {
     let mut count = 0;
     for flags in 0..=0b11111111 {
         let mode = DivMode::with_flags(flags);
-        if !mode.is_valid() {
-            println!("Flags: {:#010b}, <NOT IMPLEMENTED>", mode.flags);
+        if !mode.is_valid(false) {
+            // println!("Flags: {:#010b}, <NOT IMPLEMENTED>", mode.flags);
             continue;
         }
         test_div_primitive_execution::<Signaling>(&mode);
+        if !mode.shift_parameter() {
+            count += 1;
+        }
+    }
+    assert_eq!(60, count);
+    let mut count = 0;
+    for flags in 0..=0b11111111 {
+        let mode = DivMode::with_flags(flags);
+        if !mode.is_valid(true) {
+            // println!("Flags: {:#010b}, <NOT IMPLEMENTED>", mode.flags);
+            continue;
+        }
         test_div_primitive_execution::<Quiet>(&mode);
         if !mode.shift_parameter() {
             count += 1;
@@ -121,8 +142,8 @@ fn test_div_primitive_execution<T>(mode: &DivMode)
 where
     T: OperationBehavior,
 {
-    let command_name = command_name_from_mode::<T>(mode);
-    println!("Flags: {:#010b}, Cmd: {}", mode.flags, command_name);
+    let _command_name = command_name_from_mode::<T>(mode);
+    // println!("Flags: {:#010b}, Cmd: {}", mode.flags, _command_name);
 
     let mut value = 15;
     let add = 6;
@@ -216,7 +237,7 @@ fn test_slice(offset: usize, r: usize, x: usize) -> Status {
     builder.append_bits(0x34, 8)?; // remainder in code slice
 
     let mut code = SliceData::load_builder(builder)?;
-    println!("offset: {}, r: {}, x: {}, code: {}", offset, r, x, code);
+    // println!("offset: {}, r: {}, x: {}, code: {}", offset, r, x, code);
     let mut engine =
         Engine::with_capabilities(0).setup(code.clone().into_cell()?, None, None, None, vec![])?;
     engine.load_instruction(

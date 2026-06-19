@@ -733,9 +733,9 @@ fn test_quic_multi_key_same_address() {
         let endpoint =
             quinn::Endpoint::new(quinn::EndpointConfig::default(), None, udp, runtime).unwrap();
 
-        // SNI name matching QuicNode's key_id_to_server_name
+        // C++-compatible SNI (PR #2397): "<hex[..32]>.<hex[32..]>.adnl" for the server's id.
         let hex = hex::encode(server_key_id.data());
-        let sni = format!("{}.{}", &hex[..32], &hex[32..]);
+        let sni = format!("{}.{}.adnl", &hex[..32], &hex[32..]);
 
         // Open connection 1 with key1
         let conn1 = endpoint
@@ -817,6 +817,127 @@ fn test_quic_multi_key_same_address() {
         conn1.close(0u32.into(), b"done");
         conn2.close(0u32.into(), b"done");
         endpoint.close(0u32.into(), b"done");
+        server.shutdown();
+        server_token.cancel();
+    });
+}
+
+// ===========================================================================
+// Test 1b-2: C++-compatible SNI routing across multiple server identities
+// ===========================================================================
+
+/// Verifies SNI-based identity dispatch matching the C++ node: a server hosting
+/// several identities on one UDP port presents the identity whose SNI the client
+/// requested (compute_sni_name = "<hex[..32]>.<hex[32..]>.adnl") and falls back
+/// to the active identity when the SNI is missing or the legacy "ton" value.
+/// Unknown SNI (anything else) is rejected during the TLS handshake.
+/// This also exercises end-to-end SNI handling for the split-hex name format,
+/// which keeps each DNS label within the RFC 1035 63-octet limit so rustls
+/// accepts it without any special-case handling.
+#[test]
+fn test_quic_sni_identity_routing() {
+    init_test_log();
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        const SERVER_PORT: u16 = 5960;
+
+        // C++-compatible SNI (PR #2397): "<hex[..32]>.<hex[32..]>.adnl".
+        let sni_of = |key_id: &Arc<KeyId>| {
+            let hex = hex::encode(key_id.data());
+            format!("{}.{}.adnl", &hex[..32], &hex[32..])
+        };
+        // Ed25519 public key (last 32 bytes of the 44-byte SPKI) for a private key.
+        let pubkey_of = |key: &[u8; ED25519_SECRET_KEY_LENGTH]| -> [u8; 32] {
+            let der = rustls::pki_types::PrivateKeyDer::try_from(
+                ed25519_encode_private_key_to_pkcs8(key).unwrap(),
+            )
+            .unwrap();
+            let kp = rcgen::KeyPair::from_der_and_sign_algo(&der, &rcgen::PKCS_ED25519).unwrap();
+            let spki = kp.public_key_der();
+            spki[12..44].try_into().unwrap()
+        };
+        // Public key the server presented during the handshake (server's RPK SPKI).
+        let presented_pubkey = |conn: &quinn::Connection| -> [u8; 32] {
+            let id = conn.peer_identity().expect("no server identity");
+            let certs =
+                id.downcast::<Vec<rustls::pki_types::CertificateDer>>().expect("not RPK certs");
+            let spki = certs.first().expect("empty cert chain");
+            spki.as_ref()[12..44].try_into().expect("short SPKI")
+        };
+
+        // Server with identity A (auto-activated as the default).
+        let (server, key_a, key_a_id, server_bind, server_token) = make_endpoint(SERVER_PORT);
+
+        // Register a second identity B on the SAME port (no activation).
+        let key_b = ed25519_generate_private_key().unwrap().to_bytes();
+        let (_, cfg_b) = AdnlNodeConfig::from_ip_address_and_private_keys(
+            "127.0.0.1:5961",
+            vec![(key_b, KEY_TAG)],
+        )
+        .unwrap();
+        let key_b_id = cfg_b.key_by_tag(KEY_TAG).unwrap().id().clone();
+        server.add_key(&key_b, &key_b_id, server_bind).unwrap();
+
+        // Raw client endpoint (one client identity is enough; we vary only the SNI).
+        let client_key = ed25519_generate_private_key().unwrap().to_bytes();
+        let client_config = build_raw_quinn_client(&client_key);
+        let client_ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+
+        // SNI of B reaches identity B even though A is the active default. The
+        // successful connect_with proves rustls accepted the 64-char label.
+        let conn_b = client_ep
+            .connect_with(client_config.clone(), server_bind, &sni_of(&key_b_id))
+            .unwrap()
+            .await
+            .expect("connect with B's SNI failed");
+        assert_eq!(
+            presented_pubkey(&conn_b),
+            pubkey_of(&key_b),
+            "SNI of B should route to identity B"
+        );
+
+        // SNI of A reaches identity A.
+        let conn_a = client_ep
+            .connect_with(client_config.clone(), server_bind, &sni_of(&key_a_id))
+            .unwrap()
+            .await
+            .expect("connect with A's SNI failed");
+        assert_eq!(
+            presented_pubkey(&conn_a),
+            pubkey_of(&key_a),
+            "SNI of A should route to identity A"
+        );
+
+        // Unknown SNI is rejected: the server returns no cert from the resolver
+        // and rustls fails the TLS handshake. The connection must not establish.
+        let unknown_result = client_ep
+            .connect_with(client_config.clone(), server_bind, "unknown.adnl")
+            .unwrap()
+            .await;
+        assert!(
+            unknown_result.is_err(),
+            "unknown SNI should fail the handshake, got {unknown_result:?}"
+        );
+
+        // Legacy "ton" SNI (older Rust clients used to send this dummy value)
+        // falls back to the active identity silently (no WARN, no rejection).
+        let conn_legacy = client_ep
+            .connect_with(client_config, server_bind, "ton")
+            .unwrap()
+            .await
+            .expect("connect with legacy \"ton\" SNI failed");
+        assert_eq!(
+            presented_pubkey(&conn_legacy),
+            pubkey_of(&key_a),
+            "legacy \"ton\" SNI should fall back to the active identity A"
+        );
+
+        println!("PASS: SNI routes to B, A; unknown rejected; legacy \"ton\" falls back to active");
+
+        conn_a.close(0u32.into(), b"done");
+        conn_b.close(0u32.into(), b"done");
+        conn_legacy.close(0u32.into(), b"done");
+        client_ep.close(0u32.into(), b"done");
         server.shutdown();
         server_token.cancel();
     });
@@ -956,10 +1077,14 @@ fn test_quic_key_rotation() {
             ep
         };
 
-        // SNI — the server ignores it (single active identity), but quinn
-        // requires a valid server_name.
-        let hex = hex::encode(key_a_id.data());
-        let sni = format!("{}.{}", &hex[..32], &hex[32..]);
+        // SNI — use the legacy "ton" value so every connect falls through to
+        // the active identity. This test asserts which identity is currently
+        // active over the lifecycle (add/activate/remove); routing by SNI would
+        // short-circuit that by always pinning to whichever id the SNI names,
+        // defeating the test's intent. An arbitrary non-matching SNI would be
+        // rejected outright by QuicServerCertResolver, so "ton" is the only
+        // value that exercises the active-identity fallback path here.
+        let sni = "ton";
 
         // ---- Step 1: only key A registered, server must present key A ----
         let ep1 = make_raw_endpoint(0);
@@ -1094,7 +1219,7 @@ fn test_quic_stream_read_timeout() {
         endpoint.set_default_client_config(client_config);
 
         let hex = hex::encode(server_key_id.data());
-        let sni = format!("{}.{}", &hex[..32], &hex[32..]);
+        let sni = format!("{}.{}.adnl", &hex[..32], &hex[32..]);
 
         let conn =
             endpoint.connect(server_bind, &sni).unwrap().await.expect("raw conn handshake failed");
@@ -1253,7 +1378,7 @@ fn test_quic_reject_non_rpk_client() {
         rogue_endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic_crypto)));
 
         let hex = hex::encode(server_key_id.data());
-        let sni = format!("{}.{}", &hex[..32], &hex[32..]);
+        let sni = format!("{}.{}.adnl", &hex[..32], &hex[32..]);
 
         let handshake_result = tokio::time::timeout(
             Duration::from_secs(10),
@@ -1924,18 +2049,15 @@ fn test_parse_quic_address_only_quic() {
 }
 
 #[test]
-fn test_parse_quic_address_picks_first() {
+fn test_parse_quic_address_rejects_duplicate() {
     let ip1: u32 = u32::from(Ipv4Addr::new(1, 1, 1, 1));
     let ip2: u32 = u32::from(Ipv4Addr::new(2, 2, 2, 2));
     let list =
         make_address_list(vec![udp_addr(ip1, 30000), quic_addr(ip1, 31000), quic_addr(ip2, 32000)]);
 
-    let (_, result) = AdnlNode::parse_address_list(&list).unwrap().unwrap();
-    // Should return the first quic address
-    assert_eq!(
-        result.map(|q| ip_address_to_socket_addr(&q)),
-        Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 31000))
-    );
+    // A list carrying more than one QUIC address is malformed. parse_address_list
+    // rejects the whole list rather than guessing which QUIC address to trust.
+    assert!(AdnlNode::parse_address_list(&list).unwrap().is_none());
 }
 
 // --- parse_address_list still works (not broken by new variant) ---
@@ -2079,8 +2201,9 @@ fn test_quic_address_dht_distribution() {
 
 /// Test: address list without adnl.address.quic does NOT set peer_quic_address.
 ///
-/// Node1 does NOT set a QUIC port, stores its address via DHT.
-/// Node2 fetches it and verifies no QUIC address is stored.
+/// `init_local_dht_pair` configures a QUIC port on node1 only, so node2 is the
+/// node without one. Node2 stores its address via DHT, node1 fetches it and
+/// verifies no QUIC address is stored.
 #[test]
 fn test_no_quic_address_dht_distribution() {
     let (rt, adnl1, dht1, _overlay1, adnl2, dht2, _overlay2) = init_local_dht_pair(4293, 4294);
@@ -2091,8 +2214,8 @@ fn test_no_quic_address_dht_distribution() {
         assert!(dht1.ping(&peer2).await.unwrap());
         assert!(dht2.ping(&peer1).await.unwrap());
 
-        // Node1: no QUIC port set — build_address_list should only have UDP
-        let addr_list = adnl1.build_address_list(None).unwrap();
+        // Node2: no QUIC port set — build_address_list should only have UDP
+        let addr_list = adnl2.build_address_list(None).unwrap();
         let (_, quic_addr) = AdnlNode::parse_address_list(&addr_list).unwrap().unwrap();
         assert!(
             quic_addr.is_none(),
@@ -2100,14 +2223,14 @@ fn test_no_quic_address_dht_distribution() {
         );
 
         // Store and fetch
-        assert!(dht1.store_ip_address(&dht1.key()).await.unwrap());
-        let key1_id = dht1.key().id().clone();
-        let fetched = dht2.fetch_address(&key1_id).await.unwrap();
+        assert!(dht2.store_ip_address(&dht2.key()).await.unwrap());
+        let key2_id = dht2.key().id().clone();
+        let fetched = dht1.fetch_address(&key2_id).await.unwrap();
         assert!(fetched.is_some());
 
         // Verify no QUIC address was stored
-        let local_key2 = adnl2.key_by_tag(KEY_TAG).unwrap().id().clone();
-        let peer_addrs = adnl2.peer_ip_address(&local_key2, &key1_id).unwrap();
+        let local_key1 = adnl1.key_by_tag(KEY_TAG).unwrap().id().clone();
+        let peer_addrs = adnl1.peer_ip_address(&local_key1, &key2_id).unwrap();
         let quic_addr = peer_addrs.and_then(|(_, q)| q);
         assert!(
             quic_addr.is_none(),
@@ -2146,7 +2269,7 @@ fn make_raw_client_endpoint(server_key_id: &KeyId) -> (quinn::Endpoint, String) 
     endpoint.set_default_client_config(client_config);
 
     let hex = hex::encode(server_key_id.data());
-    let sni = format!("{}.{}", &hex[..32], &hex[32..]);
+    let sni = format!("{}.{}.adnl", &hex[..32], &hex[32..]);
     (endpoint, sni)
 }
 

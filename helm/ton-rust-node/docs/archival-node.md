@@ -36,11 +36,13 @@ archive.00100.0:8000000000000000.pack   # workchain 0 shard blocks
 ...
 ```
 
+Archives can be obtained using TON storage clients (we used [this](https://github.com/xssnick/tonutils-storage) one). Archives are split into 4 Gb pieces and addressed by bags hash in terms of TON storage. Bags are listed [here](https://archival-dump.ton.org/index/mainnet.json). All of them should be added to TON storage client for download. After download is finished all *.pack files are to be moved into one folder replacing `_` symbol in name with `:` (files are renamed to remove symbols which are not supported on some platforms, but TON archives use `:` in shard archives name). The folder containing all `*.pack` files is the input for `archive_import` util.
+
 You also need:
 
-- Masterchain zerostate `.boc` file
-- Workchain zerostate(s) `.boc` file(s) (one per workchain)
-- Global config JSON (contains zerostate hashes and hard fork list)
+- Masterchain zerostate `.boc` file. TON mainnet zerostate [here](https://github.com/RSquad/ton-rust-node/blob/master/src/node/src/tests/static/5E994FCF4D425C0A6CE6A792594B7173205F740A39CD56F537DEFD28B48A0F6E.boc)
+- Workchain zerostate(s) `.boc` file(s) (one per workchain). TON mainnet 0 workchain zerostate [here](https://github.com/RSquad/ton-rust-node/blob/master/src/node/src/tests/static/EE0BEDFE4B32761FB35E9E1D8818EA720CAD1A0E7B4D2ED673C488E72E910342.boc)
+- Global config JSON (contains zerostate hashes and hard fork list). TON mainnet global config [here](https://ton-blockchain.github.io/global.config.json)
 
 ## Archive import
 

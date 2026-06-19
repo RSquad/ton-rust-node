@@ -739,6 +739,7 @@ def build_zerostate(
     simplex_mc: bool = False,
     simplex_config: dict = None,
     use_quic: bool = False,
+    enable_observers: bool = False,
 ) -> str:
     print("Building zerostate...", end="")
     zerostate = json.loads(zerostate_blank)
@@ -787,6 +788,9 @@ def build_zerostate(
         }
         if use_quic:
             simplex_entry["use_quic"] = 1
+        # Route block-candidate broadcasts through the dedicated block-sync overlay
+        if enable_observers:
+            simplex_entry["enable_observers"] = 1
         # MC simplex config (enabled when --simplex-mc is specified)
         if simplex_mc:
             p30["mc"] = dict(simplex_entry)
@@ -794,7 +798,8 @@ def build_zerostate(
         p30["shard"] = dict(simplex_entry)
         zerostate["master"]["config"]["p30"] = p30
         quic_str = ", quic=true" if use_quic else ""
-        print(f" [simplex enabled: mc={simplex_mc}{quic_str}]", end="")
+        obs_str = ", enable_observers=true" if enable_observers else ""
+        print(f" [simplex enabled: mc={simplex_mc}{quic_str}{obs_str}]", end="")
 
     zs_json_path = common_config_path / "zerostate.json"
     with zs_json_path.open("w") as fout:
@@ -946,6 +951,12 @@ def main():
         help="Enable QUIC overlay transport in ConfigParam 30 (use_quic flag). Implies --simplex.",
     )
     parser.add_argument(
+        "--enable-observers",
+        action="store_true",
+        help="Set ConfigParam 30 simplex_config_v2.enable_observers=1 (implies --simplex). "
+             "Routes block-candidate broadcasts through the dedicated block-sync overlay.",
+    )
+    parser.add_argument(
         "--quic_custom_port",
         action="store_true",
         help="Use QUIC port offset 2000 (instead of 1000) to verify DHT announces. "
@@ -969,6 +980,9 @@ def main():
         args.simplex = True
     # --simplex-mc implies --simplex
     if args.simplex_mc:
+        args.simplex = True
+    # --enable-observers implies --simplex (BlockSync)
+    if args.enable_observers:
         args.simplex = True
     if args.start is None:
         args.start = False
@@ -994,8 +1008,8 @@ def main():
 
     if build:
         build_rust([])  # always build rust because we need tools etc.
-        #if cpp_nodes_count > 0:
-        #    build_cpp()
+        if cpp_nodes_count > 0:
+            build_cpp()
 
     test_root_path = Path(__file__).parent
 
@@ -1055,6 +1069,7 @@ def main():
             simplex_mc=args.simplex_mc,
             simplex_config=simplex_config,
             use_quic=args.quic,
+            enable_observers=args.enable_observers,
         )
 
         # Build global config

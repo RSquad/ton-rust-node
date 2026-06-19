@@ -13,6 +13,7 @@ telemetry = ["adnl/telemetry"]
 adnl = { path = "../../../adnl" }
 ton_api = { path = "../../../tl/ton_api" }
 ton_block = { path = "../../../block" }
+consensus-common = { path = "../../consensus-common" }
 
 tokio = { version = "1", features = ["full", "process", "io-util"] }
 tokio-util = "0.7"
@@ -81,3 +82,11 @@ path = "tests/test_quic_overlay.rs"
 [[test]]
 name = "test_raptorq"
 path = "tests/test_raptorq.rs"
+
+[[test]]
+name = "test_block_sync_overlay_id"
+path = "tests/test_block_sync_overlay_id.rs"
+
+[[test]]
+name = "test_simplex_config_v2_wire"
+path = "tests/test_simplex_config_v2_wire.rs"

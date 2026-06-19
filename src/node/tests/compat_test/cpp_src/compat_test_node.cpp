@@ -25,6 +25,12 @@
  *   {"cmd": "get_received_broadcasts", "overlay_id": "HEX"}
  *   {"cmd": "clear_received_broadcasts", "overlay_id": "HEX"}
  *   {"cmd": "compute_candidate_id_to_sign", "slot": 1, "hash": "HEX_64"}
+ *   {"cmd": "compute_block_sync_overlay_id", "session_id": "HEX_64"}
+ *   {"cmd": "parse_simplex_config_v2", "data": "BASE64_BOC"}
+ *   {"cmd": "build_simplex_config_v2", "enable_observers": false, "use_quic": true, "slots_per_leader_window": 4}
+ *   {"cmd": "compute_block_sync_overlay_members",
+ *           "prev": [{"key": "HEX_32", "addr": "HEX_32_OR_EMPTY"}, ...],
+ *           "curr": [...], "next": [...]}
  *   {"cmd": "compress_boc", "data": "BASE64_STANDARD_BOC", "algorithm": "baseline|improved"}
  *   {"cmd": "decompress_boc", "data": "BASE64_COMPRESSED", "max_size": 10485760}
  *   {"cmd": "shutdown"}
@@ -38,6 +44,8 @@
 #include "crypto/Ed25519.h"
 #include "vm/boc.h"
 #include "vm/boc-compression.h"
+#include "vm/cellslice.h"
+#include "crypto/block/block-auto.h"
 
 #include <sstream>
 #include <unistd.h>
@@ -282,6 +290,14 @@ void CompatTestNode::handle_command(std::string cmd_line) {
         cmd_clear_received_messages(obj);
     } else if (cmd == "compute_candidate_id_to_sign") {
         cmd_compute_candidate_id_to_sign(obj);
+    } else if (cmd == "compute_block_sync_overlay_id") {
+        cmd_compute_block_sync_overlay_id(obj);
+    } else if (cmd == "parse_simplex_config_v2") {
+        cmd_parse_simplex_config_v2(obj);
+    } else if (cmd == "build_simplex_config_v2") {
+        cmd_build_simplex_config_v2(obj);
+    } else if (cmd == "compute_block_sync_overlay_members") {
+        cmd_compute_block_sync_overlay_members(obj);
     } else if (cmd == "compress_boc") {
         cmd_compress_boc(obj);
     } else if (cmd == "decompress_boc") {
@@ -1081,6 +1097,169 @@ void CompatTestNode::cmd_compute_candidate_id_to_sign(td::JsonObject &obj) {
     auto data_b64 = td::base64_encode(serialized.as_slice());
 
     respond_ok("\"data\": \"" + data_b64 + "\"");
+}
+
+void CompatTestNode::cmd_compute_block_sync_overlay_id(td::JsonObject &obj) {
+    // Block-sync overlay seed is consensus.blockSyncOverlayId{session_id}.
+    // Short-id = SHA256(serialize_boxed(pub.overlay{name = seed})), which is what
+    // OverlayIdFull::compute_short_id() computes.
+    auto session_id_hex = get_string(obj, "session_id");
+    if (session_id_hex.empty()) {
+        respond_error("Missing 'session_id' (hex)");
+        return;
+    }
+
+    td::Bits256 session_id_bits;
+    if (session_id_bits.from_hex(session_id_hex) != 256) {
+        respond_error("Invalid session_id hex (expected 32 bytes)");
+        return;
+    }
+
+    auto tl = ton::create_tl_object<ton::ton_api::consensus_blockSyncOverlayId>(session_id_bits);
+    auto seed = ton::serialize_tl_object(tl, true);
+    auto seed_b64 = td::base64_encode(seed.as_slice());
+
+    ton::overlay::OverlayIdFull full_id{seed.clone()};
+    auto short_id = full_id.compute_short_id();
+
+    std::ostringstream oss;
+    oss << "{\"result\": {"
+        << "\"seed\": \"" << seed_b64 << "\""
+        << ", \"overlay_id\": \"" << short_id.bits256_value().to_hex() << "\""
+        << "}}";
+    respond(oss.str());
+}
+
+// ---------- simplex_config_v2 BOC parse/build ----------
+
+void CompatTestNode::cmd_parse_simplex_config_v2(td::JsonObject &obj) {
+    auto data_b64 = get_string(obj, "data");
+    if (data_b64.empty()) {
+        respond_error("Missing 'data' (base64 BOC of simplex_config_v2 cell)");
+        return;
+    }
+    auto data_res = td::base64_decode(data_b64);
+    if (data_res.is_error()) {
+        respond_error("Invalid base64 data: " + data_res.error().message().str());
+        return;
+    }
+    auto cell_res = vm::std_boc_deserialize(td::Slice(data_res.move_as_ok()));
+    if (cell_res.is_error()) {
+        respond_error("BOC parse failed: " + cell_res.error().message().str());
+        return;
+    }
+    auto cell = cell_res.move_as_ok();
+
+    block::gen::NewConsensusConfig::Record_simplex_config_v2 rec;
+    if (!block::gen::t_NewConsensusConfig.cell_unpack(cell, rec)) {
+        respond_error("Not a simplex_config_v2#22 cell");
+        return;
+    }
+
+    std::ostringstream oss;
+    oss << "{\"result\": {"
+        << "\"enable_observers\": " << (rec.enable_observers ? "true" : "false")
+        << ", \"use_quic\": " << (rec.use_quic ? "true" : "false")
+        << ", \"slots_per_leader_window\": " << rec.slots_per_leader_window
+        << "}}";
+    respond(oss.str());
+}
+
+void CompatTestNode::cmd_build_simplex_config_v2(td::JsonObject &obj) {
+    auto enable_observers = get_bool(obj, "enable_observers", false);
+    auto use_quic = get_bool(obj, "use_quic", false);
+    auto slots = static_cast<unsigned>(get_int(obj, "slots_per_leader_window", 4));
+
+    block::gen::NewConsensusConfig::Record_simplex_config_v2 rec;
+    rec.flags = 0;
+    rec.enable_observers = enable_observers;
+    rec.use_quic = use_quic;
+    rec.slots_per_leader_window = slots;
+    // Empty HashmapE 8 uint32 = single zero bit.
+    vm::CellBuilder empty_map_b;
+    empty_map_b.store_zeroes(1);
+    rec.noncritical_params = vm::load_cell_slice_ref(empty_map_b.finalize());
+
+    td::Ref<vm::Cell> cell;
+    if (!block::gen::t_NewConsensusConfig.cell_pack(cell, rec)) {
+        respond_error("Pack failed");
+        return;
+    }
+
+    auto boc_res = vm::std_boc_serialize(cell);
+    if (boc_res.is_error()) {
+        respond_error("BOC serialize failed: " + boc_res.error().message().str());
+        return;
+    }
+    auto boc_b64 = td::base64_encode(boc_res.move_as_ok().as_slice());
+    respond_ok("\"data\": \"" + boc_b64 + "\"");
+}
+
+// ---------- block-sync overlay members union ----------
+
+// For each (prev, curr, next) validator set, adnl_id = addr.is_zero() ? pubkey_short_id : addr,
+// then sort and dedup (mirrors C++ `manager.cpp:2440-2461`). Inputs are plain
+// {key_hex, addr_hex_or_empty} pairs to avoid building real ValidatorSet objects.
+void CompatTestNode::cmd_compute_block_sync_overlay_members(td::JsonObject &obj) {
+    auto parse_one_set = [](td::JsonValue &arr,
+                            std::vector<td::Bits256> &out_adnl_ids) -> std::string {
+        if (arr.type() != td::JsonValue::Type::Array) {
+            return "expected array";
+        }
+        for (auto &entry : arr.get_array()) {
+            if (entry.type() != td::JsonValue::Type::Object) {
+                return "validator entry must be object";
+            }
+            auto &eobj = entry.get_object();
+            std::string key_hex, addr_hex;
+            for (auto &kv : eobj.field_values_) {
+                if (kv.first == "key" && kv.second.type() == td::JsonValue::Type::String) {
+                    key_hex = kv.second.get_string().str();
+                } else if (kv.first == "addr" && kv.second.type() == td::JsonValue::Type::String) {
+                    addr_hex = kv.second.get_string().str();
+                }
+            }
+            td::Bits256 key_bits;
+            if (key_hex.empty() || key_bits.from_hex(key_hex) != 256) {
+                return "invalid 'key' (expected 64-char hex)";
+            }
+            td::Bits256 adnl_id;
+            if (addr_hex.empty()) {
+                // addr.is_zero() -> use pubkey short id
+                auto pub = ton::PublicKey{ton::pubkeys::Ed25519{key_bits}};
+                adnl_id = pub.compute_short_id().bits256_value();
+            } else {
+                if (addr_hex.size() != 64 || adnl_id.from_hex(addr_hex) != 256) {
+                    return "invalid 'addr' (expected 64-char hex or empty)";
+                }
+            }
+            out_adnl_ids.push_back(adnl_id);
+        }
+        return {};
+    };
+
+    std::vector<td::Bits256> members;
+    for (auto &kv : obj.field_values_) {
+        if (kv.first != "prev" && kv.first != "curr" && kv.first != "next") {
+            continue;
+        }
+        if (auto err = parse_one_set(kv.second, members); !err.empty()) {
+            respond_error("'" + kv.first.str() + "' " + err);
+            return;
+        }
+    }
+
+    std::sort(members.begin(), members.end());
+    members.erase(std::unique(members.begin(), members.end()), members.end());
+
+    std::ostringstream oss;
+    oss << "{\"result\": {\"members\": [";
+    for (size_t i = 0; i < members.size(); ++i) {
+        if (i) oss << ", ";
+        oss << "\"" << members[i].to_hex() << "\"";
+    }
+    oss << "]}}";
+    respond(oss.str());
 }
 
 // ---------- BOC Compression ----------

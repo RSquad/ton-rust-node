@@ -1148,6 +1148,49 @@ fn test_new_consensus_config_all_with_v2() {
 }
 
 #[test]
+fn test_simplex_config_enable_observers_round_trip() {
+    let config = SimplexConfig {
+        enable_observers: true,
+        use_quic: true,
+        slots_per_leader_window: 4,
+        ..Default::default()
+    };
+    let cell = config.write_to_new_cell().unwrap().into_cell().unwrap();
+    let config2 = SimplexConfig::construct_from_cell(cell).unwrap();
+    assert_eq!(config, config2);
+    assert!(config2.enable_observers);
+    assert!(config2.use_quic);
+}
+
+/// Verifies the v2 flag-byte wire layout:
+/// MSB->LSB = 6 zero flag bits, enable_observers (bit 1), use_quic (bit 0).
+#[test]
+fn test_simplex_config_v2_flag_byte_layout() {
+    fn flag_byte(enable_observers: bool, use_quic: bool) -> u8 {
+        let cfg = SimplexConfig { enable_observers, use_quic, ..Default::default() };
+        let cell = cfg.write_to_new_cell().unwrap().into_cell().unwrap();
+        let mut s = SliceData::load_cell(cell).unwrap();
+        let tag = s.get_next_byte().unwrap();
+        assert_eq!(tag, 0x22);
+        s.get_next_byte().unwrap()
+    }
+    assert_eq!(flag_byte(false, false), 0x00);
+    assert_eq!(flag_byte(false, true), 0x01);
+    assert_eq!(flag_byte(true, false), 0x02);
+    assert_eq!(flag_byte(true, true), 0x03);
+}
+
+/// v1 (`simplex_config#21`) had no enable_observers; we keep lenient decode
+/// to preserve archive replay
+#[test]
+fn test_deserialize_v1_cell_enable_observers_is_false() {
+    let cell = build_v1_cell(true, 300, 4, 1000, 100);
+    let config = SimplexConfig::construct_from_cell(cell).unwrap();
+    assert!(!config.enable_observers);
+    assert!(config.use_quic);
+}
+
+#[test]
 fn test_new_consensus_config_all_mixed_v1_mc_v2_shard() {
     let mc_cell = build_v1_cell(false, 300, 4, 1000, 100);
     let shard_config = SimplexConfig {

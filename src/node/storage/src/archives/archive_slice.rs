@@ -211,7 +211,14 @@ impl ArchiveSlice {
     ) -> Result<()> {
         let entry = PackageEntryInfo { seqno: package_archive_id, shard: shard.clone() };
 
-        if self.package_store.get(&entry).is_none() {
+        if let Some(pi) = self.get_package_by_entry(&entry).await {
+            // The package already exists — it could be partially written by the node. Refresh the persisted size to match.
+            let info = if self.shard_separated { Some(pi.entry()) } else { None };
+            self.entry_db.put_value(
+                &pi.index().into(),
+                &PackageEntryMeta::with_data(file_size, pi.version(), info),
+            )?;
+        } else {
             self.add_package(entry, file_size).await?;
         }
 

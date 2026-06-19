@@ -90,10 +90,8 @@ pub enum ExceptionCode {
     FatalError = 12,
     #[error("out of gas")]
     OutOfGas = 13,
-    #[error("illegal instruction")]
-    IllegalInstruction = 14,
     #[error("pruned cell")]
-    PrunedCellAccess = 15,
+    PrunedCellAccess = 14,
 }
 
 impl ExceptionCode {

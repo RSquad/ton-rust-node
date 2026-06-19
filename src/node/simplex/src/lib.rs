@@ -450,6 +450,10 @@ pub struct SessionOptions {
     /// Default: false
     pub use_quic: bool,
 
+    /// `SimplexConfig.enable_observers` (ConfigParam 30).
+    /// Default: false (use consensus private overlay for candidate propagation).
+    pub enable_observers: bool,
+
     /// Cooldown between repeated health alerts of the same anomaly type.
     /// Default: 30 seconds
     pub health_alert_cooldown: Duration,
@@ -548,6 +552,7 @@ impl Default for SessionOptions {
             empty_block_mc_lag_threshold: None,
             wait_for_db_init: false,
             use_quic: false,
+            enable_observers: false,
             health_alert_cooldown: Duration::from_secs(30),
             health_stall_warning_secs: 15,
             health_stall_error_secs: 60,

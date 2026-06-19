@@ -37,10 +37,19 @@
 //!
 
 use crate::{PrivateKey, PublicKey, SessionId, ValidatorWeight};
-use std::{any::Any, backtrace::Backtrace, cmp::max, panic, sync::Once, thread, time::Duration};
+use std::{
+    any::Any,
+    backtrace::Backtrace,
+    cmp::max,
+    panic,
+    sync::{Arc, Once},
+    thread,
+    time::Duration,
+};
 use ton_api::{
     ton::{
         consensus::{
+            blocksyncoverlayid::BlockSyncOverlayId,
             candidatehashdata::{CandidateHashDataEmpty, CandidateHashDataOrdinary},
             candidateid::CandidateId,
             candidateparent::CandidateParent,
@@ -48,13 +57,14 @@ use ton_api::{
             simplex::vote::Vote as SimplexVote,
             CandidateParent as CandidateParentBoxed,
         },
+        pub_::publickey::Overlay,
         validator_session::Candidate,
     },
     IntoBoxed,
 };
 use ton_block::{
     error, fail, read_boc, sha256_digest, Block, BlockIdExt, ConsensusExtraData, Deserializable,
-    Result, ShardIdent, UInt256,
+    KeyId, Result, ShardIdent, UInt256,
 };
 
 /*
@@ -925,4 +935,22 @@ pub fn extract_before_split_flag(block_data: &[u8]) -> Result<bool> {
 
     // Return before_split flag
     Ok(block_info.before_split())
+}
+
+/// Compute the block-sync overlay short id from a session id.
+///
+/// Mirrors C++ `block-sync-overlay.cpp:48-50`:
+///   overlay_seed = serialize(consensus.blockSyncOverlayId{ session_id })
+///   overlay_full_id = OverlayIdFull{ overlay_seed }
+///   overlay_short_id = overlay_full_id.compute_short_id()
+///
+/// The block-sync seed does NOT include the validator-set node list, so its
+/// short id differs from the consensus overlay's short id even for the same
+/// `session_id`. Verified byte-equal with C++ via the
+/// `test_block_sync_overlay_id_matches_cpp` compat test
+pub fn compute_block_sync_overlay_short_id(session_id: &SessionId) -> Result<Arc<KeyId>> {
+    let overlay_seed = BlockSyncOverlayId { session_id: session_id.clone() };
+    let serialized = consensus_common::serialize_tl_boxed_object!(&overlay_seed.into_boxed());
+    let overlay_pubkey = Overlay { name: serialized }.into_boxed();
+    Ok(KeyId::from_data(adnl::common::hash_boxed(&overlay_pubkey)?))
 }

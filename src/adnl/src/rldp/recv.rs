@@ -123,7 +123,7 @@ pub(crate) struct RecvContext {
 }
 
 impl RecvContext {
-    pub(crate) async fn send_confirmations(&mut self) -> Result<()> {
+    pub(crate) async fn send_confirmations(&mut self) -> Result<u32> {
         let RecvParts::V2(parts) = &mut self.recv_transfer.parts else {
             fail!("RLDP version mismatch in RLDP confirm: expected v2, got v1")
         };
@@ -131,6 +131,7 @@ impl RecvContext {
             fail!("RLDP version mismatch in RLDP confirm: expected v2, got v1")
         };
         let elapsed = self.recv_transfer.start.elapsed().as_millis() as u64;
+        let mut sent: u32 = 0;
         for i in 0..parts.len() {
             let part = &mut parts[i];
             if (part.confirm_at == 0) || (part.confirm_at > elapsed) {
@@ -151,9 +152,10 @@ impl RecvContext {
             {
                 self.recv_transfer.total_confirm_packets += 1
             }
-            self.adnl.send_custom(&reply, &self.peers).await?
+            self.adnl.send_custom(&reply, &self.peers).await?;
+            sent = sent.saturating_add(1);
         }
-        Ok(())
+        Ok(sent)
     }
 }
 

@@ -54,7 +54,10 @@
 //! `Arc<tokio::sync::Mutex<StateResolverCache>>`
 //! and passed into collation/validation requests. It is pruned on finalization.
 
-use crate::{shard_state::ShardStateStuff, validator::consensus::BlockPayloadPtr};
+use crate::{
+    engine_traits::EngineOperations, shard_state::ShardStateStuff,
+    validator::consensus::BlockPayloadPtr,
+};
 use consensus_common::{
     CandidateObservedFlags, EnsureCandidateAvailabilityOptions, ResolverPurpose,
 };
@@ -63,7 +66,7 @@ use std::{
     sync::{Arc, Weak},
     time::SystemTime,
 };
-use ton_block::{BlockIdExt, Deserializable};
+use ton_block::{error, Block, BlockIdExt, Deserializable, Result};
 
 /// Trait for resolver-to-session communication (dependency inversion).
 ///
@@ -87,6 +90,20 @@ pub trait ResolverBackend: Send + Sync {
     );
 }
 
+/// Result of [`StateResolverCache::collect_unresolved_chain`] — where the base
+/// state for a forward Merkle-apply chain comes from.
+pub enum ChainAnchor {
+    /// Resolved state found in cache.
+    Cached(Arc<ShardStateStuff>),
+    /// The base is a finalized + applied block whose full state is loaded from
+    /// the engine — either a block already evicted from the cache, or the
+    /// finalized block retained by `prune_finalized` (its parent was pruned).
+    Engine(BlockIdExt),
+    /// No single-parent chain reaches a usable anchor (merge block, or a parent
+    /// with no known parent links).
+    Unresolvable,
+}
+
 /// Single entry in the resolver cache.
 ///
 /// C++ equivalent: internal state kept per candidate in `StateResolverImpl`.
@@ -94,7 +111,9 @@ pub trait ResolverBackend: Send + Sync {
 #[derive(Clone)]
 pub struct StateResolverEntry {
     pub block_id: BlockIdExt,
-    pub data: BlockPayloadPtr,
+    /// Raw block payload paired with its deserialized `Block`, parsed once on
+    /// arrival.
+    pub data: Option<(BlockPayloadPtr, Block)>,
     pub collated_data: BlockPayloadPtr,
     pub flags: CandidateObservedFlags,
     /// Parent block IDs extracted from the block data via `read_prev_ids()`.
@@ -168,24 +187,31 @@ impl StateResolverCache {
         data: BlockPayloadPtr,
         collated_data: BlockPayloadPtr,
         flags: CandidateObservedFlags,
+        block: Option<Block>,
     ) {
         let now = SystemTime::now();
         let existed = self.entries.contains_key(&block_id);
 
-        let parent_ids = if flags.body_present { extract_parent_ids(&data) } else { None };
-        // Only the body-bearing observation may overwrite the cached payloads.
-        // Flag-only follow-ups (e.g. a later `parent_ready=true` callback that
-        // passes empty payloads with `body_present=false`) must not wipe a body
-        // we already have, otherwise the OR-merged `flags.body_present` stays
-        // `true` while `entry.data` becomes empty — silently disabling
-        // resolver materialization for this block until pruning.
-        let has_body = flags.body_present && !data.data().is_empty();
+        // Keep the deserialized block next to the raw payload so materialization
+        // and parent-id extraction never re-parse it. The caller may pass an
+        // already-parsed block (e.g. right after local collation) to avoid a
+        // second parse; otherwise parse it here. A flag-only follow-up (empty
+        // payload, `body_present=false`) yields `None` and must not wipe a body
+        // we already have.
+        let parsed = if flags.body_present && !data.data().is_empty() {
+            block
+                .or_else(|| Block::construct_from_bytes(data.data()).ok())
+                .map(|block| (data, block))
+        } else {
+            None
+        };
+        let parent_ids = parsed.as_ref().and_then(|(_, block)| extract_parent_ids(block));
 
         self.entries
             .entry(block_id.clone())
             .and_modify(|entry| {
-                if has_body {
-                    entry.data = data.clone();
+                if parsed.is_some() {
+                    entry.data = parsed.clone();
                     entry.collated_data = collated_data.clone();
                 }
                 entry.flags = CandidateObservedFlags {
@@ -200,7 +226,7 @@ impl StateResolverCache {
             })
             .or_insert_with(|| StateResolverEntry {
                 block_id: block_id.clone(),
-                data,
+                data: parsed,
                 collated_data,
                 flags,
                 parent_ids,
@@ -259,6 +285,45 @@ impl StateResolverCache {
     #[allow(dead_code)]
     pub fn try_get_entry(&self, block_id: &BlockIdExt) -> Option<&StateResolverEntry> {
         self.entries.get(block_id)
+    }
+
+    pub fn try_get_block(&self, block_id: &BlockIdExt) -> Option<Block> {
+        self.entries.get(block_id)?.data.as_ref().map(|(_, block)| block.clone())
+    }
+
+    /// Walk back from `head_id` via `parent_ids`, collecting the chain of locally
+    /// collated blocks with their states.
+    pub fn collect_local_chain_from(
+        &self,
+        head_id: &BlockIdExt,
+    ) -> Vec<(Arc<ShardStateStuff>, Block)> {
+        let mut chain = Vec::new();
+        let mut cursor = Some(head_id.clone());
+        while let Some(id) = cursor.take() {
+            let entry = match self.entries.get(&id) {
+                Some(e) => e,
+                None => break,
+            };
+            if !entry.flags.local_collated {
+                break;
+            }
+            let state = match entry.state.clone() {
+                Some(s) => s,
+                None => break,
+            };
+            let block = match self.try_get_block(&id) {
+                Some(b) => b,
+                None => break,
+            };
+            chain.push((state, block));
+            // Single-parent walk only.
+            cursor = match entry.parent_ids.as_ref() {
+                Some(parents) if parents.len() == 1 => Some(parents[0].clone()),
+                _ => None,
+            };
+        }
+        chain.reverse();
+        chain
     }
 
     /// Get a watch receiver for async state notification.
@@ -352,7 +417,7 @@ impl StateResolverCache {
                     block_id.clone(),
                     StateResolverEntry {
                         block_id: block_id.clone(),
-                        data: Arc::new(EmptyPayload),
+                        data: None,
                         collated_data: Arc::new(EmptyPayload),
                         flags: CandidateObservedFlags::default(),
                         parent_ids: None,
@@ -385,17 +450,26 @@ impl StateResolverCache {
     /// sequence of ancestor `BlockIdExt`s that are in the cache but do
     /// not yet have a materialized state.
     ///
-    /// Returns `(chain, base_state)` where:
-    /// - `chain`: ordered list from oldest unresolved ancestor to `block_id`
-    /// - `base_state`: the state of the first resolved ancestor (or `None`
-    ///   if the chain reaches beyond the cache — engine must provide it)
+    /// Returns `(chain, anchor)` where:
+    /// - `chain`: ordered list (oldest → `block_id`) of ancestors to apply
+    ///   forward on top of the anchor.
+    /// - `anchor`: where the base state comes from:
+    ///   - [`ChainAnchor::Cached`] — resolved state found in cache.
+    ///   - [`ChainAnchor::Engine`] — the base is a finalized + applied block
+    ///     whose state must be loaded from the engine. This is either a block
+    ///     already evicted from the cache, or the finalized block retained by
+    ///     `prune_finalized` (recognised by its single parent being absent from
+    ///     the cache). The base block is **not** part of the apply chain.
+    ///   - [`ChainAnchor::Unresolvable`] — no single-parent chain reaches an
+    ///     anchor (merge block or missing parent links).
     ///
-    /// C++ equivalent: recursive descent in `StateResolverImpl::resolve()`.
+    /// C++ equivalent: recursive descent in `StateResolverImpl::resolve()`,
+    /// where the `Engine` anchor mirrors `ChainState::from_manager`.
     #[allow(dead_code)]
     pub fn collect_unresolved_chain(
         &self,
         block_id: &BlockIdExt,
-    ) -> (Vec<BlockIdExt>, Option<Arc<ShardStateStuff>>) {
+    ) -> (Vec<BlockIdExt>, ChainAnchor) {
         let mut chain = Vec::new();
         let mut current = block_id.clone();
 
@@ -405,34 +479,37 @@ impl StateResolverCache {
             // one event per ancestor step.
             if let Some(state) = self.try_get_state_silent(&current) {
                 chain.reverse();
-                return (chain, Some(state));
+                return (chain, ChainAnchor::Cached(state));
             }
 
             let entry = match self.entries.get(&current) {
                 Some(e) => e,
                 None => {
-                    chain.push(current);
+                    // Walked off the end of the cached chain. The last block
+                    // still in the cache — the finalized block retained by
+                    // `prune_finalized` — is the base; everything collected
+                    // above it applies on top. If nothing was collected,
+                    // `current` itself is the base.
+                    let anchor = chain.pop().unwrap_or(current);
                     chain.reverse();
-                    return (chain, None);
+                    return (chain, ChainAnchor::Engine(anchor));
                 }
             };
 
-            chain.push(current.clone());
+            chain.push(current);
 
-            match &entry.parent_ids {
-                // Single-parent walk only. Multi-parent blocks (shard merges,
-                // 2 prev_ids) cannot be materialized from one base state via a
-                // single Merkle update, so we deliberately bail out and let the
-                // caller fall back to `engine.wait_state()` instead of silently
-                // picking `parent_ids[0]` and producing a wrong/failing apply.
-                Some(parent_ids) if parent_ids.len() == 1 => {
-                    current = parent_ids[0].clone();
-                }
+            // Single-parent walk only. Multi-parent blocks (shard merges,
+            // 2 prev_ids) cannot be materialized from one base state via a
+            // single Merkle update, so we deliberately bail out and let the
+            // caller fall back to `engine.wait_state()` instead of silently
+            // picking `parent_ids[0]` and producing a wrong/failing apply.
+            current = match &entry.parent_ids {
+                Some(parent_ids) if parent_ids.len() == 1 => parent_ids[0].clone(),
                 _ => {
                     chain.reverse();
-                    return (chain, None);
+                    return (chain, ChainAnchor::Unresolvable);
                 }
-            }
+            };
         }
     }
 
@@ -466,27 +543,34 @@ impl StateResolverCache {
         self.materializing.remove(block_id);
     }
 
-    /// Remove all entries with `seq_no <= finalized.seq_no` for the same shard.
+    /// Remove all entries with `seq_no < finalized.seq_no` for the same shard.
     ///
     /// Called from `ValidatorGroup::on_block_finalized()`. Once a block is
-    /// finalized, all ancestors are guaranteed to be applied by the engine,
-    /// so their speculative states are no longer needed.
+    /// finalized, its ancestors are guaranteed to be applied by the engine,
+    /// so their speculative states are no longer needed. The finalized block
+    /// itself is kept so its state can serve as an anchor for the recursive
+    /// apply of subsequent (not-yet-finalized) blocks without a DB load.
     pub fn prune_finalized(&mut self, finalized: &BlockIdExt) {
         let before = self.entries.len();
         let pruned_ids: Vec<BlockIdExt> = self
             .entries
             .keys()
             .filter(|block_id| {
-                block_id.shard() == finalized.shard() && block_id.seq_no() <= finalized.seq_no()
+                block_id.shard() == finalized.shard() && block_id.seq_no() < finalized.seq_no()
             })
             .cloned()
             .collect();
 
         for id in &pruned_ids {
             self.entries.remove(id);
-            self.waiters.remove(id);
             self.materializing.remove(id);
         }
+
+        // Drop waiters by id, not by `entries`: a cache-miss in `wait_prev_state`
+        // subscribes before knowing the block, leaving an orphan waiter with no
+        // `entries` item that would otherwise never be cleaned up.
+        self.waiters
+            .retain(|id, _| id.shard() != finalized.shard() || id.seq_no() >= finalized.seq_no());
 
         let pruned = before - self.entries.len();
         if pruned > 0 {
@@ -523,18 +607,226 @@ impl consensus_common::BlockPayload for EmptyPayload {
     }
 }
 
-/// Extract parent `BlockIdExt`s from raw block data.
-///
-/// Parses the block BOC and reads `prev_ids` from the block info header.
-/// Returns `None` on any parse failure (empty data, malformed block, etc.)
-fn extract_parent_ids(data: &BlockPayloadPtr) -> Option<Vec<BlockIdExt>> {
-    let bytes = data.data();
-    if bytes.is_empty() {
-        return None;
+/// Read parent `BlockIdExt`s (`prev_ids`) from a deserialized block's info
+/// header. Returns `None` on any read failure.
+fn extract_parent_ids(block: &Block) -> Option<Vec<BlockIdExt>> {
+    block.read_info().ok()?.read_prev_ids().ok()
+}
+
+/// Obtain the parent state for `prev_id`, racing the resolver cache against
+/// `engine.wait_state()`. Tries, in order: a synchronous cache hit, an in-memory
+/// forward-apply materialization, then an async cache subscription raced against
+/// the engine. Lets collation/validation proceed on a notarized-but-unfinalized
+/// parent. `purpose` distinguishes collation vs validation repair requests.
+pub async fn wait_prev_state(
+    cache: &Arc<tokio::sync::Mutex<StateResolverCache>>,
+    engine: &Arc<dyn EngineOperations>,
+    prev_id: &BlockIdExt,
+    purpose: ResolverPurpose,
+    wait_timeout_ms: u64,
+) -> Result<Arc<ShardStateStuff>> {
+    if let Some(state) = { cache.lock().await.try_get_state(prev_id) } {
+        metrics::counter!("ton_node_resolver_wait_result_total", "source" => "cache_hit")
+            .increment(1);
+        return Ok(state);
     }
-    let block = ton_block::Block::construct_from_bytes(bytes).ok()?;
-    let info = block.read_info().ok()?;
-    info.read_prev_ids().ok()
+
+    if let Some(state) = materialize_prev_state(cache, engine, prev_id, wait_timeout_ms).await {
+        metrics::counter!("ton_node_resolver_wait_result_total", "source" => "materialized")
+            .increment(1);
+        return Ok(state);
+    }
+
+    let mut cache_rx = {
+        let mut guard = cache.lock().await;
+        guard.request_availability(prev_id, purpose);
+        guard.subscribe_state(prev_id)
+    };
+    let cache_wait = async {
+        loop {
+            if let Some(state) = cache_rx.borrow().clone() {
+                return Some(state);
+            }
+            if cache_rx.changed().await.is_err() {
+                return None;
+            }
+        }
+    };
+
+    tokio::select! {
+        engine_state =
+            engine.clone().wait_state(prev_id, Some(wait_timeout_ms), true) => {
+            metrics::counter!("ton_node_resolver_wait_result_total", "source" => "engine")
+                .increment(1);
+            engine_state
+        }
+        cache_state = cache_wait => {
+            if let Some(state) = cache_state {
+                metrics::counter!("ton_node_resolver_wait_result_total", "source" => "cache_async")
+                    .increment(1);
+                Ok(state)
+            } else {
+                metrics::counter!("ton_node_resolver_wait_result_total", "source" => "engine_fallback")
+                    .increment(1);
+                engine.clone().wait_state(prev_id, Some(wait_timeout_ms), true).await
+            }
+        }
+    }
+}
+
+/// Materialize the state for `target_id` by walking the resolver cache back to
+/// an anchor and applying the intervening blocks' Merkle updates forward.
+///
+/// Manages the cache lock itself (released across the async applies) and the
+/// single-flight materializing marker. Returns `None` when the chain can't be
+/// resolved from the cache, leaving the caller to fall back to
+/// `engine.wait_state()`. Shared by the collator and the validator.
+pub async fn materialize_prev_state(
+    cache: &Arc<tokio::sync::Mutex<StateResolverCache>>,
+    engine: &Arc<dyn EngineOperations>,
+    target_id: &BlockIdExt,
+    wait_timeout_ms: u64,
+) -> Option<Arc<ShardStateStuff>> {
+    let (chain_to_apply, anchor) = {
+        let mut guard = cache.lock().await;
+
+        if guard.is_materializing(target_id) {
+            return None;
+        }
+
+        let (chain_ids, anchor) = guard.collect_unresolved_chain(target_id);
+
+        if chain_ids.is_empty() {
+            // Nothing to apply: either the target's own state is cached, or it's
+            // absent — let the outer engine.wait_state path load it.
+            return match anchor {
+                ChainAnchor::Cached(state) => Some(state),
+                _ => None,
+            };
+        }
+        if matches!(anchor, ChainAnchor::Unresolvable) {
+            return None;
+        }
+
+        // Validate every body before claiming the materializing marker: the
+        // marker is only released by `store_validated_state`, which won't fire
+        // if we early-return on a missing body.
+        let mut chain = Vec::with_capacity(chain_ids.len());
+        for block_id in chain_ids {
+            let Some((_, block)) = guard.try_get_entry(&block_id)?.data.as_ref() else {
+                return None;
+            };
+            chain.push((block_id, block.clone()));
+        }
+        guard.try_start_materializing(target_id);
+
+        (chain, anchor)
+    };
+
+    let mut state = match resolve_chain_anchor(engine, anchor, wait_timeout_ms).await {
+        Some(state) => state,
+        None => {
+            cache.lock().await.finish_materializing(target_id);
+            return None;
+        }
+    };
+
+    let mut resolved = Vec::with_capacity(chain_to_apply.len());
+    for (block_id, block) in chain_to_apply {
+        state = match apply_candidate_state_update(engine, &block_id, &block, state).await {
+            Ok(state) => state,
+            Err(err) => {
+                log::warn!(target: "simplex_resolver",
+                    "failed to materialize resolver state for {block_id}: {err}");
+                cache.lock().await.finish_materializing(target_id);
+                return None;
+            }
+        };
+        resolved.push((block_id, state.clone()));
+    }
+
+    let mut guard = cache.lock().await;
+    for (block_id, s) in &resolved {
+        guard.store_validated_state(block_id, s.clone());
+    }
+    guard.finish_materializing(target_id);
+    metrics::counter!("ton_node_resolver_materialized_total").increment(resolved.len() as u64);
+
+    Some(state)
+}
+
+/// Resolve the base state for a forward-apply chain.
+async fn resolve_chain_anchor(
+    engine: &Arc<dyn EngineOperations>,
+    anchor: ChainAnchor,
+    wait_timeout_ms: u64,
+) -> Option<Arc<ShardStateStuff>> {
+    match anchor {
+        ChainAnchor::Cached(state) => Some(state),
+        // Finalized + applied block: load its full state from the DB. No
+        // download — a finalized state must already be persisted.
+        ChainAnchor::Engine(id) => engine
+            .clone()
+            .wait_state(&id, Some(wait_timeout_ms), false)
+            .await
+            .map_err(|err| {
+                log::debug!(target: "simplex_resolver", "engine anchor load failed for {id}: {err}")
+            })
+            .ok(),
+        ChainAnchor::Unresolvable => None,
+    }
+}
+
+/// Apply a single block's Merkle update on top of `prev_state`.
+async fn apply_candidate_state_update(
+    engine: &Arc<dyn EngineOperations>,
+    block_id: &BlockIdExt,
+    block: &Block,
+    prev_state: Arc<ShardStateStuff>,
+) -> Result<Arc<ShardStateStuff>> {
+    let state_update = block.read_state_update()?;
+    let prev_state_root = prev_state.root_cell().clone();
+    let engine_for_apply = engine.clone();
+    let materialized_block_id = block_id.clone();
+    let log_block_id = block_id.clone();
+
+    let (next_state_root, _) = tokio::task::spawn_blocking(move || {
+        let fast_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            engine_for_apply
+                .db_cells_factory()
+                .and_then(|cf| state_update.apply_with_factory(&prev_state_root, &cf))
+        }))
+        .unwrap_or_else(|_| {
+            Err(error!(
+                "resolver fast Merkle apply path unavailable for {}; falling back",
+                log_block_id
+            ))
+        });
+
+        match fast_result {
+            Ok(result) => Ok(result),
+            Err(err) => {
+                log::debug!(target: "simplex_resolver",
+                    "resolver fast Merkle apply failed for {}: {}. Falling back to apply_for()",
+                    log_block_id, err);
+                state_update.apply_for(&prev_state_root).map_err(|apply_err| {
+                    error!(
+                        "cannot apply Merkle update for resolver materialization {}: {}",
+                        log_block_id, apply_err
+                    )
+                })
+            }
+        }
+    })
+    .await??;
+
+    ShardStateStuff::from_root_cell(
+        materialized_block_id,
+        next_state_root,
+        #[cfg(feature = "telemetry")]
+        engine.engine_telemetry(),
+        engine.engine_allocated(),
+    )
 }
 
 #[cfg(test)]

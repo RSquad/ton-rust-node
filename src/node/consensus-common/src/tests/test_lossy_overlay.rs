@@ -35,7 +35,12 @@ impl ConsensusOverlayListener for CountingListener {
         self.messages_received.fetch_add(1, Ordering::SeqCst);
     }
 
-    fn on_broadcast(&self, _source_key_hash: PublicKeyHash, _data: &BlockPayloadPtr) {
+    fn on_broadcast(
+        &self,
+        _source_key_hash: PublicKeyHash,
+        _data: &BlockPayloadPtr,
+        _source: crate::BroadcastSource,
+    ) {
         self.broadcasts_received.fetch_add(1, Ordering::SeqCst);
     }
 
@@ -88,7 +93,7 @@ fn test_lossy_overlay_listener_broadcast_passthrough() {
     let data = create_test_data();
 
     for _ in 0..10 {
-        lossy.on_broadcast(sender_id.clone(), &data);
+        lossy.on_broadcast(sender_id.clone(), &data, crate::BroadcastSource::ConsensusOverlay);
     }
 
     assert_eq!(inner.broadcasts_received.load(Ordering::SeqCst), 10);
@@ -162,7 +167,7 @@ fn test_lossy_overlay_listener_broadcast_100_percent_loss() {
     let data = create_test_data();
 
     for _ in 0..10 {
-        lossy.on_broadcast(sender_id.clone(), &data);
+        lossy.on_broadcast(sender_id.clone(), &data, crate::BroadcastSource::ConsensusOverlay);
     }
 
     assert_eq!(inner.broadcasts_received.load(Ordering::SeqCst), 0);
@@ -242,7 +247,7 @@ fn test_lossy_overlay_listener_broadcast_delay() {
     let data = create_test_data();
 
     let start = Instant::now();
-    lossy.on_broadcast(sender_id, &data);
+    lossy.on_broadcast(sender_id, &data, crate::BroadcastSource::ConsensusOverlay);
 
     // Wait for delayed delivery
     std::thread::sleep(std::time::Duration::from_millis(150));

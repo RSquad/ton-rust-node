@@ -1063,6 +1063,9 @@ fn serialize_accelerator(acc: &AcceleratedConsensusConfig) -> Result<Value> {
 
 fn serialize_simplex_config(cfg: &SimplexConfig) -> Result<Value> {
     let mut map = Map::new();
+    if cfg.enable_observers {
+        serialize_field(&mut map, "enable_observers", 1u32);
+    }
     if cfg.use_quic {
         serialize_field(&mut map, "use_quic", 1u32);
     }

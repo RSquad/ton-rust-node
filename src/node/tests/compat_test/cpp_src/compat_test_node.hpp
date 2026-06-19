@@ -192,6 +192,10 @@ private:
     void cmd_compress_boc(td::JsonObject &obj);
     void cmd_decompress_boc(td::JsonObject &obj);
     void cmd_compute_candidate_id_to_sign(td::JsonObject &obj);
+    void cmd_compute_block_sync_overlay_id(td::JsonObject &obj);
+    void cmd_parse_simplex_config_v2(td::JsonObject &obj);
+    void cmd_build_simplex_config_v2(td::JsonObject &obj);
+    void cmd_compute_block_sync_overlay_members(td::JsonObject &obj);
     void cmd_enable_quic(td::JsonObject &obj);
     void cmd_send_quic_message(td::JsonObject &obj);
     void cmd_send_quic_query(td::JsonObject &obj);

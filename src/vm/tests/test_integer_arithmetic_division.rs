@@ -11,8 +11,9 @@
 mod common;
 use common::*;
 use ton_assembler::CompileError;
-use ton_block::ExceptionCode;
+use ton_block::{ExceptionCode, SliceData};
 use ton_vm::{
+    executor::DivMode,
     int,
     stack::{integer::IntegerData, Stack, StackItem},
 };
@@ -503,7 +504,7 @@ fn test_adddivmod_success() {
         let v = x as i64 + w as i64;
         let q = v / z as i64;
         let r = v % z as i64;
-        println!("ADDDIVMOD: ({x} + {w}) / {z} => ({q}, {r})");
+        // println!("ADDDIVMOD: ({x} + {w}) / {z} => ({q}, {r})");
         test_case(&code).expect_stack(Stack::new().push(int!(q)).push(int!(r)));
     }
 }
@@ -824,7 +825,7 @@ fn test_addrshiftmod_success() {
 }
 
 #[test]
-fn test_rshift() {
+fn test_rshift_all() {
     test_case(
         "PUSHINT 4
          PUSHINT 2
@@ -1051,7 +1052,7 @@ fn test_quiet_muldiv_does_not_fail_div_on_zero() {
          PUSHINT 0
          QMULDIV",
     )
-    .expect_stack(Stack::new().push(int!(nan)));
+    .expect_stack(Stack::new().push_nan());
 }
 
 #[test]
@@ -1062,7 +1063,69 @@ fn test_quiet_muldivmod_does_not_fail_div_on_zero() {
          PUSHINT 0
          QMULDIVMOD",
     )
-    .expect_stack(Stack::new().push(int!(nan)).push(int!(nan)));
+    .expect_stack(Stack::new().push_nan().push_nan());
+}
+
+#[test]
+fn test_quiet_stack_shift_argument_nan_v14() {
+    test_case(
+        "PUSHINT 4
+         PUSHNAN
+         QLSHIFT",
+    )
+    .expect_stack(Stack::new().push_nan());
+
+    test_case(
+        "PUSHINT 4
+         PUSHNAN
+         QLSHIFT",
+    )
+    .with_block_version(12)
+    .expect_failure(ExceptionCode::RangeCheckError);
+
+    test_case(
+        "PUSHINT 4
+         PUSHNAN
+         QRSHIFT",
+    )
+    .expect_stack(Stack::new().push_nan());
+
+    test_case(
+        "PUSHINT 4
+         PUSHNAN
+         QRSHIFT",
+    )
+    .with_block_version(12)
+    .expect_failure(ExceptionCode::RangeCheckError);
+
+    test_case(
+        "PUSHNAN
+         PUSHINT 1
+         QLSHIFT",
+    )
+    .expect_stack(Stack::new().push_nan());
+
+    test_case(
+        "PUSHINT 5
+         PUSHNAN
+         QMODPOW2",
+    )
+    .expect_stack(Stack::new().push_nan());
+
+    test_case(
+        "PUSHINT 5
+         PUSHINT 257
+         QMODPOW2",
+    )
+    .expect_stack(Stack::new().push_nan());
+
+    test_case(
+        "PUSHINT 5
+         PUSHINT 257
+         QMODPOW2",
+    )
+    .with_block_version(12)
+    .expect_failure(ExceptionCode::RangeCheckError);
 }
 
 #[test]
@@ -3173,5 +3236,131 @@ mod lshiftdivr_tt {
              LSHIFTDIVR 1",
         )
         .expect_failure(ExceptionCode::TypeCheckError);
+    }
+}
+
+#[test]
+fn fix_div_new_versions() {
+    let skip = [0x30, 0xB0, 0xD0];
+    let shift = [0x20, 0xA0, 0xC0];
+    for quiet in [false, true] {
+        for extra_byte in [false, true] {
+            if quiet && extra_byte {
+                continue;
+            }
+            for block_version in [12, 14] {
+                for flags in 0..=0b11111111 {
+                    let prefix = flags & 0b11110000;
+                    let mut code = vec![0x71, 0x71, 0x71, 0x7F, 0xA9, flags, 0x80];
+                    if extra_byte {
+                        code.insert(6, 0x00);
+                    }
+                    if quiet {
+                        code.insert(4, 0xB7);
+                    }
+                    let code = SliceData::new(code).into_cell().unwrap();
+                    // println!("Flags: {flags:#010b}, quiet: {quiet}, extra_byte: {extra_byte}, block_version: {block_version}, code: {}", hex::encode(&code));
+                    let case = test_case_with_bytecode(code).with_block_version(block_version);
+                    let mode = DivMode::with_flags(flags);
+                    if !extra_byte && skip.iter().any(|mask| mask == &prefix) {
+                        case.expect_failure(ExceptionCode::InvalidOpcode);
+                    } else if !mode.is_valid(quiet) {
+                        case.expect_failure(ExceptionCode::InvalidOpcode);
+                    } else if !shift.iter().any(|mask| mask == &prefix) {
+                        case.expect_success();
+                    } else if quiet && block_version == 14 {
+                        case.expect_success();
+                    } else {
+                        case.expect_failure(ExceptionCode::RangeCheckError);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn fix_nan_new_versions() {
+    let shift = [0x20, 0xA0, 0xC0];
+    let skip = [0x30, 0xB0, 0xD0];
+    for quiet in [false, true] {
+        for extra_byte in [false, true] {
+            if quiet && extra_byte {
+                continue;
+            }
+            for block_version in [14] {
+                for flags in 0..=0b11111111 {
+                    let prefix = flags & 0b11110000;
+                    let mut code =
+                        vec![0x83, 0xFF, 0x83, 0xFF, 0x83, 0xFF, 0x83, 0xFF, 0xA9, flags, 0x80];
+                    if extra_byte {
+                        code.insert(10, 0x00);
+                    }
+                    if quiet {
+                        code.insert(8, 0xB7);
+                    }
+                    // println!("Flags: {flags:#010b}, quiet: {quiet}, extra_byte: {extra_byte}, block_version: {block_version}, code: {}", hex::encode(&code));
+                    let code = SliceData::new(code).into_cell().unwrap();
+                    let case = test_case_with_bytecode(code).with_block_version(block_version);
+                    let mode = DivMode::with_flags(flags);
+                    if !extra_byte && skip.iter().any(|mask| mask == &prefix) {
+                        case.expect_failure(ExceptionCode::InvalidOpcode);
+                    } else if !mode.is_valid(quiet) {
+                        case.expect_failure(ExceptionCode::InvalidOpcode);
+                    } else if !quiet && shift.iter().any(|mask| mask == &prefix) {
+                        case.expect_failure(ExceptionCode::RangeCheckError);
+                    } else if quiet {
+                        case.expect_success();
+                    } else {
+                        case.expect_failure(ExceptionCode::IntegerOverflow);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn fix_div_by_zero_new_versions() {
+    let skip = [0x30, 0xB0, 0xD0];
+    for quiet in [false, true] {
+        for extra_byte in [false, true] {
+            if quiet && extra_byte {
+                continue;
+            }
+            for block_version in [12, 14] {
+                for flags in 0..=0b11111111 {
+                    if flags & 0x20 != 0 {
+                        continue;
+                    }
+                    let prefix = flags & 0b11110000;
+                    let mut code = vec![0x71, 0x72, 0x73, 0xA9, flags, 0x80];
+                    if extra_byte {
+                        code.insert(5, 0x00);
+                    }
+                    if quiet {
+                        code.insert(3, 0xB7);
+                    }
+                    if prefix == 0xC0 {
+                        code.insert(2, 0x70);
+                    } else {
+                        code.insert(3, 0x70);
+                    }
+                    // println!("Flags: {flags:#010b}, quiet: {quiet}, extra_byte: {extra_byte}, block_version: {block_version}, code: {}", hex::encode(&code));
+                    let code = SliceData::new(code).into_cell().unwrap();
+                    let case = test_case_with_bytecode(code).with_block_version(block_version);
+                    let mode = DivMode::with_flags(flags);
+                    if !mode.is_valid(quiet) {
+                        case.expect_failure(ExceptionCode::InvalidOpcode);
+                    } else if !extra_byte && skip.iter().any(|mask| mask == &prefix) {
+                        case.expect_failure(ExceptionCode::InvalidOpcode);
+                    } else if quiet {
+                        case.expect_success();
+                    } else {
+                        case.expect_failure(ExceptionCode::IntegerOverflow);
+                    }
+                }
+            }
+        }
     }
 }

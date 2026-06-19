@@ -29,15 +29,19 @@ pub mod utils;
 use adnl::{NetworkStack, PrivateOverlayShortId};
 use std::{
     any::Any,
+    collections::HashMap,
     fmt,
     rc::Rc,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Weak,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
-use ton_block::{BlockIdExt, BlockSignaturesVariant, KeyId, KeyOption, UInt256};
+use ton_block::{
+    BlockIdExt, BlockSignaturesVariant, ConfigParams, KeyId, KeyOption, ShardIdent, UInt256,
+    ValidatorSet,
+};
 
 // Test utilities module - available for tests and when test-utils feature is enabled
 #[cfg(any(test, feature = "test-utils"))]
@@ -125,6 +129,7 @@ pub type SessionListenerPtr = Weak<dyn SessionListener + Send + Sync>;
 /// Pointer to a Session
 pub type SessionPtr = Arc<dyn Session + Send + Sync>;
 
+pub use adnl_overlay::BlockSyncCheck;
 pub use lossy_overlay::LossyOverlayOpts;
 
 // ============================================================================
@@ -522,6 +527,282 @@ pub struct ConsensusNode {
 }
 
 // ============================================================================
+// Block-Sync Overlay (BlockSync)
+// ============================================================================
+
+/// 1 MiB safety margin added to the per-key broadcast cap
+/// (matches C++ `block-sync-overlay.cpp`: `max_block_size + max_collated_data_size + 1 MiB`)
+pub const BLOCK_SYNC_BROADCAST_SIZE_MARGIN: u32 = 1 << 20;
+
+/// Membership and authorization for a per-session block-sync overlay
+///
+/// C++ ref: `validator/consensus/block-sync-overlay.cpp` (authorized_keys from current set,
+/// FixedMemberList from prev|curr|next union built in `manager.cpp`)
+#[derive(Clone, Debug)]
+pub struct BlockSyncOverlayParams {
+    /// Sorted-unique ADNL ids of the prev|curr|next mc validator sets union (FixedMemberList)
+    pub members: Vec<PublicKeyHash>,
+
+    /// Senders allowed to originate broadcasts, keyed by ADNL pubkey hash with per-key max size
+    pub authorized_keys: HashMap<PublicKeyHash, u32>,
+
+    /// Ordered ADNL pubkey hashes of the current set; precheck computes
+    /// `current_set[(slot / slots_per_leader_window) % current_set.len()]`
+    pub current_set: Vec<PublicKeyHash>,
+
+    /// Leader window size from `simplex_config_v2`
+    pub slots_per_leader_window: u32,
+
+    /// Max broadcast/candidate size accepted on this overlay, derived from
+    /// consensus config: `max_block_bytes + max_collated_bytes + 1 MiB` margin
+    /// (matches C++ `block-sync-overlay.cpp` `max_broadcast_size`)
+    pub max_broadcast_size: u32,
+
+    /// Short id of the block-sync overlay; attached via `with_overlay_id`.
+    pub overlay_id: Option<Arc<PrivateOverlayShortId>>,
+
+    /// Identifying fields used by the telemetry log dump; not consumed by overlay logic
+    pub shard: Option<ShardIdent>,
+    pub session_id: Option<UInt256>,
+}
+
+impl BlockSyncOverlayParams {
+    /// Build the params from masterchain `ConfigParams` and the shuffled session subset
+    ///
+    /// `cur_subset` is the per-(shard, cc_seqno) shuffled subset used by simplex for
+    /// leader rotation; empty prev/next sets are skipped (C++ `is_null()` behavior)
+    pub fn from_config(
+        config: &ConfigParams,
+        slots_per_leader_window: u32,
+        cur_subset: &ValidatorSet,
+    ) -> Result<Self> {
+        let consensus = config.consensus_config()?;
+        let max_size: u32 = consensus
+            .max_block_bytes
+            .saturating_add(consensus.max_collated_bytes)
+            .saturating_add(BLOCK_SYNC_BROADCAST_SIZE_MARGIN);
+
+        let prev = config.prev_validator_set()?;
+        let curr = config.validator_set()?;
+        let next = config.next_validator_set()?;
+
+        let mut members_set: std::collections::BTreeSet<PublicKeyHash> =
+            std::collections::BTreeSet::new();
+        let mut authorized_keys: HashMap<PublicKeyHash, u32> = HashMap::new();
+        let mut current_set: Vec<PublicKeyHash> = Vec::with_capacity(cur_subset.list().len());
+
+        for vset in [&prev, &curr, &next] {
+            for val in vset.list() {
+                members_set.insert(val.adnl_addr());
+            }
+        }
+
+        // current_set / authorized_keys MUST follow the SHUFFLED session order
+        // (cur_subset), not the raw masterchain config order. Simplex computes
+        // `expected_leader_for(slot) = current_set[(slot/window) % N]` over this
+        // shuffled order; using raw mc order makes the precheck reject every
+        // valid leader broadcast except by coincidence
+        for val in cur_subset.list() {
+            let id = val.adnl_addr();
+            authorized_keys.insert(id.clone(), max_size);
+            current_set.push(id);
+        }
+
+        Ok(Self {
+            members: members_set.into_iter().collect(),
+            authorized_keys,
+            current_set,
+            slots_per_leader_window,
+            max_broadcast_size: max_size,
+            overlay_id: None,
+            shard: None,
+            session_id: None,
+        })
+    }
+
+    /// Attach the overlay short id (computed by simplex from session_id).
+    pub fn with_overlay_id(mut self, overlay_id: Arc<PrivateOverlayShortId>) -> Self {
+        self.overlay_id = Some(overlay_id);
+        self
+    }
+
+    /// Attach identifying fields used by the telemetry log dump
+    pub fn with_identity(mut self, shard: ShardIdent, session_id: UInt256) -> Self {
+        self.shard = Some(shard);
+        self.session_id = Some(session_id);
+        self
+    }
+}
+
+/// Role discriminator used both in Prometheus metric names and the log dump header
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockSyncRole {
+    Validator,
+    Observer,
+}
+
+impl BlockSyncRole {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            BlockSyncRole::Validator => "validator",
+            BlockSyncRole::Observer => "observer",
+        }
+    }
+}
+
+/// Per-overlay-instance counters for the block-sync overlay
+///
+/// Counters are cumulative since `started_at`. Bumps update both an in-memory
+/// `AtomicU64` (used by the periodic log dump) and a global Prometheus counter
+/// named `block_sync_overlay_<role>_<counter>`
+pub struct BlockSyncStats {
+    pub overlay_short_id: Arc<PrivateOverlayShortId>,
+    pub role: BlockSyncRole,
+    pub shard: Option<ShardIdent>,
+    pub session_id: Option<UInt256>,
+    pub started_at: Instant,
+    pub sent: AtomicU64,
+    pub recv: AtomicU64,
+    pub auth_drop: AtomicU64,
+    pub precheck_drop: AtomicU64,
+    pub send_err: AtomicU64,
+    pub leader_mismatch: AtomicU64,
+}
+
+/// Period between log dumps; Prometheus scrape cadence is independent
+pub const BLOCK_SYNC_STATS_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Log target for the multi-line periodic dump
+pub const BLOCK_SYNC_STATS_LOG_TARGET: &str = "block_sync_telemetry";
+
+impl BlockSyncStats {
+    pub fn new(
+        overlay_short_id: Arc<PrivateOverlayShortId>,
+        role: BlockSyncRole,
+        shard: Option<ShardIdent>,
+        session_id: Option<UInt256>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            overlay_short_id,
+            role,
+            shard,
+            session_id,
+            started_at: Instant::now(),
+            sent: AtomicU64::new(0),
+            recv: AtomicU64::new(0),
+            auth_drop: AtomicU64::new(0),
+            precheck_drop: AtomicU64::new(0),
+            send_err: AtomicU64::new(0),
+            leader_mismatch: AtomicU64::new(0),
+        })
+    }
+
+    pub fn bump_sent(&self) {
+        self.sent.fetch_add(1, Ordering::Relaxed);
+        let name = match self.role {
+            BlockSyncRole::Validator => "block_sync_overlay_validator_sent",
+            BlockSyncRole::Observer => "block_sync_overlay_observer_sent",
+        };
+        metrics::counter!(name, "shard" => self.shard_label()).increment(1);
+    }
+    pub fn bump_recv(&self) {
+        self.recv.fetch_add(1, Ordering::Relaxed);
+        let name = match self.role {
+            BlockSyncRole::Validator => "block_sync_overlay_validator_recv",
+            BlockSyncRole::Observer => "block_sync_overlay_observer_recv",
+        };
+        metrics::counter!(name, "shard" => self.shard_label()).increment(1);
+    }
+    pub fn bump_auth_drop(&self) {
+        self.auth_drop.fetch_add(1, Ordering::Relaxed);
+        let name = match self.role {
+            BlockSyncRole::Validator => "block_sync_overlay_validator_auth_drop",
+            BlockSyncRole::Observer => "block_sync_overlay_observer_auth_drop",
+        };
+        metrics::counter!(name, "shard" => self.shard_label()).increment(1);
+    }
+    pub fn bump_precheck_drop(&self) {
+        self.precheck_drop.fetch_add(1, Ordering::Relaxed);
+        let name = match self.role {
+            BlockSyncRole::Validator => "block_sync_overlay_validator_precheck_drop",
+            BlockSyncRole::Observer => "block_sync_overlay_observer_precheck_drop",
+        };
+        metrics::counter!(name, "shard" => self.shard_label()).increment(1);
+    }
+    pub fn bump_send_err(&self) {
+        self.send_err.fetch_add(1, Ordering::Relaxed);
+        let name = match self.role {
+            BlockSyncRole::Validator => "block_sync_overlay_validator_send_err",
+            BlockSyncRole::Observer => "block_sync_overlay_observer_send_err",
+        };
+        metrics::counter!(name, "shard" => self.shard_label()).increment(1);
+    }
+    pub fn bump_leader_mismatch(&self) {
+        self.leader_mismatch.fetch_add(1, Ordering::Relaxed);
+        let name = match self.role {
+            BlockSyncRole::Validator => "block_sync_overlay_validator_leader_mismatch",
+            BlockSyncRole::Observer => "block_sync_overlay_observer_leader_mismatch",
+        };
+        metrics::counter!(name, "shard" => self.shard_label()).increment(1);
+    }
+
+    fn shard_label(&self) -> String {
+        self.shard.as_ref().map(|s| s.to_string()).unwrap_or_else(|| "none".into())
+    }
+
+    /// Emit a single multi-line block at INFO into `BLOCK_SYNC_STATS_LOG_TARGET`
+    pub fn dump(&self) {
+        let uptime = self.started_at.elapsed().as_secs();
+        let shard_str = self.shard.as_ref().map(|s| s.to_string()).unwrap_or_else(|| "-".into());
+        let session_str =
+            self.session_id.as_ref().map(|s| s.to_hex_string()).unwrap_or_else(|| "-".into());
+        log::info!(
+            target: BLOCK_SYNC_STATS_LOG_TARGET,
+            "BSYNC STAT\n  \
+             overlay:        {}\n  \
+             shard:          {shard_str}\n  \
+             session:        {session_str}\n  \
+             role:           {}\n  \
+             uptime:         {uptime}s\n  \
+             sent:           {}\n  \
+             recv:           {}\n  \
+             precheck_drop:  {}\n  \
+             auth_drop:      {}\n  \
+             send_err:       {}\n  \
+             leader_mismatch:{}\n",
+            self.overlay_short_id,
+            self.role.as_str(),
+            self.sent.load(Ordering::Relaxed),
+            self.recv.load(Ordering::Relaxed),
+            self.precheck_drop.load(Ordering::Relaxed),
+            self.auth_drop.load(Ordering::Relaxed),
+            self.send_err.load(Ordering::Relaxed),
+            self.leader_mismatch.load(Ordering::Relaxed),
+        );
+    }
+
+    /// Spawn a tokio task that calls `dump()` every `BLOCK_SYNC_STATS_LOG_INTERVAL`
+    /// until `stop` is observed
+    pub fn spawn_ticker(self: Arc<Self>, runtime: tokio::runtime::Handle, stop: Arc<AtomicBool>) {
+        runtime.spawn(async move {
+            let mut ticker = tokio::time::interval(BLOCK_SYNC_STATS_LOG_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await; // skip immediate first tick
+            loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                ticker.tick().await;
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                self.dump();
+            }
+        });
+    }
+}
+
+// ============================================================================
 // Block Payload
 // ============================================================================
 
@@ -538,13 +819,26 @@ pub trait BlockPayload: fmt::Debug + Send + Sync {
 // Overlay Interfaces
 // ============================================================================
 
-/// Overlay inbound interface (Overlay -> Consensus)
+/// Which overlay an inbound broadcast arrived on
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BroadcastSource {
+    /// Inbound on the consensus private overlay (votes/certs)
+    ConsensusOverlay,
+    /// Inbound on the per-session block-sync overlay (candidates only)
+    BlockSyncOverlay,
+}
+
 pub trait ConsensusOverlayListener: Send + Sync {
     /// Incoming message processing
     fn on_message(&self, adnl_id: PublicKeyHash, data: &BlockPayloadPtr);
 
     /// Incoming broadcast processing
-    fn on_broadcast(&self, source_key_hash: PublicKeyHash, data: &BlockPayloadPtr);
+    fn on_broadcast(
+        &self,
+        source_key_hash: PublicKeyHash,
+        data: &BlockPayloadPtr,
+        source: BroadcastSource,
+    );
 
     /// Incoming query processing
     fn on_query(
@@ -642,7 +936,8 @@ impl OverlayTransportType {
 
 /// Overlay manager
 pub trait ConsensusOverlayManager {
-    /// Create new overlay
+    /// Create new overlay; when `enable_observers=true`, simplex attaches the
+    /// block-sync overlay id to `block_sync_params` via `with_overlay_id`.
     fn start_overlay(
         &self,
         local_validator_key: &PrivateKey,
@@ -651,6 +946,7 @@ pub trait ConsensusOverlayManager {
         overlay_listener: ConsensusOverlayListenerPtr,
         log_replay_listener: ConsensusOverlayLogReplayListenerPtr,
         transport_type: OverlayTransportType,
+        block_sync_params: Option<BlockSyncOverlayParams>,
     ) -> Result<ConsensusOverlayPtr>;
 
     /// Stop existing overlay
@@ -1127,4 +1423,219 @@ pub trait Session: fmt::Display + Send + Sync {
     /// session type (e.g., `CatchainSession` or `SimplexSession`) when
     /// consensus-specific methods are needed.
     fn as_any(&self) -> &dyn Any;
+}
+
+#[cfg(test)]
+mod block_sync_overlay_params_tests {
+    //! Cross-checked against C++ `block-sync-overlay.cpp` (current-set authorized_keys)
+    //! and `manager.cpp` (prev|curr|next members union)
+
+    use super::*;
+    use ton_block::{
+        ConfigParam32, ConfigParam34, ConfigParam36, ConfigParamEnum, ConsensusConfig, SigPubKey,
+        ValidatorDescr, ValidatorSet,
+    };
+
+    /// Deterministic ValidatorDescr from a single-byte seed. `adnl_addr` left
+    /// `None` so `ValidatorDescr::adnl_addr()` derives the id from the public
+    /// key (matches the C++ `addr.is_zero() ? key : addr` fallback)
+    fn vdescr(seed: u8) -> ValidatorDescr {
+        let key = SigPubKey::with_bytes([seed; 32]);
+        ValidatorDescr::with_params(key, 1, None)
+    }
+
+    fn vset(seeds: &[u8]) -> ValidatorSet {
+        if seeds.is_empty() {
+            return ValidatorSet::default();
+        }
+        let list: Vec<_> = seeds.iter().map(|&s| vdescr(s)).collect();
+        ValidatorSet::new(0, 100, 1, list).unwrap()
+    }
+
+    fn config_with(
+        prev: ValidatorSet,
+        curr: ValidatorSet,
+        next: ValidatorSet,
+        max_block: u32,
+        max_collated: u32,
+    ) -> ConfigParams {
+        let mut consensus = ConsensusConfig::new();
+        consensus.round_candidates = 1;
+        consensus.max_block_bytes = max_block;
+        consensus.max_collated_bytes = max_collated;
+
+        let mut params = ConfigParams::default();
+        params.set_config(ConfigParamEnum::ConfigParam29(consensus)).unwrap();
+        if !prev.list().is_empty() {
+            params
+                .set_config(ConfigParamEnum::ConfigParam32(ConfigParam32::with_validator_set(prev)))
+                .unwrap();
+        }
+        if !curr.list().is_empty() {
+            params
+                .set_config(ConfigParamEnum::ConfigParam34(ConfigParam34::with_validator_set(curr)))
+                .unwrap();
+        }
+        if !next.list().is_empty() {
+            params
+                .set_config(ConfigParamEnum::ConfigParam36(ConfigParam36::with_validator_set(next)))
+                .unwrap();
+        }
+        params
+    }
+
+    /// Overlapping prev/curr/next yield a sorted-unique members vector covering all three
+    #[test]
+    fn members_union_dedup() {
+        let curr = vset(&[2, 3, 4]);
+        let cfg = config_with(vset(&[1, 2, 3]), curr.clone(), vset(&[3, 4, 5]), 1 << 22, 1 << 22);
+        let p =
+            BlockSyncOverlayParams::from_config(&cfg, /*slots_per_leader_window*/ 4, &curr)
+                .unwrap();
+        assert_eq!(p.members.len(), 5, "expected dedup union of size 5, got {:?}", p.members);
+        let mut sorted = p.members.clone();
+        sorted.sort();
+        assert_eq!(p.members, sorted, "members must be sorted");
+    }
+
+    /// Empty prev/next is not an error: members == current set
+    #[test]
+    fn members_union_handles_empty_prev_next() {
+        let curr = vset(&[10, 11]);
+        let cfg = config_with(
+            ValidatorSet::default(),
+            curr.clone(),
+            ValidatorSet::default(),
+            1 << 22,
+            1 << 22,
+        );
+        let p =
+            BlockSyncOverlayParams::from_config(&cfg, /*slots_per_leader_window*/ 4, &curr)
+                .unwrap();
+        assert_eq!(p.members.len(), 2);
+        assert_eq!(p.authorized_keys.len(), 2);
+    }
+
+    /// `authorized_keys` covers the current set only (prev/next-only ids excluded).
+    /// C++ parity: block-sync-overlay.cpp line 41-44 iterates `bus.validator_set`,
+    /// not the wider overlay_members union
+    #[test]
+    fn authorized_keys_only_current_set() {
+        let curr = vset(&[2, 3]); // current
+        let cfg = config_with(
+            vset(&[1]), // prev-only
+            curr.clone(),
+            vset(&[4]), // next-only
+            1 << 22,
+            1 << 22,
+        );
+        let p =
+            BlockSyncOverlayParams::from_config(&cfg, /*slots_per_leader_window*/ 4, &curr)
+                .unwrap();
+        let curr_ids: Vec<_> = vset(&[2, 3]).list().iter().map(|v| v.adnl_addr()).collect();
+        assert_eq!(p.authorized_keys.len(), 2);
+        for id in &curr_ids {
+            assert!(p.authorized_keys.contains_key(id));
+        }
+        // prev-only id (seed=1) and next-only id (seed=4) must NOT be authorized
+        let prev_id = vset(&[1]).list()[0].adnl_addr();
+        let next_id = vset(&[4]).list()[0].adnl_addr();
+        assert!(!p.authorized_keys.contains_key(&prev_id));
+        assert!(!p.authorized_keys.contains_key(&next_id));
+        // Both must still appear in `members`
+        assert!(p.members.contains(&prev_id));
+        assert!(p.members.contains(&next_id));
+    }
+
+    /// `max_broadcast_size = max_block_bytes + max_collated_bytes + 1 MiB`
+    /// (matches C++ `block-sync-overlay.cpp:40`)
+    #[test]
+    fn authorized_keys_size_from_consensus_config() {
+        let curr = vset(&[1]);
+        let cfg = config_with(
+            ValidatorSet::default(),
+            curr.clone(),
+            ValidatorSet::default(),
+            2 * 1024 * 1024, // 2 MiB
+            3 * 1024 * 1024, // 3 MiB
+        );
+        let p =
+            BlockSyncOverlayParams::from_config(&cfg, /*slots_per_leader_window*/ 4, &curr)
+                .unwrap();
+        let expected = 2 * 1024 * 1024 + 3 * 1024 * 1024 + (1 << 20); // 6 MiB
+        let only_key = p.authorized_keys.values().next().copied().unwrap();
+        assert_eq!(only_key, expected);
+    }
+
+    /// `current_set` carries the same elements as `authorized_keys.keys()` and is
+    /// ordered by `validator_set.list()` position
+    #[test]
+    fn current_set_is_ordered_subset_of_authorized() {
+        let curr = vset(&[10, 11, 12]);
+        let cfg = config_with(
+            ValidatorSet::default(),
+            curr.clone(),
+            ValidatorSet::default(),
+            1 << 22,
+            1 << 22,
+        );
+        let p = BlockSyncOverlayParams::from_config(&cfg, 4, &curr).unwrap();
+        assert_eq!(p.current_set.len(), 3);
+        assert_eq!(p.authorized_keys.len(), 3);
+        for id in &p.current_set {
+            assert!(p.authorized_keys.contains_key(id));
+        }
+        // current_set MUST follow cur_subset.list() order (shuffled per-session
+        // order in production), not raw HashMap iteration
+        let expected: Vec<_> = curr.list().iter().map(|v| v.adnl_addr()).collect();
+        assert_eq!(p.current_set, expected);
+    }
+
+    /// When cur_subset differs from cfg.validator_set (the shard subset case in
+    /// production), current_set / authorized_keys MUST follow cur_subset, not
+    /// the wider masterchain set. members still covers the full union
+    #[test]
+    fn current_set_uses_cur_subset_not_mc_validator_set() {
+        let mc_curr = vset(&[10, 11, 12, 13, 14]);
+        // Simulate a shard subset: 3 validators in a different (shuffled) order
+        let shard_subset = vset(&[13, 10, 12]);
+        let cfg = config_with(
+            ValidatorSet::default(),
+            mc_curr.clone(),
+            ValidatorSet::default(),
+            1 << 22,
+            1 << 22,
+        );
+        let p = BlockSyncOverlayParams::from_config(&cfg, 4, &shard_subset).unwrap();
+        // current_set follows the shard subset order, NOT the mc validator_set order
+        let expected: Vec<_> = shard_subset.list().iter().map(|v| v.adnl_addr()).collect();
+        assert_eq!(p.current_set, expected);
+        // authorized covers only the shard subset
+        assert_eq!(p.authorized_keys.len(), 3);
+        let mc_only_id = vset(&[11]).list()[0].adnl_addr();
+        assert!(
+            !p.authorized_keys.contains_key(&mc_only_id),
+            "mc-only validator must NOT be in authorized_keys"
+        );
+        // members still covers the wider mc set (so overlay survives rotation)
+        let mc_only_member = vset(&[14]).list()[0].adnl_addr();
+        assert!(p.members.contains(&mc_only_member));
+    }
+
+    /// slots_per_leader_window is plumbed through verbatim
+    #[test]
+    fn slots_per_leader_window_plumbed_through() {
+        let curr = vset(&[1]);
+        let cfg = config_with(
+            ValidatorSet::default(),
+            curr.clone(),
+            ValidatorSet::default(),
+            1 << 22,
+            1 << 22,
+        );
+        let p = BlockSyncOverlayParams::from_config(&cfg, 16, &curr).unwrap();
+        assert_eq!(p.slots_per_leader_window, 16);
+        let p = BlockSyncOverlayParams::from_config(&cfg, 1, &curr).unwrap();
+        assert_eq!(p.slots_per_leader_window, 1);
+    }
 }

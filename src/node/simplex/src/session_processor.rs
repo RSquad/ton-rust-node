@@ -724,6 +724,16 @@ struct FinalizedEntry {
     finalized_at: SystemTime,
 }
 
+/// Value of `finalized_delivery_sent_seqno`: the delivered `BlockIdExt` plus the
+/// originating slot. The slot is kept so this map can later be pruned together
+/// with the retained candidate metadata; until then, keeping this map session-long
+/// is what prevents old retained `received_candidates` from re-emitting callbacks.
+#[derive(Debug, Clone)]
+struct FinalizedSeqnoRecord {
+    slot: SlotIndex,
+    block_id: BlockIdExt,
+}
+
 /*
     Slot runtime + outcome gating (future wiring)
 
@@ -1162,9 +1172,15 @@ pub(crate) struct SessionProcessor {
     /// Seqno-level finalized callback tracking.
     ///
     /// Protocol invariant: a session must never emit more than one
-    /// `on_block_finalized()` callback for the same block seqno.
-    /// Any second attempt is treated as a protocol breach and asserted.
-    finalized_delivery_sent_seqno: HashMap<u32, BlockIdExt>,
+    /// `on_block_finalized()` callback for two **distinct** blocks at the same
+    /// seqno. The same block being processed twice (e.g. recursive parent walk
+    /// re-entering an ancestor whose slot-keyed dedup entry was already pruned
+    /// by `cleanup_old_slots`) is idempotent and must not panic.
+    ///
+    /// The value carries the originating slot for future coupled cleanup with
+    /// `received_candidates`. It intentionally outlives the slot-keyed
+    /// `finalized_delivery_sent` while old received candidates are retained.
+    finalized_delivery_sent_seqno: HashMap<u32, FinalizedSeqnoRecord>,
 
     /// Collected misbehavior reports from this session
     ///
@@ -9134,6 +9150,10 @@ impl SessionProcessor {
         // Prune log-throttle set to prevent unbounded growth over long sessions
         self.missing_body_logged.retain(|&slot| slot >= up_to_slot.value());
         self.finalized_delivery_sent.retain(|id| id.slot >= up_to_slot);
+        // Do not prune finalized_delivery_sent_seqno here while received_candidates
+        // are still retained for old slots. If the seqno dedup is removed but old
+        // candidate metadata remains reachable, a later recursive parent-chain
+        // walk can re-emit an already-delivered finalized callback.
 
         // Remove pending candidate requests for slots < up_to_slot
         self.requested_candidates.retain(|id, _| id.slot >= up_to_slot);
@@ -10119,16 +10139,36 @@ impl SessionProcessor {
             return;
         }
 
-        // Protocol invariant: exactly one finalized callback per seqno.
+        // Protocol invariant: at most one finalized callback per seqno for a
+        // *distinct* block. Two callbacks for the same `block_id` are idempotent
+        // (typically a recursive parent-chain walk re-entering an ancestor whose
+        // slot-keyed dedup entry was already pruned by `cleanup_old_slots`) and
+        // must NOT panic. Only a different `block_id` at the same seqno is a real
+        // protocol breach.
         let seqno = received.block_id.seq_no();
-        if let Some(existing_block_id) = self.finalized_delivery_sent_seqno.get(&seqno) {
+        if let Some(existing) = self.finalized_delivery_sent_seqno.get(&seqno) {
+            if existing.block_id == received.block_id {
+                log::debug!(
+                    "Session {} recursive finalization: idempotent re-entry for \
+                     block_id={} seqno={} previous_slot={} current_slot={} (slot dedup pruned)",
+                    &self.session_id().to_hex_string()[..8],
+                    received.block_id,
+                    seqno,
+                    existing.slot,
+                    candidate_id.slot,
+                );
+                // Re-insert the candidate_id so subsequent walks short-circuit at
+                // the cheaper dedup before reaching here.
+                self.finalized_delivery_sent.insert(candidate_id.clone());
+                return;
+            }
             assert!(
                 false,
                 "Session {} protocol breach: multiple finalized callbacks for seqno={} \
                  existing_block_id={} new_block_id={}",
                 &self.session_id().to_hex_string()[..8],
                 seqno,
-                existing_block_id,
+                existing.block_id,
                 received.block_id,
             );
         }
@@ -10232,15 +10272,20 @@ impl SessionProcessor {
         if delivered {
             self.record_self_collation_acceptance(candidate_id, &received.block_id, has_final_cert);
             self.finalized_delivery_sent.insert(candidate_id.clone());
-            let previous =
-                self.finalized_delivery_sent_seqno.insert(seqno, received.block_id.clone());
+            let previous = self.finalized_delivery_sent_seqno.insert(
+                seqno,
+                FinalizedSeqnoRecord {
+                    slot: candidate_id.slot,
+                    block_id: received.block_id.clone(),
+                },
+            );
             assert!(
                 previous.is_none(),
                 "Session {} protocol breach: duplicate finalized callback seqno={} \
                  previous_block_id={} new_block_id={}",
                 &self.session_id().to_hex_string()[..8],
                 seqno,
-                previous.unwrap_or_else(|| received.block_id.clone()),
+                previous.map(|r| r.block_id).unwrap_or_else(|| received.block_id.clone()),
                 received.block_id,
             );
         } else {
@@ -11038,19 +11083,22 @@ impl SessionStartupRecoveryListener for SessionProcessor {
                 if !is_empty {
                     self.finalized_delivery_sent.insert(candidate_id.clone());
                     let seqno = block_id.seq_no();
-                    if let Some(existing_block_id) = self.finalized_delivery_sent_seqno.get(&seqno)
-                    {
+                    if let Some(existing) = self.finalized_delivery_sent_seqno.get(&seqno) {
+                        if existing.block_id == block_id {
+                            continue;
+                        }
                         assert!(
                             false,
                             "Session {} protocol breach: duplicate finalized seqno={} while seeding \
                              existing_block_id={} new_block_id={}",
                             &self.session_id().to_hex_string()[..8],
                             seqno,
-                            existing_block_id,
+                            existing.block_id,
                             block_id,
                         );
                     }
-                    self.finalized_delivery_sent_seqno.insert(seqno, block_id);
+                    self.finalized_delivery_sent_seqno
+                        .insert(seqno, FinalizedSeqnoRecord { slot, block_id });
                 }
                 continue;
             }
@@ -11078,18 +11126,22 @@ impl SessionStartupRecoveryListener for SessionProcessor {
             if !is_empty {
                 self.finalized_delivery_sent.insert(candidate_id);
                 let seqno = block_id.seq_no();
-                if let Some(existing_block_id) = self.finalized_delivery_sent_seqno.get(&seqno) {
+                if let Some(existing) = self.finalized_delivery_sent_seqno.get(&seqno) {
+                    if existing.block_id == block_id {
+                        continue;
+                    }
                     assert!(
                         false,
                         "Session {} protocol breach: duplicate finalized seqno={} while seeding \
                          existing_block_id={} new_block_id={}",
                         &self.session_id().to_hex_string()[..8],
                         seqno,
-                        existing_block_id,
+                        existing.block_id,
                         block_id,
                     );
                 }
-                self.finalized_delivery_sent_seqno.insert(seqno, block_id);
+                self.finalized_delivery_sent_seqno
+                    .insert(seqno, FinalizedSeqnoRecord { slot, block_id });
             }
         }
 
