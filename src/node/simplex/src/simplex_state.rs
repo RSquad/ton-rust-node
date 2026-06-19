@@ -60,7 +60,6 @@ use crate::{
         ConflictReason, ConflictingVoteType, MisbehaviorProof, VoteDescriptor, VoteResult,
     },
     session_description::SessionDescription,
-    session_processor::{SlotDiagnostic, SlotWaitPhase, WindowDiagnostic},
     RawVoteData, ValidatorWeight,
 };
 use std::{
@@ -1107,6 +1106,8 @@ impl SimplexState {
             slots_per_leader_window: slots_per_window,
             max_leader_window_desync: desc.opts().max_leader_window_desync,
             window_reject_count: 0,
+            skipscan_invariant_warned: false,
+            startup_replay_active: false,
         };
 
         // Initialize first window with genesis (None) as available base

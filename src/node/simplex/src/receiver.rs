@@ -88,7 +88,7 @@ use ton_api::{
             simplex::{
                 candidateandcert::CandidateAndCert, vote::Vote as TlVote,
                 CandidateAndCert as CandidateAndCertBoxed, Certificate, UnsignedVote,
-                Vote as TlVoteBoxed,
+                Vote as TlVoteBoxed, VoteSignatureSet as VoteSignatureSetBoxed,
             },
             CandidateData, CandidateParent, RequestError as ConsensusRequestError,
         },

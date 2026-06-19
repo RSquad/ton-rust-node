@@ -6,8 +6,9 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-//! Tests for simplex signature utilities in validating_utils.rs
+//! Tests for simplex signature helpers and top-shard-descr promotion rules.
 
+use super::can_promote_to_top_shard_descr;
 use crate::validating_utils::{build_checked_data, simplex_to_sign};
 use ton_api::{IntoBoxed, Serializer};
 use ton_block::{
@@ -109,4 +110,51 @@ fn test_build_checked_data_simplex() {
     // Should use simplex_to_sign
     let expected = simplex_to_sign(&simplex).unwrap();
     assert_eq!(checked_data, expected);
+}
+
+fn make_simplex_variant(is_final: bool) -> BlockSignaturesVariant {
+    let session_id = UInt256::rand();
+    let candidate_data = BlockSignaturesSimplex::bytes_to_cell_tree(&[0xFE, 0xED]).unwrap();
+    let validator_info = ValidatorBaseInfo::with_params(1, 2);
+    let signatures = BlockSignaturesPure::with_weight(100);
+
+    let simplex = if is_final {
+        BlockSignaturesSimplex::new_finalize(
+            validator_info,
+            signatures,
+            session_id,
+            10,
+            candidate_data,
+        )
+    } else {
+        BlockSignaturesSimplex::new_notarize(
+            validator_info,
+            signatures,
+            session_id,
+            10,
+            candidate_data,
+        )
+    };
+
+    BlockSignaturesVariant::Simplex(simplex)
+}
+
+#[test]
+fn test_top_shard_descr_promotion_allows_ordinary_signatures() {
+    let ordinary = BlockSignaturesVariant::Ordinary(BlockSignatures::with_params(
+        ValidatorBaseInfo::with_params(1, 2),
+        BlockSignaturesPure::with_weight(100),
+    ));
+
+    assert!(can_promote_to_top_shard_descr(&ordinary));
+}
+
+#[test]
+fn test_top_shard_descr_promotion_allows_final_simplex_signatures() {
+    assert!(can_promote_to_top_shard_descr(&make_simplex_variant(true)));
+}
+
+#[test]
+fn test_top_shard_descr_promotion_rejects_notarized_simplex_signatures() {
+    assert!(!can_promote_to_top_shard_descr(&make_simplex_variant(false)));
 }

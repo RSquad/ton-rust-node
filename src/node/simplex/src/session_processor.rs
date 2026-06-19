@@ -2109,24 +2109,6 @@ impl ConsensusBackend for ConsensusBackendAdapter<'_> {
                 }
             },
         );
-        if let Err(e) = result.wait() {
-            log::error!(
-                "Session {} maybe_store_pool_state: failed to store pool_state ({}) after {}ms: {}",
-                &self.session_id().to_hex_string()[..8],
-                self.first_nonannounced_window,
-                self.now().duration_since(wait_started_at).map(|d| d.as_millis()).unwrap_or(0),
-                e
-            );
-            self.increment_error();
-        } else {
-            log::trace!(
-                "Session {} maybe_store_pool_state: stored pool_state \
-                (first_nonannounced_window={}) in {}ms",
-                &self.session_id().to_hex_string()[..8],
-                self.first_nonannounced_window,
-                self.now().duration_since(wait_started_at).map(|d| d.as_millis()).unwrap_or(0),
-            );
-        }
     }
 
     fn candidate_book(&self) -> &CandidateBook {

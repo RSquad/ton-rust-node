@@ -462,10 +462,30 @@ fn test_async_result_try_get() {
     // Wait for result
     result.wait_timeout(Duration::from_secs(5)).expect("timeout").unwrap();
 
-    // try_get should return error (already taken)
+    // try_get must surface the typed `StorageResultAlreadyTaken` sentinel —
+    // consumers detect this via `downcast_ref` rather than string matching,
+    // so any future change to the wrapping must keep the type alive.
     let try_result = result.try_get();
-    assert!(try_result.is_some());
-    assert!(try_result.unwrap().is_err());
+    assert!(try_result.is_some(), "second try_get must return Some(Err)");
+    let err = try_result.unwrap().expect_err("second try_get must be Err");
+    assert!(
+        err.downcast_ref::<crate::StorageResultAlreadyTaken>().is_some(),
+        "Err must downcast to StorageResultAlreadyTaken (got: {err})",
+    );
+    // Display impl is part of the public contract — log scrapers and humans
+    // continue to see the legacy text.
+    assert_eq!(err.to_string(), "StorageAsyncResult: result already taken");
+
+    // Same contract on `wait_timeout` after `try_get` already drained the
+    // result — it must also surface the typed sentinel.
+    let wait_result = result
+        .wait_timeout(Duration::from_millis(50))
+        .expect("wait_timeout on Taken state must return Some, not None");
+    let wait_err = wait_result.expect_err("wait_timeout on Taken must be Err");
+    assert!(
+        wait_err.downcast_ref::<crate::StorageResultAlreadyTaken>().is_some(),
+        "wait_timeout Err must also downcast to StorageResultAlreadyTaken (got: {wait_err})",
+    );
 
     storage.mark_for_destroy();
 }

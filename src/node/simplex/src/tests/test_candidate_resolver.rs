@@ -13,17 +13,31 @@
 
 use crate::{
     block::{SlotIndex, ValidatorIndex},
-    SessionId, SessionNode,
+    certificate::{Certificate, NotarCert, VoteSignature},
+    simplex_state::{NotarizeVote, Vote},
+    utils::{
+        compute_candidate_id_hash, compute_candidate_id_hash_empty, sign_candidate_u32, sign_vote,
+    },
+    PublicKey, SessionId, SessionNode,
 };
 use std::{
     collections::HashMap,
     time::{Duration, SystemTime},
 };
 use ton_api::{
-    ton::{consensus::overlayid::OverlayId, pub_::publickey::Overlay},
+    serialize_boxed,
+    ton::{
+        consensus::{
+            candidatedata::{Block as CandidateDataBlock, Empty as CandidateDataEmpty},
+            candidateid::CandidateId as TlCandidateId,
+            overlayid::OverlayId,
+            CandidateData, CandidateParent,
+        },
+        pub_::publickey::Overlay,
+    },
     IntoBoxed,
 };
-use ton_block::{Ed25519KeyOption, KeyId, UInt256, ZeroizingBytes};
+use ton_block::{BlockIdExt, Ed25519KeyOption, KeyId, ShardIdent, UInt256, ZeroizingBytes};
 
 #[test]
 fn test_candidate_resolver_cache_new() {
@@ -326,6 +340,47 @@ fn test_merge_candidate_response_parts_uses_locally_cached_notar() {
 }
 
 #[test]
+fn test_merge_candidate_response_parts_uses_locally_cached_candidate() {
+    let slot = SlotIndex::new(8);
+    let block_hash = UInt256::rand();
+    let cached_candidate = vec![11, 22, 33];
+    let notar_bytes = vec![44, 55];
+
+    let mut cache = super::CandidateResolverCache::new();
+    cache.cache_candidate(slot, block_hash.clone(), cached_candidate.clone());
+
+    let mut state = super::CandidateRequestState {
+        start_time: SystemTime::now(),
+        retry_count: 0,
+        current_timeout: Duration::from_millis(500),
+        attempt_id: 0,
+        in_flight: false,
+        in_flight_want_candidate: false,
+        in_flight_want_notar: false,
+        source_idx: ValidatorIndex::new(1),
+        cached_notar: None,
+        cached_candidate: None,
+        giveup_reports: 0,
+        peer_retry_not_before: HashMap::new(),
+    };
+
+    // No candidate in this response, but resolver cache already has one.
+    let (merged_candidate, merged_notar) = super::ReceiverImpl::merge_candidate_response_parts(
+        &mut cache,
+        Some(&mut state),
+        slot,
+        &block_hash,
+        &[],
+        &notar_bytes,
+    );
+    assert_eq!(
+        merged_candidate, cached_candidate,
+        "notar-only response should complete when candidate already exists in local cache"
+    );
+    assert_eq!(merged_notar, notar_bytes);
+}
+
+#[test]
 fn test_merge_candidate_response_parts_notar_then_body_completes_merge() {
     let slot = SlotIndex::new(99);
     let block_hash = UInt256::rand();
@@ -374,6 +429,52 @@ fn test_merge_candidate_response_parts_notar_then_body_completes_merge() {
     );
     assert_eq!(merged_candidate_2, candidate_bytes);
     assert_eq!(merged_notar_2, notar_bytes);
+}
+
+#[test]
+fn test_merge_candidate_response_parts_preserves_existing_parts() {
+    let slot = SlotIndex::new(100);
+    let block_hash = UInt256::rand();
+    let existing_candidate = vec![1, 1, 1];
+    let existing_notar = vec![2, 2, 2];
+    let later_candidate = vec![3, 3, 3];
+    let later_notar = vec![4, 4, 4];
+
+    let mut cache = super::CandidateResolverCache::new();
+    let mut state = super::CandidateRequestState {
+        start_time: SystemTime::now(),
+        retry_count: 0,
+        current_timeout: Duration::from_millis(500),
+        attempt_id: 0,
+        in_flight: false,
+        in_flight_want_candidate: false,
+        in_flight_want_notar: false,
+        source_idx: ValidatorIndex::new(1),
+        cached_notar: Some(existing_notar.clone()),
+        cached_candidate: Some(existing_candidate.clone()),
+        giveup_reports: 0,
+        peer_retry_not_before: HashMap::new(),
+    };
+
+    let (merged_candidate, merged_notar) = super::ReceiverImpl::merge_candidate_response_parts(
+        &mut cache,
+        Some(&mut state),
+        slot,
+        &block_hash,
+        &later_candidate,
+        &later_notar,
+    );
+
+    assert_eq!(
+        merged_candidate, existing_candidate,
+        "C++ CandidateAndCert::merge fills missing body only; it must not replace known body"
+    );
+    assert_eq!(
+        merged_notar, existing_notar,
+        "C++ CandidateAndCert::merge fills missing notar only; it must not replace known notar"
+    );
+    assert_eq!(state.cached_candidate.as_ref(), Some(&existing_candidate));
+    assert_eq!(state.cached_notar.as_ref(), Some(&existing_notar));
 }
 
 #[test]
@@ -462,4 +563,594 @@ fn test_bad_signature_ban_state_is_per_source() {
     assert!(state.is_banned(4, now));
     assert!(!state.is_banned(5, now));
     assert!(!state.is_banned(0, now));
+}
+
+// ============================================================================
+// requestCandidate response validation regression tests
+// ============================================================================
+//
+// These tests lock in three properties of the repair channel:
+//
+//   1. `merge_candidate_response_parts` never persists unverified response
+//      bytes into the shared `resolver_cache`; the cache is only ever read
+//      to fall back to previously trusted candidate/notar parts.
+//   2. `validate_repair_candidate_identity` recomputes `(slot, candidate_hash)`
+//      from the response body and rejects any payload whose identity does not
+//      match the requested `(slot, block_hash)` (wrong-hash, wrong-slot, or
+//      malformed bytes).
+//   3. `validate_repair_notar_signature_set` mirrors the strict policy of
+//      `Certificate::from_tl_signatures` (the FSM-side acceptance gate in
+//      `SessionProcessor::process_received_notar_cert`): invalid validator
+//      indices, duplicate indices, signature failures, and aggregate weight
+//      below the 2/3 threshold are all rejected.
+
+/// Builder for a minimal repair-channel fixture (validator set + session id +
+/// keys) shared by the notar-cert regression tests.
+fn build_repair_validator_set(
+    num_validators: usize,
+    weight: crate::ValidatorWeight,
+) -> (SessionId, Vec<super::SourceStats>, Vec<crate::PrivateKey>) {
+    let session_id: SessionId = UInt256::from_slice(&[0x37; 32]);
+    let mut sources = Vec::with_capacity(num_validators);
+    let mut keys = Vec::with_capacity(num_validators);
+    for idx in 0..num_validators {
+        let key: crate::PrivateKey = Ed25519KeyOption::<ZeroizingBytes>::generate()
+            .expect("failed to generate validator key");
+        let public_key: PublicKey = key.clone();
+        let adnl_id = key.id().clone();
+        sources.push(super::SourceStats::new(idx as u32, adnl_id, public_key, weight));
+        keys.push(key);
+    }
+    (session_id, sources, keys)
+}
+
+fn build_notar_signature_set_bytes(
+    session_id: &SessionId,
+    vote: &NotarizeVote,
+    signing_keys: &[(u32, &crate::PrivateKey)],
+) -> Vec<u8> {
+    let mut signatures = Vec::with_capacity(signing_keys.len());
+    let fsm_vote = Vote::Notarize(vote.clone());
+    for (idx, key) in signing_keys {
+        let signed = sign_vote(&fsm_vote, session_id, key).expect("sign_vote failed");
+        signatures.push(VoteSignature::new(ValidatorIndex::new(*idx), signed.signature().to_vec()));
+    }
+    let cert: NotarCert = Certificate::new(vote.clone(), signatures);
+    let tl_set = cert.to_tl_vote_signature_set();
+    serialize_boxed(&tl_set).expect("serialize VoteSignatureSet")
+}
+
+fn build_empty_candidate_for_repair(
+    slot: u32,
+    parent_slot: u32,
+    parent_hash: UInt256,
+    session_id: &SessionId,
+    leader_key: &crate::PrivateKey,
+) -> (CandidateData, UInt256, Vec<u8>) {
+    let block_id = BlockIdExt::default();
+    let parent_tl = TlCandidateId { slot: parent_slot as i32, hash: parent_hash.clone() };
+    let candidate_hash =
+        compute_candidate_id_hash_empty(&block_id, (SlotIndex::new(parent_slot), &parent_hash));
+    let signature = sign_candidate_u32(session_id, slot, &candidate_hash, leader_key)
+        .expect("sign empty candidate");
+    let empty = CandidateDataEmpty {
+        slot: slot as i32,
+        parent: parent_tl.into_boxed(),
+        block: block_id.clone(),
+        signature,
+    };
+    let candidate = CandidateData::Consensus_Empty(empty);
+    let bytes = serialize_boxed(&candidate).expect("serialize CandidateData::Empty");
+    (candidate, candidate_hash, bytes)
+}
+
+/// A `merge_candidate_response_parts` call with non-empty body/notar bytes
+/// must NOT write into the shared resolver cache. Only the per-request pending
+/// state may be updated. Unverified peer responses must never populate the
+/// cache under the requested `(slot, hash)` and permanently suppress future
+/// repairs.
+#[test]
+fn test_merge_candidate_response_parts_does_not_write_resolver_cache() {
+    let slot = SlotIndex::new(1234);
+    let block_hash = UInt256::rand();
+    let candidate_bytes = vec![0xAA; 64];
+    let notar_bytes = vec![0xBB; 64];
+
+    let mut cache = super::CandidateResolverCache::new();
+    let mut state = super::CandidateRequestState {
+        start_time: SystemTime::now(),
+        retry_count: 0,
+        current_timeout: Duration::from_millis(500),
+        attempt_id: 0,
+        in_flight: false,
+        in_flight_want_candidate: false,
+        in_flight_want_notar: false,
+        source_idx: ValidatorIndex::new(2),
+        cached_notar: None,
+        cached_candidate: None,
+        giveup_reports: 0,
+        peer_retry_not_before: HashMap::new(),
+    };
+
+    let (merged_candidate, merged_notar) = super::ReceiverImpl::merge_candidate_response_parts(
+        &mut cache,
+        Some(&mut state),
+        slot,
+        &block_hash,
+        &candidate_bytes,
+        &notar_bytes,
+    );
+
+    // Merge surfaces the pieces back to the caller and to the pending state.
+    assert_eq!(merged_candidate, candidate_bytes);
+    assert_eq!(merged_notar, notar_bytes);
+    assert_eq!(state.cached_candidate.as_ref(), Some(&candidate_bytes));
+    assert_eq!(state.cached_notar.as_ref(), Some(&notar_bytes));
+
+    // But the resolver cache (which is shared and served back to peers) must
+    // remain untouched until a trusted path (broadcast verification, startup
+    // recovery, or `SessionProcessor::cache_notarization_cert`) writes to it.
+    assert!(
+        cache.get_candidate(slot, &block_hash).is_none(),
+        "unverified response candidate bytes must not be cached"
+    );
+    assert!(
+        cache.get_notar_cert(slot, &block_hash).is_none(),
+        "unverified response notar bytes must not be cached"
+    );
+}
+
+/// A well-formed `Consensus_Empty` response with the expected `(slot, hash)`
+/// is accepted and its parsed `CandidateData` is returned for reuse by the
+/// listener forwarding path.
+#[test]
+fn test_validate_repair_candidate_identity_accepts_matching_empty_block() {
+    let (session_id, sources, keys) =
+        build_repair_validator_set(/* nodes */ 1, /* weight */ 100);
+    let parent_hash = UInt256::from_slice(&[0x11; 32]);
+    let (_candidate, candidate_hash, bytes) = build_empty_candidate_for_repair(
+        /* slot */ 42,
+        /* parent_slot */ 41,
+        parent_hash,
+        &session_id,
+        &keys[0],
+    );
+
+    let shard = ShardIdent::masterchain();
+    let parsed = super::ReceiverImpl::validate_repair_candidate_identity(
+        &session_id,
+        &sources,
+        1,
+        &shard,
+        /* max_candidate_size */ 1 << 20,
+        /* max_candidate_query_answer_size */ 1 << 24,
+        /* proto_version */ 5,
+        SlotIndex::new(42),
+        &candidate_hash,
+        &bytes,
+    )
+    .expect("matching identity must be accepted");
+
+    match parsed {
+        CandidateData::Consensus_Empty(empty) => {
+            assert_eq!(empty.slot, 42);
+        }
+        _ => panic!("expected Consensus_Empty"),
+    }
+}
+
+/// A response whose recomputed candidate hash differs from the requested
+/// `block_hash` is rejected.
+#[test]
+fn test_validate_repair_candidate_identity_rejects_wrong_hash() {
+    let (session_id, sources, keys) = build_repair_validator_set(1, 100);
+    let parent_hash = UInt256::from_slice(&[0x22; 32]);
+    let (_candidate, _candidate_hash, bytes) =
+        build_empty_candidate_for_repair(7, 6, parent_hash, &session_id, &keys[0]);
+
+    let shard = ShardIdent::masterchain();
+    let wrong_hash = UInt256::from_slice(&[0xEE; 32]);
+    let err = super::ReceiverImpl::validate_repair_candidate_identity(
+        &session_id,
+        &sources,
+        1,
+        &shard,
+        1 << 20,
+        1 << 24,
+        5,
+        SlotIndex::new(7),
+        &wrong_hash,
+        &bytes,
+    )
+    .expect_err("wrong-hash response must be rejected");
+    assert!(err.contains("hash mismatch"), "unexpected error: {err}");
+}
+
+/// A response whose body claims a different slot than the requested one is
+/// rejected even before the hash check.
+#[test]
+fn test_validate_repair_candidate_identity_rejects_wrong_slot() {
+    let (session_id, sources, keys) = build_repair_validator_set(1, 100);
+    let parent_hash = UInt256::from_slice(&[0x33; 32]);
+    let (_candidate, candidate_hash, bytes) =
+        build_empty_candidate_for_repair(9, 8, parent_hash, &session_id, &keys[0]);
+
+    let shard = ShardIdent::masterchain();
+    let err = super::ReceiverImpl::validate_repair_candidate_identity(
+        &session_id,
+        &sources,
+        1,
+        &shard,
+        1 << 20,
+        1 << 24,
+        5,
+        SlotIndex::new(10),
+        &candidate_hash,
+        &bytes,
+    )
+    .expect_err("slot-mismatch response must be rejected");
+    assert!(err.contains("slot mismatch"), "unexpected error: {err}");
+}
+
+/// Bytes exceeding the receiver's per-query answer budget are rejected without
+/// invoking the heavier TL/hash recomputation path.
+#[test]
+fn test_validate_repair_candidate_identity_rejects_oversize() {
+    let (session_id, sources, _keys) = build_repair_validator_set(1, 100);
+    let shard = ShardIdent::masterchain();
+    let bytes = vec![0u8; 64];
+    let err = super::ReceiverImpl::validate_repair_candidate_identity(
+        &session_id,
+        &sources,
+        1,
+        &shard,
+        /* max_candidate_size */ 1 << 20,
+        /* max_candidate_query_answer_size */ 32,
+        5,
+        SlotIndex::new(1),
+        &UInt256::default(),
+        &bytes,
+    )
+    .expect_err("oversize response must be rejected");
+    assert!(err.contains("exceeds answer budget"), "unexpected error: {err}");
+}
+
+/// Candidate bytes with a valid `(slot, hash)` identity but signed by a
+/// non-leader key must be rejected at receiver validation time.
+#[test]
+fn test_validate_repair_candidate_identity_rejects_invalid_leader_signature() {
+    let (session_id, sources, keys) =
+        build_repair_validator_set(/* nodes */ 2, /* weight */ 100);
+    let parent_hash = UInt256::from_slice(&[0x44; 32]);
+    // slot=0 with slots_per_window=1 => leader is validator 0. Sign with validator 1 instead.
+    let (_candidate, candidate_hash, bytes) =
+        build_empty_candidate_for_repair(0, 0, parent_hash, &session_id, &keys[1]);
+
+    let shard = ShardIdent::masterchain();
+    let err = super::ReceiverImpl::validate_repair_candidate_identity(
+        &session_id,
+        &sources,
+        1,
+        &shard,
+        1 << 20,
+        1 << 24,
+        5,
+        SlotIndex::new(0),
+        &candidate_hash,
+        &bytes,
+    )
+    .expect_err("non-leader signature must be rejected");
+    assert!(err.contains("invalid candidate leader signature"), "unexpected error: {err}");
+}
+
+/// `Consensus_Block` with empty inner candidate bytes is malformed; only
+/// `Consensus_Empty` may represent an empty block over the repair channel.
+#[test]
+fn test_validate_repair_candidate_identity_rejects_empty_block_candidate_bytes() {
+    let (session_id, sources, keys) = build_repair_validator_set(1, 100);
+    let slot = 17u32;
+    let candidate_hash = compute_candidate_id_hash(SlotIndex::new(slot), None, None, None);
+    let signature =
+        sign_candidate_u32(&session_id, slot, &candidate_hash, &keys[0]).expect("sign candidate");
+    let candidate = CandidateData::Consensus_Block(CandidateDataBlock {
+        slot: slot as i32,
+        candidate: Vec::new(),
+        parent: CandidateParent::Consensus_CandidateWithoutParents,
+        signature,
+    });
+    let bytes = serialize_boxed(&candidate).expect("serialize CandidateData::Block");
+
+    let shard = ShardIdent::masterchain();
+    let err = super::ReceiverImpl::validate_repair_candidate_identity(
+        &session_id,
+        &sources,
+        1,
+        &shard,
+        1 << 20,
+        1 << 24,
+        5,
+        SlotIndex::new(slot),
+        &candidate_hash,
+        &bytes,
+    )
+    .expect_err("empty consensus.block candidate bytes must be rejected");
+    assert!(err.contains("empty candidate bytes"), "unexpected error: {err}");
+}
+
+/// A VoteSignatureSet covering 2/3 of the validator weight for the requested
+/// `NotarizeVote{slot, block_hash}` must be accepted.
+#[test]
+fn test_validate_repair_notar_signature_set_accepts_quorum() {
+    let (session_id, sources, keys) =
+        build_repair_validator_set(/* nodes */ 4, /* weight */ 100);
+    let slot = SlotIndex::new(11);
+    let block_hash = UInt256::from_slice(&[0x42; 32]);
+    let vote = NotarizeVote { slot, block_hash: block_hash.clone() };
+
+    // 3 of 4 validators = 75% weight, above the 66% threshold.
+    let signing: Vec<(u32, &crate::PrivateKey)> =
+        (0..3u32).map(|i| (i, &keys[i as usize])).collect();
+    let notar_bytes = build_notar_signature_set_bytes(&session_id, &vote, &signing);
+
+    super::ReceiverImpl::validate_repair_notar_signature_set(
+        &session_id,
+        &sources,
+        /* max_candidate_query_answer_size */ 1 << 24,
+        slot,
+        &block_hash,
+        &notar_bytes,
+    )
+    .expect("valid quorum must be accepted");
+}
+
+/// A notar set that names an out-of-range validator index is rejected (matches
+/// `Certificate::from_tl_signatures` strict policy).
+#[test]
+fn test_validate_repair_notar_signature_set_rejects_invalid_validator_index() {
+    let (session_id, sources, keys) = build_repair_validator_set(4, 100);
+    let slot = SlotIndex::new(12);
+    let block_hash = UInt256::from_slice(&[0x55; 32]);
+    let vote = NotarizeVote { slot, block_hash: block_hash.clone() };
+
+    // 3 valid signatures + 1 forged entry pointing at validator index 100.
+    let fsm_vote = Vote::Notarize(vote.clone());
+    let mut signatures = Vec::new();
+    for i in 0..3u32 {
+        let signed = sign_vote(&fsm_vote, &session_id, &keys[i as usize]).expect("sign_vote");
+        signatures.push(VoteSignature::new(ValidatorIndex::new(i), signed.signature().to_vec()));
+    }
+    signatures.push(VoteSignature::new(ValidatorIndex::new(100), vec![0xAA; 64]));
+    let cert: NotarCert = Certificate::new(vote.clone(), signatures);
+    let tl_set = cert.to_tl_vote_signature_set();
+    let notar_bytes = serialize_boxed(&tl_set).expect("serialize VoteSignatureSet");
+
+    let err = super::ReceiverImpl::validate_repair_notar_signature_set(
+        &session_id,
+        &sources,
+        1 << 24,
+        slot,
+        &block_hash,
+        &notar_bytes,
+    )
+    .expect_err("invalid validator index must be rejected");
+    assert!(err.contains("invalid validator index"), "unexpected error: {err}");
+}
+
+/// Duplicate validator indices in the notar set are rejected.
+#[test]
+fn test_validate_repair_notar_signature_set_rejects_duplicate_validator() {
+    let (session_id, sources, keys) = build_repair_validator_set(4, 100);
+    let slot = SlotIndex::new(13);
+    let block_hash = UInt256::from_slice(&[0x66; 32]);
+    let vote = NotarizeVote { slot, block_hash: block_hash.clone() };
+
+    let signing: Vec<(u32, &crate::PrivateKey)> =
+        vec![(0, &keys[0]), (1, &keys[1]), (2, &keys[2]), (0, &keys[0])];
+    let notar_bytes = build_notar_signature_set_bytes(&session_id, &vote, &signing);
+
+    let err = super::ReceiverImpl::validate_repair_notar_signature_set(
+        &session_id,
+        &sources,
+        1 << 24,
+        slot,
+        &block_hash,
+        &notar_bytes,
+    )
+    .expect_err("duplicate validator index must be rejected");
+    assert!(err.contains("duplicate validator index"), "unexpected error: {err}");
+}
+
+/// A notar set with an invalid signature (validator claims to have signed but
+/// the bytes don't verify against its key) is rejected.
+#[test]
+fn test_validate_repair_notar_signature_set_rejects_invalid_signature() {
+    let (session_id, sources, keys) = build_repair_validator_set(4, 100);
+    let slot = SlotIndex::new(14);
+    let block_hash = UInt256::from_slice(&[0x77; 32]);
+    let vote = NotarizeVote { slot, block_hash: block_hash.clone() };
+
+    // 3 valid sigs from validators 0,1,2 + one fake sig where validator 3 is
+    // attributed but the signature bytes come from validator 0 (so verification
+    // against validator 3's public key fails).
+    let fsm_vote = Vote::Notarize(vote.clone());
+    let mut signatures = Vec::new();
+    for i in 0..3u32 {
+        let signed = sign_vote(&fsm_vote, &session_id, &keys[i as usize]).expect("sign_vote");
+        signatures.push(VoteSignature::new(ValidatorIndex::new(i), signed.signature().to_vec()));
+    }
+    let imposter_signed = sign_vote(&fsm_vote, &session_id, &keys[0]).expect("sign_vote");
+    signatures
+        .push(VoteSignature::new(ValidatorIndex::new(3), imposter_signed.signature().to_vec()));
+    let cert: NotarCert = Certificate::new(vote.clone(), signatures);
+    let tl_set = cert.to_tl_vote_signature_set();
+    let notar_bytes = serialize_boxed(&tl_set).expect("serialize VoteSignatureSet");
+
+    let err = super::ReceiverImpl::validate_repair_notar_signature_set(
+        &session_id,
+        &sources,
+        1 << 24,
+        slot,
+        &block_hash,
+        &notar_bytes,
+    )
+    .expect_err("invalid signature must be rejected");
+    assert!(err.contains("invalid signature"), "unexpected error: {err}");
+}
+
+/// Aggregate signature weight below 2/3 of the validator set is rejected,
+/// even when individual signatures are otherwise well-formed.
+#[test]
+fn test_validate_repair_notar_signature_set_rejects_insufficient_weight() {
+    let (session_id, sources, keys) = build_repair_validator_set(4, 100);
+    let slot = SlotIndex::new(15);
+    let block_hash = UInt256::from_slice(&[0x88; 32]);
+    let vote = NotarizeVote { slot, block_hash: block_hash.clone() };
+
+    // Only 2 of 4 sign: total 200 / 400 = 50% < 66%.
+    let signing: Vec<(u32, &crate::PrivateKey)> = vec![(0, &keys[0]), (1, &keys[1])];
+    let notar_bytes = build_notar_signature_set_bytes(&session_id, &vote, &signing);
+
+    let err = super::ReceiverImpl::validate_repair_notar_signature_set(
+        &session_id,
+        &sources,
+        1 << 24,
+        slot,
+        &block_hash,
+        &notar_bytes,
+    )
+    .expect_err("insufficient weight must be rejected");
+    assert!(err.contains("insufficient weight"), "unexpected error: {err}");
+}
+
+/// An empty validator set must be rejected before the quorum check. Without
+/// this guard `threshold_66(0) == 0` would make the `voted_weight < threshold`
+/// test evaluate `0 < 0 == false`, wrongly accepting a signature-less response.
+#[test]
+fn test_validate_repair_notar_signature_set_rejects_empty_validator_set() {
+    let (session_id, sources, _keys) = build_repair_validator_set(0, 100);
+    assert!(sources.is_empty());
+    let slot = SlotIndex::new(19);
+    let block_hash = UInt256::from_slice(&[0xDD; 32]);
+    let vote = NotarizeVote { slot, block_hash: block_hash.clone() };
+    let notar_bytes = build_notar_signature_set_bytes(&session_id, &vote, &[]);
+
+    let err = super::ReceiverImpl::validate_repair_notar_signature_set(
+        &session_id,
+        &sources,
+        1 << 24,
+        slot,
+        &block_hash,
+        &notar_bytes,
+    )
+    .expect_err("empty validator set must be rejected");
+    assert!(err.contains("empty validator set"), "unexpected error: {err}");
+}
+
+/// A validator set whose total weight is zero must be rejected before the
+/// quorum check for the same `threshold_66(0) == 0` reason, even when the
+/// response carries otherwise well-formed signatures.
+#[test]
+fn test_validate_repair_notar_signature_set_rejects_zero_total_weight() {
+    let (session_id, sources, keys) = build_repair_validator_set(4, 0);
+    let slot = SlotIndex::new(20);
+    let block_hash = UInt256::from_slice(&[0xEE; 32]);
+    let vote = NotarizeVote { slot, block_hash: block_hash.clone() };
+
+    // Real signatures from 3 of 4 validators: only the zero total weight makes
+    // this degenerate, proving the guard (not a signature failure) rejects it.
+    let signing: Vec<(u32, &crate::PrivateKey)> =
+        (0..3u32).map(|i| (i, &keys[i as usize])).collect();
+    let notar_bytes = build_notar_signature_set_bytes(&session_id, &vote, &signing);
+
+    let err = super::ReceiverImpl::validate_repair_notar_signature_set(
+        &session_id,
+        &sources,
+        1 << 24,
+        slot,
+        &block_hash,
+        &notar_bytes,
+    )
+    .expect_err("zero total validator weight must be rejected");
+    assert!(err.contains("zero total validator weight"), "unexpected error: {err}");
+}
+
+/// When the notar set is signed for a different `(slot, block_hash)` than the
+/// receiver requested, signature verification cryptographically rejects it
+/// because the `dataToSign` payload binds the session id and the unsigned
+/// vote. This blocks replay of an unrelated cert against the requested key.
+#[test]
+fn test_validate_repair_notar_signature_set_rejects_mismatched_vote() {
+    let (session_id, sources, keys) = build_repair_validator_set(4, 100);
+    let slot = SlotIndex::new(16);
+    let block_hash_signed = UInt256::from_slice(&[0x99; 32]);
+    let block_hash_requested = UInt256::from_slice(&[0xAA; 32]);
+    let signed_vote = NotarizeVote { slot, block_hash: block_hash_signed.clone() };
+
+    // Validators correctly sign for the wrong vote.
+    let signing: Vec<(u32, &crate::PrivateKey)> =
+        (0..3u32).map(|i| (i, &keys[i as usize])).collect();
+    let notar_bytes = build_notar_signature_set_bytes(&session_id, &signed_vote, &signing);
+
+    // Receiver requested a different block_hash; verification must fail because
+    // the dataToSign payload is bound to the requested NotarizeVote.
+    let err = super::ReceiverImpl::validate_repair_notar_signature_set(
+        &session_id,
+        &sources,
+        1 << 24,
+        slot,
+        &block_hash_requested,
+        &notar_bytes,
+    )
+    .expect_err("notar bound to a different vote must be rejected");
+    assert!(err.contains("invalid signature"), "unexpected error: {err}");
+}
+
+/// Notar bytes exceeding the receiver's per-query answer budget are rejected
+/// without invoking signature verification.
+#[test]
+fn test_validate_repair_notar_signature_set_rejects_oversize() {
+    let (session_id, sources, _keys) = build_repair_validator_set(4, 100);
+    let slot = SlotIndex::new(17);
+    let block_hash = UInt256::from_slice(&[0xBB; 32]);
+    let bytes = vec![0u8; 128];
+    let err = super::ReceiverImpl::validate_repair_notar_signature_set(
+        &session_id,
+        &sources,
+        /* max_candidate_query_answer_size */ 64,
+        slot,
+        &block_hash,
+        &bytes,
+    )
+    .expect_err("oversize notar response must be rejected");
+    assert!(err.contains("exceeds answer budget"), "unexpected error: {err}");
+}
+
+/// Bytes that decode as a different TL type must be rejected with the
+/// dedicated "unexpected TL type" path; signature verification must not run
+/// on them. Uses the lower-cost path of submitting an `OverlayId` (a TL type
+/// readily available in this test module).
+#[test]
+fn test_validate_repair_notar_signature_set_rejects_wrong_tl_type() {
+    let (session_id, sources, _keys) = build_repair_validator_set(4, 100);
+    let slot = SlotIndex::new(18);
+    let block_hash = UInt256::from_slice(&[0xCC; 32]);
+
+    // Serialize an unrelated TL boxed object (OverlayId) and try to feed it as
+    // notar bytes.
+    let bogus = OverlayId { session_id: UInt256::default(), nodes: Vec::new().into() };
+    let bytes = serialize_boxed(&bogus.into_boxed()).expect("serialize OverlayId");
+
+    let err = super::ReceiverImpl::validate_repair_notar_signature_set(
+        &session_id,
+        &sources,
+        1 << 24,
+        slot,
+        &block_hash,
+        &bytes,
+    )
+    .expect_err("wrong TL type must be rejected");
+    assert!(
+        err.contains("unexpected TL type") || err.contains("deserialize VoteSignatureSet"),
+        "unexpected error: {err}",
+    );
 }
