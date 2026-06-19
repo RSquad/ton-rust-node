@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-06-19
+
+### Added
+
+- **Audit log** — a structured, append-only JSONL log of domain events (elections, REST config mutations, authentication, service lifecycle), written to `./logs/audit.jsonl` separately from the tracing service log. Each event carries a UUID v7 id, RFC3339 timestamp, outcome, dotted `event_type`, and `actor`/`target`. Includes size-based rotation (default 100 MiB × 10 files), batched writes with optional `fsync`, an in-memory ring buffer feeding the REST read path, and client-IP PII controls. Configured under a new `audit_log` section (read at startup); `0600` file mode on Unix. Recent elections events are surfaced in `GET /v1/elections` as `recent_events`. See `docs/audit-log.md`.
+
+### Fixed
+
+- **Nominator Pool: out-of-gas when processing withdraw requests** — fixed gas calculation so the process-withdraw-requests (op 2) message covers large withdraw-stake-request batches.
+
 ## [0.5.1] - 2026-05-25
 
 ### Added
