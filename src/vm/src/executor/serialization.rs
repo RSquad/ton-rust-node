@@ -748,12 +748,9 @@ pub fn execute_cdepth(engine: &mut Engine) -> Status {
     let depth = if engine.cmd.var(0).is_null() {
         0
     } else {
-        let c = engine.cmd.var(0).as_cell()?;
-        if c.references_count() == 0 {
-            0
-        } else {
-            c.depth(MAX_LEVEL)
-        }
+        // Must use the cell's stored depth: a pruned-branch
+        // cell from a Merkle proof has no references but a non-zero represented depth.
+        engine.cmd.var(0).as_cell()?.depth(MAX_LEVEL)
     };
     engine.cc.stack.push_int(depth);
     Ok(())

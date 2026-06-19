@@ -311,10 +311,9 @@ impl RecvTransfer {
             total_size
         } else {
             let total_size = chunk.total_size as usize;
-            let cap = self
-                .expected_total_size
-                .map(|s| s.min(Constraints::MAX_TOTAL_TRANSFER_SIZE))
-                .unwrap_or(Constraints::MAX_TOTAL_TRANSFER_SIZE);
+            let max_wire =
+                Constraints::MAX_TOTAL_TRANSFER_SIZE + Constraints::RLDP_ANSWER_TL_OVERHEAD;
+            let cap = self.expected_total_size.map(|s| s.min(max_wire)).unwrap_or(max_wire);
             if total_size > cap {
                 fail!("RLDP total size {total_size} exceeds cap {cap}");
             }

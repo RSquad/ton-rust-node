@@ -12,8 +12,11 @@ use core::ops::Range;
 use rand::Rng;
 #[cfg(any(feature = "client", feature = "node", feature = "server"))]
 use std::convert::TryInto;
+#[cfg(feature = "tokio-monitor")]
+use std::task::{Context, Poll};
 use std::{
     fmt::Debug,
+    future::Future,
     hash::Hash,
     pin::Pin,
     sync::{
@@ -1297,4 +1300,224 @@ where
             _ = cancellation_token.cancelled() => {}
         }
     })
+}
+
+// Tokio task poll-time monitoring
+
+pub const TOKIO_MONITOR_TARGET: &str = "tokio-monitor";
+
+/// Returns the CPU time consumed by the current thread in microseconds.
+/// Used to distinguish real slow polls from OS preemption in wall-clock measurements.
+#[cfg(all(feature = "tokio-monitor", target_os = "linux"))]
+fn thread_cpu_micros() -> u128 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: valid pointer to a local timespec, CLOCK_THREAD_CPUTIME_ID is always available.
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts);
+    }
+    (ts.tv_sec as u128) * 1_000_000 + (ts.tv_nsec as u128) / 1_000
+}
+
+#[cfg(feature = "tokio-monitor")]
+const POLL_THRESHOLD_ERROR_US: u128 = 100_000;
+#[cfg(feature = "tokio-monitor")]
+const POLL_THRESHOLD_WARN_US: u128 = 10_000;
+#[cfg(feature = "tokio-monitor")]
+const POLL_THRESHOLD_INFO_US: u128 = 3_000;
+#[cfg(feature = "tokio-monitor")]
+const POLL_THRESHOLD_DEBUG_US: u128 = 1_000;
+#[cfg(feature = "tokio-monitor")]
+const POLL_THRESHOLD_TRACE_US: u128 = 300;
+
+/// Wraps a future and logs each `.poll()` call that exceeds a time threshold.
+///
+/// All messages are emitted to the `"tokio-monitor"` log target.
+/// Use [`spawn_monitored`] to spawn a named monitored task.
+///
+/// Only available with the `tokio-monitor` feature.
+#[cfg(feature = "tokio-monitor")]
+pub struct MonitoredFuture<F> {
+    inner: F,
+    name: String,
+}
+
+#[cfg(feature = "tokio-monitor")]
+impl<F> MonitoredFuture<F> {
+    pub fn new(name: impl Into<String>, fut: F) -> Self {
+        Self { inner: fut, name: name.into() }
+    }
+}
+
+#[cfg(feature = "tokio-monitor")]
+impl<F: Future> Future for MonitoredFuture<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: `inner` is structurally pinned and never moved out of `self`.
+        let (inner, name) = unsafe {
+            let this = self.get_unchecked_mut();
+            (Pin::new_unchecked(&mut this.inner), &this.name)
+        };
+
+        let start = Instant::now();
+        #[cfg(target_os = "linux")]
+        let cpu_start_us = thread_cpu_micros();
+
+        let result = inner.poll(cx);
+        let elapsed_us = start.elapsed().as_micros();
+
+        // On Linux, if wall-clock time exceeds a threshold but CPU time does not,
+        // the thread was preempted by the OS - log separately to avoid false positives.
+        #[cfg(target_os = "linux")]
+        if elapsed_us > POLL_THRESHOLD_TRACE_US {
+            let cpu_us = thread_cpu_micros().saturating_sub(cpu_start_us);
+            if cpu_us * 10 < elapsed_us {
+                log::trace!(
+                    target: TOKIO_MONITOR_TARGET,
+                    "preempted: task='{}' wall={}µs cpu={}µs",
+                    name, elapsed_us, cpu_us
+                );
+                return result;
+            }
+        }
+
+        if elapsed_us > POLL_THRESHOLD_ERROR_US {
+            log::error!(
+                target: TOKIO_MONITOR_TARGET,
+                "slow poll: task='{name}' duration={elapsed_us}µs"
+            );
+        } else if elapsed_us > POLL_THRESHOLD_WARN_US {
+            log::warn!(
+                target: TOKIO_MONITOR_TARGET,
+                "slow poll: task='{name}' duration={elapsed_us}µs"
+            );
+        } else if elapsed_us > POLL_THRESHOLD_INFO_US {
+            log::info!(
+                target: TOKIO_MONITOR_TARGET,
+                "slow poll: task='{name}' duration={elapsed_us}µs"
+            );
+        } else if elapsed_us > POLL_THRESHOLD_DEBUG_US {
+            log::debug!(
+                target: TOKIO_MONITOR_TARGET,
+                "slow poll: task='{name}' duration={elapsed_us}µs"
+            );
+        } else if elapsed_us > POLL_THRESHOLD_TRACE_US {
+            log::trace!(
+                target: TOKIO_MONITOR_TARGET,
+                "slow poll: task='{name}' duration={elapsed_us}µs"
+            );
+        }
+        result
+    }
+}
+
+/// Spawns a Tokio task.
+///
+/// With the `tokio-monitor` feature the future is wrapped in [`MonitoredFuture`]
+/// which logs each `.poll()` call exceeding the configured thresholds.
+/// Without the feature equivalent to [`tokio::spawn`].
+pub fn spawn_monitored<F>(name: impl Into<String>, fut: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    #[cfg(feature = "tokio-monitor")]
+    return tokio::spawn(MonitoredFuture::new(name, fut));
+    #[cfg(not(feature = "tokio-monitor"))]
+    {
+        let _ = name;
+        tokio::spawn(fut)
+    }
+}
+
+/// Spawns a Tokio task cancelable by token.
+///
+/// With the `tokio-monitor` feature the future is wrapped in [`MonitoredFuture`]
+/// which logs each `.poll()` call exceeding the configured thresholds.
+/// Without the feature equivalent to [`spawn_cancelable`].
+pub fn spawn_monitored_cancelable<F>(
+    name: impl Into<String>,
+    cancellation_token: tokio_util::sync::CancellationToken,
+    task: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    #[cfg(feature = "tokio-monitor")]
+    {
+        let task = MonitoredFuture::new(name, task);
+        return tokio::spawn(async move {
+            tokio::select! {
+                _ = task => {},
+                _ = cancellation_token.cancelled() => {}
+            }
+        });
+    }
+    #[cfg(not(feature = "tokio-monitor"))]
+    {
+        let _ = name;
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = task => {},
+                _ = cancellation_token.cancelled() => {}
+            }
+        })
+    }
+}
+
+/// Spawns a Tokio task on the given runtime handle.
+///
+/// With the `tokio-monitor` feature the future is wrapped in [`MonitoredFuture`].
+/// Without the feature equivalent to [`tokio::runtime::Handle::spawn`].
+pub fn spawn_monitored_on<F>(
+    handle: &tokio::runtime::Handle,
+    name: impl Into<String>,
+    fut: F,
+) -> tokio::task::JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    #[cfg(feature = "tokio-monitor")]
+    return handle.spawn(MonitoredFuture::new(name, fut));
+    #[cfg(not(feature = "tokio-monitor"))]
+    {
+        let _ = name;
+        handle.spawn(fut)
+    }
+}
+
+/// Spawns a Tokio task on the given runtime handle, cancelable by token.
+///
+/// With the `tokio-monitor` feature the future is wrapped in [`MonitoredFuture`].
+/// Without the feature equivalent to [`spawn_cancelable`] on the handle.
+pub fn spawn_monitored_cancelable_on<F>(
+    handle: &tokio::runtime::Handle,
+    name: impl Into<String>,
+    cancellation_token: tokio_util::sync::CancellationToken,
+    task: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    #[cfg(feature = "tokio-monitor")]
+    {
+        let task = MonitoredFuture::new(name, task);
+        return handle.spawn(async move {
+            tokio::select! {
+                _ = task => {},
+                _ = cancellation_token.cancelled() => {}
+            }
+        });
+    }
+    #[cfg(not(feature = "tokio-monitor"))]
+    {
+        let _ = name;
+        handle.spawn(async move {
+            tokio::select! {
+                _ = task => {},
+                _ = cancellation_token.cancelled() => {}
+            }
+        })
+    }
 }

@@ -6,7 +6,7 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use clap::{Arg, Command};
+use clap::{Arg, ArgAction, Command};
 use node::{
     block::BlockStuff,
     block_proof::BlockProofStuff,
@@ -18,7 +18,7 @@ use node::{
     shard_state::ShardStateStuff,
     types::top_block_descr::TopBlockDescrStuff,
     validator::{
-        collator::{CollateResult, Collator},
+        collator::{CollateResult, Collator, HardforkData},
         state_resolver_cache::StateResolverCache,
         validator_utils::{calc_subset_for_masterchain, PrevBlockHistory},
         CollatorSettings,
@@ -33,14 +33,14 @@ use std::{
     str::FromStr,
     sync::{
         atomic::{AtomicU32, AtomicU8, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     time::SystemTime,
 };
 use storage::{block_handle_db::BlockHandle, db::rocksdb::AccessType};
 use ton_block::{
-    error, fail, AccountIdPrefixFull, BlockIdExt, ConfigParams, Message, Result, ShardIdent,
-    UInt256,
+    error, fail, Account, AccountId, AccountIdPrefixFull, BlockIdExt, ConfigParams, Message,
+    MsgAddressInt, Result, ShardIdent, UInt256, MASTERCHAIN_ID,
 };
 
 // include!("../../common/src/log.rs");
@@ -60,11 +60,11 @@ pub struct MockEngine {
     collator_telemetry: CollatorValidatorTelemetry,
     engine_allocated: Arc<EngineAlloc>,
     collator_config: CollatorConfig,
-    new_config: Option<ConfigParams>,
+    hardfork_data: OnceLock<HardforkData>,
 }
 
 impl MockEngine {
-    pub async fn new(db_dir: &str, new_config: Option<ConfigParams>) -> Result<Self> {
+    pub async fn new(db_dir: &str) -> Result<Self> {
         let db_config = InternalDbConfig { db_directory: db_dir.to_string(), ..Default::default() };
         #[cfg(feature = "telemetry")]
         let telemetry = create_engine_telemetry();
@@ -102,8 +102,12 @@ impl MockEngine {
                 stop_timeout_ms: 60_000,
                 ..Default::default()
             },
-            new_config,
+            hardfork_data: OnceLock::new(),
         })
+    }
+
+    pub fn set_hardfork_data(&self, data: HardforkData) -> Result<()> {
+        self.hardfork_data.set(data).map_err(|_| error!("hardfork data has already been installed"))
     }
 }
 
@@ -121,7 +125,7 @@ impl EngineOperations for MockEngine {
         self.db.load_shard_state_dynamic(block_id)
     }
 
-    async fn load_block(&self, handle: &BlockHandle) -> Result<BlockStuff> {
+    async fn load_block(&self, handle: &Arc<BlockHandle>) -> Result<BlockStuff> {
         self.db.load_block_data(handle).await
     }
 
@@ -256,9 +260,90 @@ impl EngineOperations for MockEngine {
         &self.collator_config
     }
 
-    fn get_config_for_hardfork(&self) -> Option<ConfigParams> {
-        self.new_config.clone()
+    fn get_hardfork_data(&self) -> Option<HardforkData> {
+        self.hardfork_data.get().cloned()
     }
+}
+
+/// Placeholder for the actual pubkey patching logic. Receives the account id
+/// and current account state, must return the patched account. The collator
+/// preserves `last_trans_hash` / `last_trans_lt` from the existing
+/// `ShardAccount` separately, so this function only deals with `Account`.
+fn patch_account_key(account_id: &AccountId, _account: Account) -> Result<Account> {
+    fail!("patch_account_key is not implemented yet (account {:x})", account_id)
+}
+
+/// For each requested address, load the current account state from `mc_state`
+/// and pass it through `patch_account_key`. Accounts that are missing, live
+/// outside the masterchain, or fail the patching step are skipped with a
+/// stdout note - the hardfork block is still produced for the remaining ones.
+fn collect_patched_accounts(
+    mc_state: &Arc<ShardStateStuff>,
+    new_keys: &[(i32, AccountId)],
+) -> Result<Vec<(AccountId, Account)>> {
+    let mut patched = Vec::new();
+    for (workchain_id, account_id) in new_keys {
+        if *workchain_id != MASTERCHAIN_ID {
+            println!(
+                "skip {}:{:x}: only masterchain accounts are supported by the hardfork utility",
+                workchain_id, account_id
+            );
+            continue;
+        }
+        let shard_acc = match mc_state.shard_account(account_id) {
+            Ok(Some(sa)) => sa,
+            Ok(None) => {
+                println!(
+                    "skip {}:{:x}: account not found in masterchain state",
+                    workchain_id, account_id
+                );
+                continue;
+            }
+            Err(err) => {
+                println!("skip {}:{:x}: failed to load account: {}", workchain_id, account_id, err);
+                continue;
+            }
+        };
+        let account = match shard_acc.read_account() {
+            Ok(a) => a,
+            Err(err) => {
+                println!(
+                    "skip {}:{:x}: failed to deserialize account: {}",
+                    workchain_id, account_id, err
+                );
+                continue;
+            }
+        };
+        match patch_account_key(account_id, account) {
+            Ok(patched_account) => {
+                println!("patched {}:{:x}", workchain_id, account_id);
+                patched.push((account_id.clone(), patched_account));
+            }
+            Err(err) => {
+                println!(
+                    "skip {}:{:x}: patch_account_key failed: {}",
+                    workchain_id, account_id, err
+                );
+            }
+        }
+    }
+    Ok(patched)
+}
+
+/// Parse one `wc:hash` CLI value into a workchain id and `AccountId`.
+fn parse_account_address(value: &str) -> Result<(i32, AccountId)> {
+    let addr = MsgAddressInt::from_str(value)
+        .map_err(|err| error!("cannot parse address '{}': {}", value, err))?;
+    let workchain_id = addr.workchain_id();
+    let account_id = addr.address().clone();
+    if account_id.remaining_bits() != 256 {
+        fail!(
+            "address '{}' has {}-bit account id, expected 256 bits",
+            value,
+            account_id.remaining_bits()
+        )
+    }
+    Ok((workchain_id, account_id))
 }
 
 async fn run(args: clap::ArgMatches) -> Result<()> {
@@ -277,10 +362,14 @@ async fn run(args: clap::ArgMatches) -> Result<()> {
         None
     };
 
+    let new_keys: Vec<(i32, AccountId)> = args
+        .get_many::<String>("PATCH_ACC")
+        .map(|values| values.map(|value| parse_account_address(value)).collect::<Result<Vec<_>>>())
+        .transpose()?
+        .unwrap_or_default();
+
     let engine = Arc::new(
-        MockEngine::new(db_dir, new_config)
-            .await
-            .map_err(|err| error!("cannot create engine: {}", err))?,
+        MockEngine::new(db_dir).await.map_err(|err| error!("cannot create engine: {}", err))?,
     );
 
     let mc_state = engine.load_last_applied_mc_state().await?;
@@ -311,6 +400,10 @@ async fn run(args: clap::ArgMatches) -> Result<()> {
             mc_state.find_block_id(mc_seq_no - 1)?
         };
         let mc_state = engine.load_state(&prev_block_id).await?;
+
+        let patched_accounts = collect_patched_accounts(&mc_state, &new_keys)?;
+        engine.set_hardfork_data(HardforkData { config: new_config, patched_accounts })?;
+
         let cc_seqno = mc_state.shard_state_extra().unwrap().validator_info.catchain_seqno;
 
         let config = mc_state.config_params()?;
@@ -382,7 +475,18 @@ async fn main() {
         .arg(
             Arg::new("STATE").short('s').long("state").num_args(1).help("file with new state json"),
         )
-        .arg(Arg::new("LAST").short('l').long("last").help("last seq no of masterchain block"))
+        .arg(Arg::new("PATCH_ACC").long("patch-acc").num_args(1).action(ArgAction::Append).help(
+            "address (wc:hex_account_id) of an account whose public key must be \
+                     replaced by patch_account_key; may be repeated to patch several accounts \
+                     at once",
+        ))
+        .arg(
+            Arg::new("LAST")
+                .short('l')
+                .long("last")
+                .action(ArgAction::SetTrue)
+                .help("last seq no of masterchain block"),
+        )
         .get_matches();
 
     run(args).await.unwrap();

@@ -29,6 +29,13 @@ use crate::{
 use std::fmt::{Display, Formatter};
 use ton_block::UInt256;
 
+// ======================================================================
+// Proof, descriptor & report types
+// ======================================================================
+// The misbehavior proof enum and its supporting descriptor / reason /
+// report types (with their small inline accessors and `Display`). Mirrors
+// C++ `misbehavior.h` / `bus.h`.
+
 /// Cryptographic proof of validator misbehavior.
 ///
 /// Each variant contains the serialized signed vote data needed to independently
@@ -187,6 +194,12 @@ pub struct MisbehaviorReport {
     pub proof: MisbehaviorProof,
 }
 
+// ======================================================================
+// Vote result
+// ======================================================================
+// The FSM `on_vote` outcome enum (C++ `AddVoteResult` parity) with its
+// classification helpers and `Display`.
+
 /// Result of processing a vote in the FSM.
 ///
 /// Replaces `Result<()>` for `on_vote` to provide richer feedback:
@@ -323,6 +336,11 @@ impl Display for VoteResult {
     }
 }
 
+// ======================================================================
+// Proof construction & accessors
+// ======================================================================
+// Builders for the two proof variants plus the slot / validator / hash /
+// descriptor accessors and the `ConflictReason` description.
 impl MisbehaviorProof {
     /// Create a proof of conflicting votes (same vote type, different content).
     ///
@@ -473,6 +491,11 @@ impl ConflictReason {
     }
 }
 
+// ======================================================================
+// Display formatting
+// ======================================================================
+// Human-readable rendering of the proof, conflict reason, and report for
+// log lines.
 impl Display for MisbehaviorProof {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -540,6 +563,10 @@ impl Display for MisbehaviorReport {
     }
 }
 
+// ======================================================================
+// Tests
+// ======================================================================
+// Unit tests for proof construction, accessors, and formatting.
 #[cfg(test)]
 #[path = "tests/test_misbehavior.rs"]
 mod tests;

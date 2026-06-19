@@ -284,6 +284,7 @@ macro_rules! define_HashmapAugE {
                     },
                 )
             }
+            /// scans differences in two hashmaps with default values for missing items
             pub fn scan_diff_with_default<F>(&self, other: &Self, mut op: F) -> Result<bool>
             where
                 F: FnMut(SliceData, $x_type, $x_type) -> Result<bool>,

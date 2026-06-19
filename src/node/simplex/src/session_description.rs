@@ -25,9 +25,11 @@ use std::{
 };
 use ton_block::{error, fail, Result, ShardIdent};
 
-/*
-    Source node description
-*/
+// ======================================================================
+// Source node
+// ======================================================================
+// Per-validator source record (id, public key, ADNL id, stake weight)
+// backing `SessionDescription`'s validator set.
 
 /// Validator source node description
 struct Source {
@@ -41,10 +43,6 @@ struct Source {
     /// Node's weight according to stake
     weight: ValidatorWeight,
 }
-
-/*
-    SessionDescription implementation
-*/
 
 /// Session description for Simplex consensus
 ///
@@ -85,11 +83,12 @@ pub(crate) struct SessionDescription {
     metrics_receiver: MetricsHandle,
 }
 
+// ======================================================================
+// Construction
+// ======================================================================
+// Build the immutable session description from the validator set: compute
+// weights, sources and the reverse index, and resolve `self_idx`.
 impl SessionDescription {
-    /*
-        Constructor
-    */
-
     /// Create new session description
     ///
     /// # Parameters
@@ -197,7 +196,15 @@ impl SessionDescription {
             metrics_receiver,
         })
     }
+}
 
+// ======================================================================
+// Accessors & runtime helpers
+// ======================================================================
+// Read-only access to identity, options, the validator set, weights /
+// thresholds, slot / leader-window mapping, replay-aware time, and the
+// metrics handle. Finer groups are marked with lightweight comments.
+impl SessionDescription {
     /*
         Session identity
     */
@@ -317,12 +324,6 @@ impl SessionDescription {
         slot.window_index(self.options.slots_per_leader_window)
     }
 
-    /// Get first slot of the window containing the given slot
-    #[allow(dead_code)]
-    pub fn get_window_start_slot(&self, slot: SlotIndex) -> SlotIndex {
-        slot.window_start(self.options.slots_per_leader_window)
-    }
-
     /// Get slot offset within the window (0-based)
     pub fn get_slot_offset_in_window(&self, slot: SlotIndex) -> u32 {
         slot.offset_in_window(self.options.slots_per_leader_window)
@@ -367,12 +368,6 @@ impl SessionDescription {
         self.replay_time_us.store(micros_u64.saturating_add(1), Ordering::Relaxed);
     }
 
-    /// Clear replay time and return to real-time mode.
-    #[allow(dead_code)]
-    pub fn clear_time(&self) {
-        self.replay_time_us.store(0, Ordering::Relaxed);
-    }
-
     /// Get current time (SystemTime::now() for real-time, or replayed time)
     pub fn get_time(&self) -> SystemTime {
         let stored = self.replay_time_us.load(Ordering::Relaxed);
@@ -404,10 +399,10 @@ impl SessionDescription {
     }
 }
 
-/*
-    Display implementation
-*/
-
+// ======================================================================
+// Display
+// ======================================================================
+// Compact one-line summary (node count, total weight, self index).
 impl fmt::Display for SessionDescription {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(

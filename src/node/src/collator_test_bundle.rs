@@ -1601,7 +1601,7 @@ impl EngineOperations for CollatorTestBundle {
         self.load_state_internal(&block_id)
     }
 
-    async fn load_block(&self, handle: &BlockHandle) -> Result<BlockStuff> {
+    async fn load_block(&self, handle: &Arc<BlockHandle>) -> Result<BlockStuff> {
         if *handle.id() == self.index.id {
             if let Some(s) = &self.ethalon_block {
                 return Ok(s.clone());

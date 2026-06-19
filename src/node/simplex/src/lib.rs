@@ -143,34 +143,62 @@
 
 #![allow(clippy::too_many_arguments)]
 
-/// Modules
+// ======================================================================
+// Modules
+// ======================================================================
+// Crate-private module tree, the public `utils` module, and the
+// crate-internal `#[cfg(test)]` test module.
 mod block;
+mod candidate_book;
+mod candidate_controller;
 mod certificate;
+mod collation_controller;
+mod consensus_controller;
+mod controller_queue;
 mod database;
+mod database_controller;
 mod misbehavior;
 mod prometheus_publisher;
 mod receiver;
+mod receiver_callbacks;
 mod session;
+mod session_callbacks;
 mod session_description;
 mod session_processor;
+mod session_runtime;
+mod session_telemetry;
 mod simplex_state;
 mod startup_recovery;
 mod task_queue;
+pub mod trace_collector;
 pub mod utils;
+mod validation_controller;
+
+pub use trace_collector::{
+    LifecycleFinalStatus, LifecycleStarted, LifecycleStopped, LifecycleValidator, TraceCollector,
+};
 
 /// Internal tests (private unit tests with crate access)
 #[cfg(test)]
 mod tests;
 
-/*
-    Imported consensus dependencies from consensus-common
-*/
+// ======================================================================
+// Re-exports from consensus-common
+// ======================================================================
+// Convenience re-exports of the `consensus-common` types that form this
+// crate's public surface (listener trait, payload pointers, overlay
+// manager, key types, …), followed by the crate's `std` / `ton_block`
+// imports.
 /// Metrics handle for profiling
 pub use consensus_common::utils::MetricsHandle;
 /// Activity node for liveness tracking
 pub use consensus_common::ActivityNode;
 /// Activity node pointer
 pub use consensus_common::ActivityNodePtr;
+/// Async collation request interface (collation deadlines)
+pub use consensus_common::AsyncCollationRequest;
+/// Async collation request pointer
+pub use consensus_common::AsyncCollationRequestPtr;
 /// Async request interface
 pub use consensus_common::AsyncRequest;
 /// Async request pointer
@@ -245,9 +273,11 @@ use std::{
 };
 use ton_block::{fail, BlockIdExt, Result, ShardIdent};
 
-/*
-    Shared Raw Vote Data (memory-efficient storage)
-*/
+// ======================================================================
+// Shared raw vote data
+// ======================================================================
+// `RawVoteData`: an `Arc<RawBuffer>` wrapper for sharing serialized vote
+// bytes across structures (vote storage, misbehavior proofs) cheaply.
 
 /// Shared raw vote data for memory-efficient storage.
 ///
@@ -264,7 +294,7 @@ impl RawVoteData {
         Self(Arc::new(data))
     }
 
-    /// Create from Vec<u8>
+    /// Create from `Vec<u8>`
     pub fn from_vec(data: Vec<u8>) -> Self {
         Self(Arc::new(data.into()))
     }
@@ -321,18 +351,22 @@ impl AsRef<[u8]> for RawVoteData {
     }
 }
 
-/*
-    TL types for simplex consensus
-*/
+// ======================================================================
+// TL types
+// ======================================================================
+// Re-export of the generated TL consensus / simplex types under `ton`.
 
 /// Module with TL types for simplex consensus
 pub mod ton {
     pub use ton_api::ton::consensus::{simplex::*, *};
 }
 
-/*
-    Simplex Roundless Mode Constants
-*/
+// ======================================================================
+// Roundless-mode constant
+// ======================================================================
+// `SIMPLEX_ROUNDLESS`: the sentinel `round` value that tells
+// `ValidatorGroup` to bypass round-based invariants for slot-native
+// Simplex.
 
 /// Sentinel value indicating Simplex roundless mode.
 ///
@@ -360,9 +394,11 @@ pub mod ton {
 /// `unreachable!()` to assert this.
 pub const SIMPLEX_ROUNDLESS: u32 = u32::MAX;
 
-/*
-    Simplex-specific types
-*/
+// ======================================================================
+// Session pointers & aliases
+// ======================================================================
+// Public pointer aliases for the session, its listener, and the replay
+// listener.
 
 /// Pointer to Simplex Session
 pub type SessionPtr = Arc<dyn SimplexSession + Send + Sync>;
@@ -373,9 +409,11 @@ pub type SessionListenerPtr = Weak<dyn SessionListener + Send + Sync>;
 /// Log replay listener pointer
 pub type SessionReplayListenerPtr = consensus_common::ConsensusReplayListenerPtr;
 
-/*
-    SessionOptions for Simplex consensus
-*/
+// ======================================================================
+// Session options
+// ======================================================================
+// `SessionOptions` (immutable per-session configuration) plus the
+// Prometheus-labelling strategy, `Default`, and validation.
 
 /// Simplex session options
 #[derive(Clone, Copy, Debug)]
@@ -413,12 +451,6 @@ pub struct SessionOptions {
 
     /// Timeout between validation retry attempts
     pub validation_retry_timeout: Duration,
-
-    /// Collation retry timeout
-    pub collation_retry_timeout: Duration,
-
-    /// Collation retry max attempts
-    pub collation_retry_max_attempts: u32,
 
     /// Standstill timeout - if no finalization occurs within this period,
     /// re-broadcast all our votes for tracked slots
@@ -496,8 +528,10 @@ pub struct SessionOptions {
     // C++ candidate-resolver.cpp parity (1-second sliding window per peer).
     pub candidate_resolve_rate_limit: u32,
 
-    // TODO: wire into empty-block error backoff. C++ block-producer.cpp suppresses
-    // empty blocks for this period after a failed normal collation.
+    // Empty-block suppression window (C++ `allow_empty` in block-producer.cpp):
+    // once consensus has not finalized anything for this period, the producer stops
+    // emitting empty fillers and keeps waiting for a real block. Read by the
+    // collation controller's per-slot deadline wake.
     pub no_empty_blocks_on_error_timeout: Duration,
 
     /// Label set attached to per-session metrics that are republished to the
@@ -546,8 +580,6 @@ impl Default for SessionOptions {
             use_callback_thread: true,
             validation_retry_attempts: 0,
             validation_retry_timeout: Duration::from_secs(1),
-            collation_retry_timeout: Duration::from_millis(500),
-            collation_retry_max_attempts: 3,
             standstill_timeout: Duration::from_secs(10),
             empty_block_mc_lag_threshold: None,
             wait_for_db_init: false,
@@ -594,13 +626,6 @@ impl SessionOptions {
         if self.first_block_timeout.is_zero() {
             fail!("first_block_timeout must be > 0")
         }
-
-        // Collation flow parameters
-        if self.collation_retry_timeout.is_zero() {
-            fail!("collation_retry_timeout must be > 0")
-        }
-
-        // collation_retry_max_attempts = 0 is valid (no retries)
 
         if self.health_alert_cooldown.is_zero() {
             fail!("health_alert_cooldown must be > 0")
@@ -671,9 +696,11 @@ impl SessionOptions {
     }
 }
 
-/*
-    SimplexSession trait (Simplex-specific operations)
-*/
+// ======================================================================
+// SimplexSession trait
+// ======================================================================
+// The Simplex-specific extension of `Session`: MC-finalized notification,
+// candidate-availability repair, and stop / panic probes.
 
 /// Simplex-specific session operations
 ///
@@ -759,9 +786,11 @@ pub trait SimplexSession: ConsensusSession {
     fn is_panicked(&self) -> bool;
 }
 
-/*
-    SessionFactory
-*/
+// ======================================================================
+// Session factory
+// ======================================================================
+// `SessionFactory`: entry points to build overlay managers and create
+// live / log-replay sessions.
 
 /// Factory for creating Simplex sessions and related objects
 pub struct SessionFactory;
@@ -821,6 +850,8 @@ impl SessionFactory {
         db_path: String,
         overlay_manager: ConsensusOverlayManagerPtr,
         listener: SessionListenerPtr,
+        trace_collector: Option<TraceCollector>,
+        catchain_seqno: u32,
     ) -> Result<SessionPtr> {
         session::SessionImpl::create(
             options,
@@ -831,6 +862,8 @@ impl SessionFactory {
             db_path,
             overlay_manager,
             listener,
+            trace_collector,
+            catchain_seqno,
         )
     }
 

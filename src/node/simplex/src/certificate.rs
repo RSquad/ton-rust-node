@@ -66,16 +66,14 @@ use ton_api::{
     },
     IntoBoxed,
 };
-use ton_block::{error, fail, Result, UInt256};
+use ton_block::{fail, Result, UInt256};
 
-/*
-    ============================================================================
-    Vote Signature
-    ============================================================================
-
-    Single vote signature from a validator.
-    Reference: C++ `Certificate<T>::VoteSignature` in `certificate.h`
-*/
+// ======================================================================
+// Vote signature
+// ======================================================================
+// A single validator's signature over a vote: a compact validator index
+// plus Ed25519 bytes, with TL conversion. Reference: C++
+// `Certificate<T>::VoteSignature` in `certificate.h`.
 
 /// Single vote signature from a validator
 ///
@@ -139,14 +137,12 @@ impl VoteSignature {
     }
 }
 
-/*
-    ============================================================================
-    Certificate
-    ============================================================================
-
-    Aggregated vote signatures meeting 2/3 threshold.
-    Reference: C++ `Certificate<T>` template struct in `certificate.h`
-*/
+// ======================================================================
+// Certificate type & aliases
+// ======================================================================
+// The generic `Certificate<T>` (a vote plus its >= 2/3-weight aggregated
+// signatures) and the Notar / Final / Skip cert + `Arc` pointer aliases.
+// Reference: C++ `Certificate<T>` template struct in `certificate.h`.
 
 /// Certificate of aggregated vote signatures
 ///
@@ -208,6 +204,11 @@ pub(crate) type FinalCertPtr = Arc<FinalCert>;
 #[allow(dead_code)]
 pub(crate) type SkipCertPtr = Arc<SkipCert>;
 
+// ======================================================================
+// Construction & accessors
+// ======================================================================
+// Unverified construction (`new`, `from_tl_bytes_for_candidate`), weight
+// accounting, and the signature-set TL projection.
 impl NotarCert {
     /// Deserialize NotarCert from TL VoteSignatureSet bytes.
     ///
@@ -295,11 +296,11 @@ impl<T: Clone> Certificate<T> {
     }
 }
 
-/*
-    ============================================================================
-    Vote Type Trait for TL Conversion
-    ============================================================================
-*/
+// ======================================================================
+// Vote-type TL conversion
+// ======================================================================
+// `ToTlUnsignedVote`: convert FSM vote types to a TL `UnsignedVote` (and
+// back to the `Vote` enum), implemented for each concrete vote type.
 
 /// Trait for converting FSM vote types to TL
 pub(crate) trait ToTlUnsignedVote: Clone {
@@ -351,97 +352,10 @@ impl ToTlUnsignedVote for Vote {
     }
 }
 
-/*
-    ============================================================================
-    Vote Type Trait for TL Verification
-    ============================================================================
-
-    This trait enables generic certificate verification from TL.
-    Each vote type knows how to:
-    - Extract slot and optional block_hash from TL
-    - Verify the TL vote matches expected values
-    - Create itself from expected values
-*/
-
-/// Trait for verifying vote types from TL during certificate verification
-#[allow(dead_code)] // Infrastructure for full TL verification
-pub(crate) trait VerifiableVote: ToTlUnsignedVote {
-    /// Extract slot and optional block hash from TL unsigned vote
-    ///
-    /// Returns None if the TL vote is not the expected type.
-    fn extract_from_tl(tl_vote: &UnsignedVote) -> Option<(SlotIndex, Option<UInt256>)>;
-
-    /// Create vote from expected slot and optional block hash
-    fn create(slot: SlotIndex, block_hash: Option<&UInt256>) -> Result<Self>;
-
-    /// Vote type name for error messages
-    fn vote_type_name() -> &'static str;
-}
-
-impl VerifiableVote for NotarizeVote {
-    fn extract_from_tl(tl_vote: &UnsignedVote) -> Option<(SlotIndex, Option<UInt256>)> {
-        match tl_vote {
-            UnsignedVote::Consensus_Simplex_NotarizeVote(v) => {
-                Some((SlotIndex::new(*v.id.slot() as u32), Some(v.id.hash().clone())))
-            }
-            _ => None,
-        }
-    }
-
-    fn create(slot: SlotIndex, block_hash: Option<&UInt256>) -> Result<Self> {
-        let hash = block_hash.ok_or_else(|| error!("NotarizeVote requires block_hash"))?;
-        Ok(NotarizeVote { slot, block_hash: hash.clone() })
-    }
-
-    fn vote_type_name() -> &'static str {
-        "notarize"
-    }
-}
-
-impl VerifiableVote for FinalizeVote {
-    fn extract_from_tl(tl_vote: &UnsignedVote) -> Option<(SlotIndex, Option<UInt256>)> {
-        match tl_vote {
-            UnsignedVote::Consensus_Simplex_FinalizeVote(v) => {
-                Some((SlotIndex::new(*v.id.slot() as u32), Some(v.id.hash().clone())))
-            }
-            _ => None,
-        }
-    }
-
-    fn create(slot: SlotIndex, block_hash: Option<&UInt256>) -> Result<Self> {
-        let hash = block_hash.ok_or_else(|| error!("FinalizeVote requires block_hash"))?;
-        Ok(FinalizeVote { slot, block_hash: hash.clone() })
-    }
-
-    fn vote_type_name() -> &'static str {
-        "finalize"
-    }
-}
-
-impl VerifiableVote for SkipVote {
-    fn extract_from_tl(tl_vote: &UnsignedVote) -> Option<(SlotIndex, Option<UInt256>)> {
-        match tl_vote {
-            UnsignedVote::Consensus_Simplex_SkipVote(v) => {
-                Some((SlotIndex::new(v.slot as u32), None))
-            }
-            _ => None,
-        }
-    }
-
-    fn create(slot: SlotIndex, _block_hash: Option<&UInt256>) -> Result<Self> {
-        Ok(SkipVote { slot })
-    }
-
-    fn vote_type_name() -> &'static str {
-        "skip"
-    }
-}
-
-/*
-    ============================================================================
-    Certificate TL Serialization
-    ============================================================================
-*/
+// ======================================================================
+// TL serialization
+// ======================================================================
+// `Certificate::to_tl` for any certifiable vote type.
 
 impl<T: ToTlUnsignedVote> Certificate<T> {
     /// Convert to TL Certificate
@@ -461,11 +375,11 @@ impl<T: ToTlUnsignedVote> Certificate<T> {
     }
 }
 
-/*
-    ============================================================================
-    Certificate Deserialization with Verification
-    ============================================================================
-*/
+// ======================================================================
+// Deserialization with verification
+// ======================================================================
+// `from_tl_signatures`: rebuild and fully verify a typed certificate
+// (index bounds, duplicate detection, signatures, >= 2/3 weight).
 
 impl<T: ToTlUnsignedVote> Certificate<T> {
     /// Deserialize from TL VoteSignatureSet with signature verification
@@ -555,11 +469,11 @@ impl<T: ToTlUnsignedVote> Certificate<T> {
     }
 }
 
-/*
-    ============================================================================
-    Certificate from Generic Vote (for parsing TL Certificate)
-    ============================================================================
-*/
+// ======================================================================
+// Generic-vote parse & verify
+// ======================================================================
+// `Certificate<Vote>::from_tl`: parse and verify a TL certificate whose
+// vote variant is not known at compile time (C++-strict reject policy).
 
 impl Certificate<Vote> {
     /// Parse and verify certificate from TL Certificate
@@ -578,7 +492,7 @@ impl Certificate<Vote> {
     /// * `session_id` - Session ID for signature verification
     ///
     /// # Returns
-    /// Ok(Certificate<Vote>) if valid, Err with description if rejected
+    /// `Ok(Certificate<Vote>)` if valid, `Err` with a description if rejected
     pub fn from_tl(
         tl_cert: &CertificateBoxed,
         desc: &SessionDescription,
@@ -635,128 +549,5 @@ impl Certificate<Vote> {
         }
 
         Ok(Self { vote, signatures })
-    }
-}
-
-/*
-    ============================================================================
-    Generic Certificate Verification from TL
-    ============================================================================
-
-    Verifies and creates certificates from TL for any vote type.
-    Reference: C++ CandidateResolver certificate verification
-*/
-
-impl<T: VerifiableVote> Certificate<T> {
-    /// Verify and create Certificate from TL Certificate
-    ///
-    /// This method:
-    /// 1. Verifies the certificate contains the expected vote type for the expected slot/block
-    /// 2. Verifies all signatures
-    /// 3. Checks the weight meets the 2/3 threshold
-    /// 4. Returns the verified Certificate
-    ///
-    /// # Arguments
-    ///
-    /// * `tl_cert` - TL Certificate object to verify
-    /// * `expected_slot` - Expected slot number in the vote
-    /// * `expected_block_hash` - Expected block hash (Some for notarize/finalize, None for skip)
-    /// * `desc` - Session description for validator lookup and weight calculation
-    ///
-    /// # Returns
-    ///
-    /// Ok(Arc<Certificate<T>>) if valid, Err with descriptive message otherwise
-    ///
-    /// # Errors
-    ///
-    /// - Certificate contains wrong vote type
-    /// - Slot mismatch
-    /// - Block hash mismatch (for notarize/finalize)
-    /// - Invalid validator index
-    /// - Duplicate validator
-    /// - Invalid signature
-    /// - Insufficient weight (< 2/3)
-    #[allow(dead_code)] // Available for TL verification in future
-    pub fn verify_from_tl(
-        tl_cert: &CertificateBoxed,
-        expected_slot: SlotIndex,
-        expected_block_hash: Option<&UInt256>,
-        desc: &SessionDescription,
-        session_id: &SessionId,
-    ) -> Result<Arc<Self>> {
-        // Extract vote and signatures from TL
-        let tl_vote = tl_cert.vote();
-
-        // Verify vote type and extract slot/hash
-        let (cert_slot, cert_hash) = T::extract_from_tl(tl_vote)
-            .ok_or_else(|| error!("Certificate contains non-{} vote", T::vote_type_name()))?;
-
-        // Verify slot matches
-        if cert_slot != expected_slot {
-            fail!("Certificate slot mismatch: expected {}, got {}", expected_slot, cert_slot)
-        }
-
-        // Verify block hash matches (if applicable)
-        match (expected_block_hash, &cert_hash) {
-            (Some(expected), Some(actual)) if expected != actual => {
-                fail!("Certificate block hash mismatch")
-            }
-            (Some(_), None) => {
-                fail!("Certificate missing block hash for {} vote", T::vote_type_name())
-            }
-            _ => {}
-        }
-
-        // Get vote bytes for signature verification
-        // Wrap in dataToSign(session_id, vote_bytes) - matches C++ types.cpp
-        let raw_vote_bytes = serialize_unsigned_vote(tl_vote);
-        let vote_bytes = crate::utils::create_data_to_sign(session_id, &raw_vote_bytes);
-
-        // Parse signatures
-        let votes_vec = tl_cert.signatures().votes();
-        let num_validators = desc.get_total_nodes();
-        let mut voted = vec![false; num_validators];
-        let mut signatures = Vec::with_capacity(votes_vec.len());
-
-        for tl_sig in votes_vec.iter() {
-            let sig = VoteSignature::from_tl(tl_sig);
-            let validator_idx = sig.validator_idx;
-
-            // Check validator index bounds
-            if validator_idx.value() as usize >= num_validators {
-                fail!(
-                    "Invalid validator index {} in certificate (num_validators={})",
-                    validator_idx,
-                    num_validators
-                )
-            }
-
-            // Check for duplicates
-            if voted[validator_idx.value() as usize] {
-                fail!("Duplicate validator index {} in certificate", validator_idx)
-            }
-            voted[validator_idx.value() as usize] = true;
-
-            // Verify signature
-            let validator_key = desc.get_source_public_key(validator_idx);
-            if validator_key.verify(&vote_bytes, &sig.signature).is_err() {
-                fail!("Invalid vote signature for validator {}", validator_idx)
-            }
-
-            signatures.push(sig);
-        }
-
-        // Create the vote and certificate
-        let vote = T::create(expected_slot, expected_block_hash)?;
-        let cert = Certificate::new(vote, signatures);
-
-        // Check weight threshold using Certificate method
-        if !cert.has_sufficient_weight(desc) {
-            let total = cert.total_weight(desc);
-            let threshold = desc.get_threshold_66();
-            fail!("Certificate weight {} below threshold {}", total, threshold)
-        }
-
-        Ok(Arc::new(cert))
     }
 }

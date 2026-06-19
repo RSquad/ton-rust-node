@@ -231,6 +231,26 @@ fn test_value_flow() {
     burned.set_other(2100500, 100_500_000_000 + 100500 + 2).unwrap();
     burned.set_other(28, 100_500_000_000 + 8 + 2).unwrap();
 
+    // The data above is arbitrary and does not satisfy the balance invariant
+    //   from_prev_blk + imported + fees_imported + created + minted + recovered
+    //     == to_next_blk + exported + fees_collected + burned
+    // Compute both totals, then add the right-hand total to from_prev_blk and the
+    // left-hand total to to_next_blk: both sides then equal (lhs_total + rhs_total).
+    let mut lhs_total = from_prev_blk.clone();
+    assert!(lhs_total.add(&imported).unwrap());
+    assert!(lhs_total.add(&fees_imported).unwrap());
+    assert!(lhs_total.add(&created).unwrap());
+    assert!(lhs_total.add(&minted).unwrap());
+    assert!(lhs_total.add(&recovered).unwrap());
+
+    let mut rhs_total = to_next_blk.clone();
+    assert!(rhs_total.add(&exported).unwrap());
+    assert!(rhs_total.add(&fees_collected).unwrap());
+    assert!(rhs_total.add(&burned).unwrap());
+
+    assert!(from_prev_blk.add(&rhs_total).unwrap());
+    assert!(to_next_blk.add(&lhs_total).unwrap());
+
     let value_flow = ValueFlow {
         from_prev_blk,
         to_next_blk,
@@ -243,6 +263,12 @@ fn test_value_flow() {
         minted,
         burned,
     };
+    assert!(value_flow.validate().unwrap());
+
+    // unbalancing any term makes the flow invalid
+    let mut unbalanced = value_flow.clone();
+    unbalanced.minted.set_other(100500, 2001).unwrap();
+    assert!(!unbalanced.validate().unwrap());
 
     write_read_and_assert(value_flow);
 }

@@ -113,7 +113,7 @@ impl SessionListener for ValidationTestListener {
     fn on_generate_slot(
         &self,
         source_info: simplex::BlockSourceInfo,
-        request: simplex::AsyncRequestPtr,
+        request: simplex::AsyncCollationRequestPtr,
         parent: consensus_common::CollationParentHint,
         callback: ValidatorBlockCandidateCallback,
     ) {
@@ -431,6 +431,8 @@ fn run_validation_test() {
         db_path_0,
         overlay_manager.clone(),
         Arc::downgrade(&session_listener_0),
+        None,
+        0,
     )
     .expect("Failed to create session 0");
     let (prev_blocks_0, min_masterchain_block_id_0) =
@@ -446,6 +448,8 @@ fn run_validation_test() {
         db_path_1,
         overlay_manager.clone(),
         Arc::downgrade(&session_listener_1),
+        None,
+        0,
     )
     .expect("Failed to create session 1");
     let (prev_blocks_1, min_masterchain_block_id_1) =

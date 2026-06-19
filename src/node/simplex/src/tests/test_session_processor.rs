@@ -14,12 +14,16 @@
 use super::*;
 use crate::{
     block::ValidatorIndex,
+    collation_controller::{CollationResult, LocalChainHead, PrecollatedBlock},
+    database::{CandidateInfoRecord, NotarCertRecord},
     receiver::Receiver,
     task_queue::{CallbackTaskQueuePtr, TaskQueuePtr},
+    utils::AsyncRequestImpl,
+    validation_controller::PendingValidation,
     SessionId, SessionNode, SessionOptions, SIMPLEX_ROUNDLESS,
 };
 use consensus_common::{
-    AsyncRequestPtr, BlockPayloadPtr, BlockSourceInfo, CollationParentHint,
+    AsyncCollationRequestPtr, BlockPayloadPtr, BlockSourceInfo, CollationParentHint,
     EnsureCandidateAvailabilityOptions, PublicKey, PublicKeyHash, ResolverPurpose, SessionStats,
     ValidatorBlockCandidateCallback, ValidatorBlockCandidateDecisionCallback,
 };
@@ -34,14 +38,20 @@ use std::{
     time::{Duration, SystemTime},
 };
 use ton_api::{
-    deserialize_boxed,
-    ton::consensus::{
-        simplex::{
-            certificate::Certificate, unsignedvote::SkipVote, vote::Vote as TlVote,
-            votesignature::VoteSignature, votesignatureset::VoteSignatureSet, CandidateAndCert,
-            Certificate as CertificateBoxed, VoteSignature as VoteSignatureBoxed,
+    deserialize_boxed, serialize_boxed,
+    ton::{
+        consensus::{
+            candidatehashdata::{CandidateHashDataEmpty, CandidateHashDataOrdinary},
+            candidateid::CandidateId as TlCandidateId,
+            candidateparent::CandidateParent as TlCandidateParent,
+            simplex::{
+                certificate::Certificate, unsignedvote::SkipVote, vote::Vote as TlVote,
+                votesignature::VoteSignature, votesignatureset::VoteSignatureSet, CandidateAndCert,
+                Certificate as CertificateBoxed, VoteSignature as VoteSignatureBoxed,
+            },
+            CandidateData, CandidateHashData, CandidateId as CandidateIdBoxed, CandidateParent,
         },
-        CandidateData,
+        validator_session::candidate::Candidate as TlCandidate,
     },
     IntoBoxed,
 };
@@ -135,6 +145,8 @@ enum ReceiverAction {
     SendBlockBroadcast { slot: u32, candidate_hash: UInt256 },
     /// cache_notarization_cert() was called
     CacheNotarizationCert { slot: u32, block_hash: UInt256 },
+    /// cache_candidate_bytes() was called (full bytes captured for roundtrip checks)
+    CacheCandidateBytes { slot: u32, block_hash: UInt256, candidate_data: Vec<u8> },
     /// send_certificate() was called
     SendCertificate { certificate: CertificateBoxed },
     /// cache_standstill_certificate() was called
@@ -182,12 +194,6 @@ impl MockReceiver {
     fn drain_actions(&self) -> Vec<ReceiverAction> {
         self.actions.lock().unwrap().drain(..).collect()
     }
-
-    /// Get count of pending actions
-    #[allow(dead_code)]
-    fn action_count(&self) -> usize {
-        self.actions.lock().unwrap().len()
-    }
 }
 
 impl Receiver for MockReceiver {
@@ -213,8 +219,12 @@ impl Receiver for MockReceiver {
             .push_back(ReceiverAction::CacheNotarizationCert { slot, block_hash });
     }
 
-    fn cache_candidate_bytes(&self, _slot: u32, _block_hash: UInt256, _candidate_data: Vec<u8>) {
-        // No-op for tests
+    fn cache_candidate_bytes(&self, slot: u32, block_hash: UInt256, candidate_data: Vec<u8>) {
+        self.actions.lock().unwrap().push_back(ReceiverAction::CacheCandidateBytes {
+            slot,
+            block_hash,
+            candidate_data,
+        });
     }
 
     fn cleanup(&self, up_to_slot: u32) {
@@ -326,7 +336,7 @@ impl consensus_common::SessionListener for MockListener {
     fn on_generate_slot(
         &self,
         _source_info: BlockSourceInfo,
-        _request: AsyncRequestPtr,
+        _request: AsyncCollationRequestPtr,
         _parent: CollationParentHint,
         _callback: ValidatorBlockCandidateCallback,
     ) {
@@ -425,7 +435,7 @@ impl consensus_common::SessionListener for RecordingListener {
     fn on_generate_slot(
         &self,
         _source_info: BlockSourceInfo,
-        _request: AsyncRequestPtr,
+        _request: AsyncCollationRequestPtr,
         _parent: CollationParentHint,
         _callback: ValidatorBlockCandidateCallback,
     ) {
@@ -511,14 +521,6 @@ struct TestTaskQueue {
 impl TestTaskQueue {
     fn new() -> Arc<Self> {
         Arc::new(Self { tasks: Arc::new(Mutex::new(VecDeque::new())) })
-    }
-
-    /// Execute all pending tasks
-    #[allow(dead_code)]
-    fn execute_all(&self, processor: &mut SessionProcessor) {
-        while let Some(task) = self.tasks.lock().unwrap().pop_front() {
-            task(processor);
-        }
     }
 }
 
@@ -653,29 +655,52 @@ impl TestFixture {
 
         let task_queue = TestTaskQueue::new();
         let callback_queue: CallbackTaskQueuePtr = Arc::new(TestCallbackQueue);
-        let overlay_manager =
-            consensus_common::ConsensusCommonFactory::create_dummy_overlay_manager();
         let receiver = MockReceiver::new();
         let db = MockDb::new();
 
         let stop_flag = Arc::new(AtomicBool::new(false));
         let health_counters = Arc::new(crate::receiver::ReceiverHealthCounters::new());
+        let callbacks = Arc::new(crate::session_callbacks::SessionCallbacks::new(
+            description.get_session_id().clone(),
+            stop_flag.clone(),
+            false,
+            callback_queue,
+            listener_weak,
+        ));
         let processor = SessionProcessor::new(
             description.clone(),
             make_start_prev_blocks(description.get_shard(), description.get_initial_block_seqno()),
-            listener_weak,
             task_queue.clone() as TaskQueuePtr,
-            callback_queue,
-            overlay_manager,
             receiver.clone() as crate::receiver::ReceiverPtr,
             stop_flag,
             db,
             0,
             health_counters,
+            callbacks,
+            None,
+            0,
         )
         .unwrap();
 
         Self { nodes, description, processor, receiver, task_queue }
+    }
+
+    /// Drain and run any closures the processor posted to the SXMAIN task queue,
+    /// against `&mut self.processor`.
+    ///
+    /// Tests use this to flush deferred backend effects that production would run
+    /// on the next main-loop iteration — e.g. the borrowing `ValidationBackend` /
+    /// `CollationBackend` cannot call `&mut SessionProcessor` methods like
+    /// `request_candidate` synchronously, so they bounce a closure onto this
+    /// queue.
+    fn run_pending_tasks(&mut self) {
+        loop {
+            let task = self.task_queue.tasks.lock().unwrap().pop_front();
+            match task {
+                Some(task) => task(&mut self.processor),
+                None => break,
+            }
+        }
     }
 
     /// Create a test fixture with N validators and custom session options
@@ -688,15 +713,37 @@ impl TestFixture {
         self.processor.advance_time(delta);
     }
 
-    /// Execute all pending tasks
-    #[allow(dead_code)]
-    fn execute_pending_tasks(&mut self) {
-        self.task_queue.execute_all(&mut self.processor);
-    }
-
     /// Get all actions sent to receiver
     fn drain_receiver_actions(&self) -> Vec<ReceiverAction> {
         self.receiver.drain_actions()
+    }
+
+    /// Drain `pending_async_db_results` by polling the registry while the
+    /// background storage thread flushes in-flight writes. Used by tests that
+    /// exercise `*_async()` continuations migrated to the SXMAIN async-DB-results
+    /// registry — without this, post-persist side-effects (broadcast, cache,
+    /// standstill update) would not have run by the time the test asserts on
+    /// receiver actions.
+    fn drain_pending_async_db_results(&mut self) {
+        for _ in 0..200 {
+            self.processor.process_pending_async_db_results();
+            if self.processor.database.pending_is_empty() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // 200 polls * 5 ms = ~1 s budget (orders of magnitude above the observed
+        // continuation latency). If anything is still queued, a registered
+        // continuation never completed — fail loudly instead of letting the test
+        // assert against half-applied side-effects (the original `break` silently
+        // hid such stalls).
+        assert!(
+            self.processor.database.pending_is_empty(),
+            "drain_pending_async_db_results: {} entr{} still pending after 200 polls (~1s); \
+             a registered continuation never completed",
+            self.processor.database.pending_count(),
+            if self.processor.database.pending_count() == 1 { "y" } else { "ies" },
+        );
     }
 }
 
@@ -723,35 +770,6 @@ fn build_skip_certificate_tl(
         .iter()
         .map(|&idx| {
             let sig = nodes[idx].public_key.sign(&to_sign).expect("failed to sign skip vote");
-            VoteSignature { who: idx as i32, signature: sig.to_vec().into() }.into_boxed()
-        })
-        .collect();
-
-    let sig_set = VoteSignatureSet { votes: tl_sigs.into() }.into_boxed();
-
-    Certificate { vote: unsigned_vote, signatures: sig_set }.into_boxed()
-}
-
-#[allow(dead_code)]
-fn build_notarize_certificate_tl(
-    session_id: &SessionId,
-    nodes: &[SessionNode],
-    slot: u32,
-    signers: &[usize],
-) -> CertificateBoxed {
-    use ton_api::ton::consensus::{candidateid::CandidateId, simplex::unsignedvote::NotarizeVote};
-
-    let block_hash = UInt256::rand();
-    let candidate_id = CandidateId { slot: slot as i32, hash: block_hash.clone() }.into_boxed();
-    let unsigned_vote = NotarizeVote { id: candidate_id }.into_boxed();
-
-    let raw_vote_bytes = crate::utils::serialize_unsigned_vote(&unsigned_vote);
-    let to_sign = crate::utils::create_data_to_sign(session_id, &raw_vote_bytes);
-
-    let tl_sigs: Vec<VoteSignatureBoxed> = signers
-        .iter()
-        .map(|&idx| {
-            let sig = nodes[idx].public_key.sign(&to_sign).expect("failed to sign notarize vote");
             VoteSignature { who: idx as i32, signature: sig.to_vec().into() }.into_boxed()
         })
         .collect();
@@ -810,6 +828,178 @@ fn make_notar_vote_signature_set_bytes(
 }
 
 // ============================================================================
+// Startup recovery helpers (apply_bootstrap state-based tests)
+// ============================================================================
+
+fn make_candidate_id(slot: u32, hash_byte: u8) -> RawCandidateId {
+    let mut hash = [0u8; 32];
+    hash[0] = hash_byte;
+    RawCandidateId { slot: SlotIndex::new(slot), hash: UInt256::from(hash) }
+}
+
+fn make_block_id(seqno: u32) -> BlockIdExt {
+    BlockIdExt {
+        shard_id: ShardIdent::masterchain(),
+        seq_no: seqno,
+        root_hash: UInt256::default(),
+        file_hash: UInt256::default(),
+    }
+}
+
+fn make_candidate_hash_data_with_parent(
+    block_id: BlockIdExt,
+    collated_file_hash: UInt256,
+    parent: Option<RawCandidateId>,
+) -> CandidateHashData {
+    let parent_tl = match parent {
+        None => CandidateParent::Consensus_CandidateWithoutParents,
+        Some(parent_id) => {
+            let tl_parent_id =
+                TlCandidateId { slot: parent_id.slot.value() as i32, hash: parent_id.hash };
+            CandidateParent::Consensus_CandidateParent(TlCandidateParent {
+                id: CandidateIdBoxed::Consensus_CandidateId(tl_parent_id),
+            })
+        }
+    };
+
+    CandidateHashData::Consensus_CandidateHashDataOrdinary(CandidateHashDataOrdinary {
+        block: block_id,
+        collated_file_hash: collated_file_hash.into(),
+        parent: parent_tl,
+    })
+}
+
+fn make_candidate_hash_data_empty(
+    referenced_block: BlockIdExt,
+    parent: RawCandidateId,
+) -> CandidateHashData {
+    let tl_parent_id = TlCandidateId { slot: parent.slot.value() as i32, hash: parent.hash };
+
+    CandidateHashData::Consensus_CandidateHashDataEmpty(CandidateHashDataEmpty {
+        block: referenced_block,
+        parent: tl_parent_id,
+    })
+}
+
+fn make_validator_session_candidate_bytes(
+    round: i32,
+    root_hash: UInt256,
+    data: Vec<u8>,
+    collated_data: Vec<u8>,
+) -> Vec<u8> {
+    let tl_candidate =
+        TlCandidate { src: UInt256::default(), round, root_hash, data, collated_data };
+
+    consensus_common::serialize_tl_boxed_object!(&tl_candidate.into_boxed())
+}
+
+fn make_vote_record(
+    node_idx: ValidatorIndex,
+    vote: crate::simplex_state::Vote,
+    session_id: &SessionId,
+    nodes: &[SessionNode],
+) -> crate::database::VoteRecord {
+    let signer = &nodes[node_idx.value() as usize].public_key;
+    let tl_vote = crate::utils::sign_vote(&vote, session_id, signer).expect("sign_vote failed");
+    let serialized = serialize_boxed(&tl_vote).expect("serialize vote failed");
+    let vote_hash = UInt256::from_slice(&sha256_digest(&serialized));
+    crate::database::VoteRecord { vote_hash, data: serialized.into(), node_idx, seqno: 0 }
+}
+
+fn make_final_cert_record(
+    session_id: &SessionId,
+    nodes: &[SessionNode],
+    candidate_id: RawCandidateId,
+    signers: &[usize],
+) -> crate::database::FinalCertRecord {
+    let vote = crate::simplex_state::FinalizeVote {
+        slot: candidate_id.slot,
+        block_hash: candidate_id.hash.clone(),
+    };
+    let unsigned_vote =
+        crate::utils::vote_to_tl_unsigned(&crate::simplex_state::Vote::Finalize(vote.clone()))
+            .expect("build finalize unsigned vote");
+    let raw_vote_bytes = crate::utils::serialize_unsigned_vote(&unsigned_vote);
+    let to_sign = crate::utils::create_data_to_sign(session_id, &raw_vote_bytes);
+
+    let signatures = signers
+        .iter()
+        .map(|&idx| {
+            let signature = nodes[idx].public_key.sign(&to_sign).expect("sign finalize vote");
+            crate::certificate::VoteSignature::new(
+                ValidatorIndex::new(idx as u32),
+                signature.to_vec(),
+            )
+        })
+        .collect();
+
+    let cert = crate::certificate::Certificate::new(vote, signatures);
+    let tl_cert = cert.to_tl().expect("serialize final cert to TL");
+    let cert_bytes = serialize_boxed(&tl_cert).expect("serialize final cert");
+
+    crate::database::FinalCertRecord { candidate_id, cert_bytes: cert_bytes.into() }
+}
+
+fn make_skip_cert_record(
+    session_id: &SessionId,
+    nodes: &[SessionNode],
+    slot: SlotIndex,
+    signers: &[usize],
+) -> crate::database::SkipCertRecord {
+    let vote = crate::simplex_state::SkipVote { slot };
+    let unsigned_vote =
+        crate::utils::vote_to_tl_unsigned(&crate::simplex_state::Vote::Skip(vote.clone()))
+            .expect("build skip unsigned vote");
+    let raw_vote_bytes = crate::utils::serialize_unsigned_vote(&unsigned_vote);
+    let to_sign = crate::utils::create_data_to_sign(session_id, &raw_vote_bytes);
+
+    let signatures = signers
+        .iter()
+        .map(|&idx| {
+            let signature = nodes[idx].public_key.sign(&to_sign).expect("sign skip vote");
+            crate::certificate::VoteSignature::new(
+                ValidatorIndex::new(idx as u32),
+                signature.to_vec(),
+            )
+        })
+        .collect();
+
+    let cert = crate::certificate::Certificate::new(vote, signatures);
+    let tl_cert = cert.to_tl().expect("serialize skip cert to TL");
+    let cert_bytes = serialize_boxed(&tl_cert).expect("serialize skip cert");
+
+    crate::database::SkipCertRecord { slot, cert_bytes: cert_bytes.into() }
+}
+
+/// Build an empty bootstrap (all sections empty). Tests populate the sections
+/// they exercise; an all-empty bootstrap is treated as a fresh start and
+/// `apply_bootstrap` returns early, so recovery tests must set at least one.
+fn empty_bootstrap() -> crate::database::Bootstrap {
+    crate::database::Bootstrap {
+        finalized_blocks: vec![],
+        candidate_infos: vec![],
+        notar_certs: vec![],
+        final_certs: vec![],
+        skip_certs: vec![],
+        votes: vec![],
+        pool_state: None,
+        candidate_payloads: vec![],
+    }
+}
+
+/// Run startup recovery against the fixture's real `SessionProcessor`
+/// (which implements `StartupRecoveryBackend`) and assert success.
+fn run_apply_bootstrap(fixture: &mut TestFixture, bootstrap: crate::database::Bootstrap) {
+    let session_id = fixture.description.get_session_id().clone();
+    let recovery = crate::startup_recovery::SessionStartupRecoveryProcessor::new(
+        session_id,
+        fixture.description.clone(),
+        bootstrap,
+    );
+    recovery.apply_bootstrap(&mut fixture.processor).expect("apply_bootstrap failed");
+}
+
+// ============================================================================
 // Basic Tests
 // ============================================================================
 
@@ -861,7 +1051,7 @@ fn test_genesis_collation_expected_seqno_uses_initial_block_seqno() {
     // initial_block_seqno is set to 1 in create_test_desc()
     assert_eq!(fixture.description.get_initial_block_seqno(), 1);
     // Ensure the expected seqno does NOT depend on finalized_head_seqno when parent=None.
-    fixture.processor.finalized_head_seqno = Some(123);
+    fixture.processor.consensus.set_finalized_head_seqno(Some(123));
 
     let slot = SlotIndex::new(132);
 
@@ -915,38 +1105,65 @@ fn test_should_generate_empty_block_uses_committed_head_at_session_start() {
 
     let task_queue = TestTaskQueue::new();
     let callback_queue: CallbackTaskQueuePtr = Arc::new(TestCallbackQueue);
-    let overlay_manager = consensus_common::ConsensusCommonFactory::create_dummy_overlay_manager();
     let receiver = MockReceiver::new();
     let db = MockDb::new();
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     let health_counters = Arc::new(crate::receiver::ReceiverHealthCounters::new());
+    let callbacks = Arc::new(crate::session_callbacks::SessionCallbacks::new(
+        description.get_session_id().clone(),
+        stop_flag.clone(),
+        false,
+        callback_queue,
+        listener_weak,
+    ));
     let processor = SessionProcessor::new(
         description,
         make_start_prev_blocks(&shard, initial_block_seqno),
-        listener_weak,
         task_queue.clone() as TaskQueuePtr,
-        callback_queue,
-        overlay_manager,
         receiver.clone() as crate::receiver::ReceiverPtr,
         stop_flag,
         db,
         0,
         health_counters,
+        callbacks,
+        None,
+        0,
     )
     .unwrap();
 
-    assert_eq!(processor.finalized_head_seqno, Some(46));
+    assert_eq!(processor.consensus.finalized_head_seqno(), Some(46));
 
     // Slot 0 is the initial `first_non_progressed_slot` in fresh state.
     // MC: new_seqno=48, finalized_head=46 -> 46+1=47 < 48 -> empty
-    assert!(processor.should_generate_empty_block(SlotIndex::new(0), 48, None));
+    assert!(processor.collation.should_generate_empty_block(
+        SlotIndex::new(0),
+        48,
+        None,
+        processor.consensus.finalized_head_before_split(),
+        processor.consensus.last_consensus_finalized_seqno(),
+        processor.consensus.last_mc_finalized_seqno(),
+    ));
     assert!(
-        processor.should_generate_empty_block(SlotIndex::new(1), 48, None),
+        processor.collation.should_generate_empty_block(
+            SlotIndex::new(1),
+            48,
+            None,
+            processor.consensus.finalized_head_before_split(),
+            processor.consensus.last_consensus_finalized_seqno(),
+            processor.consensus.last_mc_finalized_seqno(),
+        ),
         "C++ parity: empty-block fallback must also apply to future slots in the same window"
     );
     // MC: new_seqno=47, finalized_head=46 -> 46+1=47 == 47 -> NOT empty
-    assert!(!processor.should_generate_empty_block(SlotIndex::new(0), 47, None));
+    assert!(!processor.collation.should_generate_empty_block(
+        SlotIndex::new(0),
+        47,
+        None,
+        processor.consensus.finalized_head_before_split(),
+        processor.consensus.last_consensus_finalized_seqno(),
+        processor.consensus.last_mc_finalized_seqno(),
+    ));
 }
 
 #[test]
@@ -957,16 +1174,16 @@ fn test_out_of_order_finalized_delivery_emits_immediately_when_body_present() {
 
     let recording = RecordingListener::new();
     let listener: Arc<dyn consensus_common::SessionListener + Send + Sync> = recording.clone();
-    fixture.processor.listener = Arc::downgrade(&listener);
+    fixture.processor.set_listener_for_test(Arc::downgrade(&listener));
 
     // Set finalized head high so this test isolates finalized-delivery callback.
-    fixture.processor.finalized_head_seqno = Some(100);
-    fixture.processor.finalized_head_block_id = Some(BlockIdExt::with_params(
+    fixture.processor.consensus.set_finalized_head_seqno(Some(100));
+    fixture.processor.consensus.set_finalized_head_block_id(Some(BlockIdExt::with_params(
         ShardIdent::masterchain(),
         100,
         UInt256::rand(),
         UInt256::rand(),
-    ));
+    )));
 
     let slot = 103u32;
     let (leader_source, candidate_id, broadcast) =
@@ -975,8 +1192,8 @@ fn test_out_of_order_finalized_delivery_emits_immediately_when_body_present() {
 
     let received = fixture
         .processor
-        .received_candidates
-        .get(&candidate_id)
+        .candidate_book()
+        .received(&candidate_id)
         .expect("candidate should be present")
         .clone();
 
@@ -1002,11 +1219,11 @@ fn test_out_of_order_finalized_delivery_emits_immediately_when_body_present() {
         "on_block_committed must be suppressed in out-of-order mode"
     );
     assert!(
-        fixture.processor.finalized_pending_body.is_empty(),
+        fixture.processor.consensus.finalized_pending_body_is_empty(),
         "no pending-body retention expected when finalized body is already present"
     );
     assert!(
-        fixture.processor.requested_candidates.is_empty(),
+        fixture.processor.requested_candidates().is_empty(),
         "finalized-driven mode must not request missing candidates"
     );
 }
@@ -1019,16 +1236,16 @@ fn test_out_of_order_finalized_delivery_emits_when_body_arrives_late_and_dedups(
 
     let recording = RecordingListener::new();
     let listener: Arc<dyn consensus_common::SessionListener + Send + Sync> = recording.clone();
-    fixture.processor.listener = Arc::downgrade(&listener);
+    fixture.processor.set_listener_for_test(Arc::downgrade(&listener));
 
     // Set finalized head high so this test isolates finalized-delivery callback.
-    fixture.processor.finalized_head_seqno = Some(70);
-    fixture.processor.finalized_head_block_id = Some(BlockIdExt::with_params(
+    fixture.processor.consensus.set_finalized_head_seqno(Some(70));
+    fixture.processor.consensus.set_finalized_head_block_id(Some(BlockIdExt::with_params(
         ShardIdent::masterchain(),
         70,
         UInt256::rand(),
         UInt256::rand(),
-    ));
+    )));
 
     let slot = 77u32;
     let block_data = vec![0xA5, 0x5A, 0xCC, 0x33];
@@ -1038,7 +1255,7 @@ fn test_out_of_order_finalized_delivery_emits_when_body_arrives_late_and_dedups(
     // Finalization observed first (before full candidate body is known).
     let root_hash = UInt256::from_slice(&sha256_digest(&block_data));
     let block_id = BlockIdExt {
-        shard_id: fixture.processor.description.get_shard().clone(),
+        shard_id: fixture.processor.runtime.description().get_shard().clone(),
         seq_no: slot,
         root_hash: root_hash.clone(),
         file_hash: root_hash,
@@ -1050,13 +1267,15 @@ fn test_out_of_order_finalized_delivery_emits_when_body_arrives_late_and_dedups(
         certificate: make_test_final_cert(candidate_id.slot, candidate_id.hash.clone()),
     };
     fixture.processor.handle_block_finalized(event.clone());
+    // Drain the deferred `request_candidate` bounce onto SXMAIN.
+    fixture.run_pending_tasks();
 
     assert!(
         recording.drain_events().is_empty(),
         "no finalized callback before candidate body is available"
     );
     assert!(
-        fixture.processor.requested_candidates.contains_key(&candidate_id),
+        fixture.processor.requested_candidates().contains_key(&candidate_id),
         "recursive finalization must request missing trigger body/cert immediately"
     );
 
@@ -1076,7 +1295,7 @@ fn test_out_of_order_finalized_delivery_emits_when_body_arrives_late_and_dedups(
         "on_block_committed must stay suppressed in out-of-order mode"
     );
     assert!(
-        fixture.processor.requested_candidates.is_empty(),
+        fixture.processor.requested_candidates().is_empty(),
         "request bookkeeping must clear once the missing body arrives"
     );
 
@@ -1111,24 +1330,26 @@ fn test_out_of_order_mode_does_not_run_commit_chain_recovery_for_missing_body() 
         certificate: make_test_final_cert(slot, block_hash),
     };
     fixture.processor.handle_block_finalized(event);
+    // Drain the deferred `request_candidate` bounce onto SXMAIN.
+    fixture.run_pending_tasks();
 
     assert!(
-        fixture.processor.finalized_pending_body.contains_key(&finalized_id),
+        fixture.processor.consensus.finalized_pending_body_contains(&finalized_id),
         "finalization should be buffered until body arrival"
     );
     assert!(
-        !fixture.processor.received_candidates.contains_key(&finalized_id),
+        !fixture.processor.candidate_book().contains_received(&finalized_id),
         "finalized-driven mode must not seed stubs for missing bodies"
     );
     assert!(
-        fixture.processor.requested_candidates.contains_key(&finalized_id),
+        fixture.processor.requested_candidates().contains_key(&finalized_id),
         "missing finalized trigger body must schedule a repair request"
     );
 
     // Periodic scheduler path should also avoid candidate recovery.
     fixture.processor.check_all();
     assert!(
-        fixture.processor.requested_candidates.contains_key(&finalized_id),
+        fixture.processor.requested_candidates().contains_key(&finalized_id),
         "check_all must keep the pending repair tracked until body arrival"
     );
 }
@@ -1237,6 +1458,9 @@ fn test_on_certificate_relays_and_caches_skip_certificate_once() {
 
     // First application should store + relay + cache
     fixture.processor.on_certificate(1, tl_cert.clone());
+    // SXMAIN async-DB-results registry: drain so the skip persist continuation runs
+    // (relay + cache happen in the continuation post-migration).
+    fixture.drain_pending_async_db_results();
 
     let actions = fixture.drain_receiver_actions();
     let send_cert_count =
@@ -1265,6 +1489,7 @@ fn test_on_certificate_relays_and_caches_skip_certificate_once() {
 
     // Second application should be ignored (already have skip certificate), so no relay/caching
     fixture.processor.on_certificate(1, tl_cert);
+    fixture.drain_pending_async_db_results();
     let actions2 = fixture.drain_receiver_actions();
     assert!(
         !actions2.iter().any(|a| matches!(a, ReceiverAction::SendCertificate { .. })),
@@ -1286,6 +1511,8 @@ fn test_future_certificate_is_not_rejected_like_cpp() {
         build_skip_certificate_tl(&SessionId::default(), &fixture.nodes, slot, &[0, 1, 2]);
 
     fixture.processor.on_certificate(1, tl_cert);
+    // Skip persist + relay are async (registry continuation); drain before asserting.
+    fixture.drain_pending_async_db_results();
 
     assert!(
         fixture.processor.simplex_state.has_skip_certificate(SlotIndex::new(slot)),
@@ -1305,10 +1532,10 @@ fn test_future_certificate_is_not_rejected_like_cpp() {
 }
 
 // ============================================================================
-// TN-1034 SIMPLEX-DOS-HARDENING-1 — bad-signature peer-ban tests
+// Bad-signature peer-ban tests
 // ============================================================================
 
-/// TN-1034 / NODE-75: a certificate that fails `Certificate::from_tl` verification
+/// A certificate that fails `Certificate::from_tl` verification
 /// (e.g. signed against the wrong session) must trigger a temporary peer ban for
 /// the source via `receiver.ban_source_for_bad_signature(source_idx)`.
 ///
@@ -1360,7 +1587,7 @@ fn test_on_certificate_bad_signature_triggers_temporary_ban() {
     );
 }
 
-/// TN-1034 / NODE-75: well-signed certificates must NOT result in peer-ban side
+/// Well-signed certificates must NOT result in peer-ban side
 /// effects, even if dispatched repeatedly. This guards against false-positive
 /// bans during legitimate standstill rebroadcasts.
 #[test]
@@ -1409,6 +1636,9 @@ fn test_handle_finalization_reached_caches_final_certificate_for_standstill() {
 
     fixture.processor.handle_finalization_reached(event);
 
+    // Persist + cache + relay are async (registry continuation); drain before asserting.
+    fixture.drain_pending_async_db_results();
+
     let actions = fixture.drain_receiver_actions();
     assert!(
         actions.iter().any(|a| matches!(
@@ -1448,14 +1678,19 @@ fn test_handle_notarization_reached_persists_before_relay() {
 
     fixture.processor.handle_notarization_reached(event);
 
+    // Drain the SXMAIN async-DB-results registry: storage thread completes the
+    // notar persist, registry continuation runs broadcast + cache.
+    fixture.drain_pending_async_db_results();
+
     assert!(
         fixture
             .processor
-            .db
+            .database
+            .db()
             .load_notar_cert_by_id(&candidate_id, Duration::from_secs(1))
             .expect("notar cert lookup must succeed")
             .is_some(),
-        "notar cert must be persisted in DB by the time handler returns"
+        "notar cert must be persisted in DB after the registry continuation runs"
     );
 
     let actions = fixture.drain_receiver_actions();
@@ -1484,14 +1719,19 @@ fn test_handle_finalization_reached_persists_before_relay() {
 
     fixture.processor.handle_finalization_reached(event);
 
+    // Drain the SXMAIN async-DB-results registry: storage thread completes the
+    // final persist, registry continuation runs broadcast + cache + standstill update.
+    fixture.drain_pending_async_db_results();
+
     assert!(
         fixture
             .processor
-            .db
+            .database
+            .db()
             .load_final_cert_by_id(&candidate_id, Duration::from_secs(1))
             .expect("final cert lookup must succeed")
             .is_some(),
-        "final cert must be persisted in DB by the time handler returns"
+        "final cert must be persisted in DB after the registry continuation runs"
     );
 
     let actions = fixture.drain_receiver_actions();
@@ -1517,14 +1757,19 @@ fn test_handle_skip_certificate_reached_persists_before_relay() {
 
     fixture.processor.handle_skip_certificate_reached(event);
 
+    // Drain the SXMAIN async-DB-results registry: storage thread completes the
+    // skip persist, registry continuation runs broadcast + cache.
+    fixture.drain_pending_async_db_results();
+
     assert!(
         fixture
             .processor
-            .db
+            .database
+            .db()
             .load_skip_cert_by_slot(slot, Duration::from_secs(1))
             .expect("skip cert lookup must succeed")
             .is_some(),
-        "skip cert must be persisted in DB by the time handler returns"
+        "skip cert must be persisted in DB after the registry continuation runs"
     );
 
     let actions = fixture.drain_receiver_actions();
@@ -1534,7 +1779,7 @@ fn test_handle_skip_certificate_reached_persists_before_relay() {
     );
 }
 
-/// Regression for TN-1386: do not prune the seqno-keyed callback dedup while
+/// Regression: do not prune the seqno-keyed callback dedup while
 /// old `received_candidates` are still retained.
 ///
 /// The original panic happened after `cleanup_old_slots` pruned the slot-keyed
@@ -1551,7 +1796,7 @@ fn test_cleanup_old_slots_keeps_seqno_dedup_while_received_candidates_are_retain
 
     let recording = RecordingListener::new();
     let listener: Arc<dyn consensus_common::SessionListener + Send + Sync> = recording.clone();
-    fixture.processor.listener = Arc::downgrade(&listener);
+    fixture.processor.set_listener_for_test(Arc::downgrade(&listener));
 
     let old_slot = SlotIndex::new(10);
     let old_hash = UInt256::from([0xAA; 32]);
@@ -1565,7 +1810,6 @@ fn test_cleanup_old_slots_keeps_seqno_dedup_while_received_candidates_are_retain
     let received = ReceivedCandidate {
         slot: old_slot,
         source_idx: ValidatorIndex::new(0),
-        candidate_id_hash: old_hash.clone(),
         candidate_hash_data_bytes: vec![1, 2, 3],
         block_id: old_block_id.clone(),
         root_hash: old_block_id.root_hash.clone(),
@@ -1578,12 +1822,16 @@ fn test_cleanup_old_slots_keeps_seqno_dedup_while_received_candidates_are_retain
         parent_id: None,
     };
 
-    fixture.processor.finalized_delivery_sent.insert(old_candidate_id.clone());
-    fixture.processor.finalized_delivery_sent_seqno.insert(
+    fixture.processor.consensus.insert_finalized_delivery_sent(old_candidate_id.clone());
+    fixture.processor.consensus.insert_finalized_delivery_sent_seqno(
         old_block_id.seq_no(),
-        FinalizedSeqnoRecord { slot: old_slot, block_id: old_block_id.clone() },
+        old_slot,
+        old_block_id.clone(),
     );
-    fixture.processor.received_candidates.insert(old_candidate_id.clone(), received.clone());
+    fixture
+        .processor
+        .candidate_book_mut()
+        .insert_received(old_candidate_id.clone(), received.clone());
 
     // cleanup_old_slots(MAX_HISTORY_SLOTS) computes up_to_slot = 1, so slot=0
     // entries would be the only ones cleaned. Using slot=10 above guarantees the
@@ -1591,17 +1839,17 @@ fn test_cleanup_old_slots_keeps_seqno_dedup_while_received_candidates_are_retain
     fixture.processor.cleanup_old_slots(SlotIndex::new(MAX_HISTORY_SLOTS + old_slot.value() + 1));
 
     assert!(
-        !fixture.processor.finalized_delivery_sent.contains(&old_candidate_id),
+        !fixture.processor.consensus.finalized_delivery_sent_contains(&old_candidate_id),
         "pre-existing slot-keyed dedup pruning must continue to work"
     );
     assert!(
-        fixture.processor.received_candidates.contains_key(&old_candidate_id),
+        fixture.processor.candidate_book().contains_received(&old_candidate_id),
         "old received candidates are still retained today; pruning seqno dedup before this \
          metadata is gone would allow duplicate callback emission"
     );
     assert!(
-        fixture.processor.finalized_delivery_sent_seqno.contains_key(&old_block_id.seq_no()),
-        "TN-1386: seqno-keyed dedup must remain while old candidate metadata remains reachable"
+        fixture.processor.consensus.finalized_delivery_sent_seqno_contains(old_block_id.seq_no()),
+        "seqno-keyed dedup must remain while old candidate metadata remains reachable"
     );
 
     let mut complete = true;
@@ -1625,10 +1873,10 @@ fn test_cleanup_old_slots_keeps_seqno_dedup_while_received_candidates_are_retain
         drain_finalized_events(&recording).is_empty(),
         "idempotent re-entry after slot-keyed cleanup must not emit a second finalized callback"
     );
-    assert!(fixture.processor.finalized_delivery_sent.contains(&old_candidate_id));
+    assert!(fixture.processor.consensus.finalized_delivery_sent_contains(&old_candidate_id));
 }
 
-/// Regression for TN-1386: `try_emit_recursive_finalized_callback` must treat a
+/// Regression: `try_emit_recursive_finalized_callback` must treat a
 /// second emit attempt for the **same** `block_id` at the same seqno as
 /// idempotent (no panic, no double-callback) and only assert when a
 /// **different** `block_id` would be reported for an already-delivered seqno.
@@ -1652,18 +1900,18 @@ fn test_try_emit_recursive_finalized_callback_idempotent_on_same_block_id() {
     };
 
     // Seed the seqno-dedup map as if the callback already fired once.
-    fixture
-        .processor
-        .finalized_delivery_sent_seqno
-        .insert(block_id.seq_no(), FinalizedSeqnoRecord { slot, block_id: block_id.clone() });
+    fixture.processor.consensus.insert_finalized_delivery_sent_seqno(
+        block_id.seq_no(),
+        slot,
+        block_id.clone(),
+    );
     // Simulate that the slot-keyed dedup was pruned by cleanup_old_slots —
     // i.e. `finalized_delivery_sent` does NOT contain this candidate_id.
-    assert!(!fixture.processor.finalized_delivery_sent.contains(&candidate_id));
+    assert!(!fixture.processor.consensus.finalized_delivery_sent_contains(&candidate_id));
 
     let received = ReceivedCandidate {
         slot,
         source_idx: ValidatorIndex::new(0),
-        candidate_id_hash: hash.clone(),
         candidate_hash_data_bytes: vec![1, 2, 3],
         block_id: block_id.clone(),
         root_hash: block_id.root_hash.clone(),
@@ -1701,7 +1949,7 @@ fn test_try_emit_recursive_finalized_callback_idempotent_on_same_block_id() {
 
     assert!(complete, "idempotent re-entry must not flip the `complete` flag back to false");
     assert!(
-        fixture.processor.finalized_delivery_sent.contains(&candidate_id),
+        fixture.processor.consensus.finalized_delivery_sent_contains(&candidate_id),
         "idempotent path must re-seed the slot-keyed dedup so subsequent walks short-circuit early"
     );
 }
@@ -1737,7 +1985,17 @@ fn test_update_standstill_after_final_cert_updates_ingress_when_cleanup_is_skipp
 fn test_recovery_set_first_non_finalized_slot_updates_receiver_ingress() {
     let mut fixture = TestFixture::new(4);
 
-    fixture.processor.recovery_set_first_non_finalized_slot(crate::block::SlotIndex::new(9));
+    // A persisted finalized block at slot 8 makes recovery set the finalized
+    // boundary to slot 9 (max finalized + 1), which must synchronize the
+    // receiver ingress cursor to the restored frontier.
+    let mut bootstrap = empty_bootstrap();
+    bootstrap.finalized_blocks = vec![crate::database::FinalizedBlockRecord {
+        candidate_id: make_candidate_id(8, 0x88),
+        block_id: make_block_id(108),
+        parent: None,
+        is_final: true,
+    }];
+    run_apply_bootstrap(&mut fixture, bootstrap);
 
     let actions = fixture.drain_receiver_actions();
     assert!(
@@ -1748,37 +2006,47 @@ fn test_recovery_set_first_non_finalized_slot_updates_receiver_ingress() {
         actions.iter().any(|a| matches!(a, ReceiverAction::SetIngressProgressSlot { slot: 9 })),
         "recovery must synchronize receiver ingress progress cursor with restored frontier"
     );
+    assert_eq!(
+        fixture.processor.simplex_state.get_first_non_finalized_slot(),
+        crate::block::SlotIndex::new(9),
+        "finalized boundary must be max finalized slot + 1"
+    );
 }
 
 #[test]
 fn test_recovery_finalize_parent_chain_sets_base_for_current_frontier() {
     let mut fixture = TestFixture::new(4);
 
-    // Simulate post-replay frontier movement: first non-finalized is slot 3.
-    fixture.processor.simplex_state.set_first_non_finalized_slot(crate::block::SlotIndex::new(3));
-
-    // Provide finalized parent metadata at slot 2, which recovery should use as base.
-    let parent_id = RawCandidateId { slot: SlotIndex::new(2), hash: UInt256::from([0x44; 32]) };
-    insert_received_candidate(
-        &mut fixture.processor,
-        &parent_id,
-        BlockIdExt::default(),
-        false,
-        Some(RawCandidateId { slot: SlotIndex::new(1), hash: UInt256::from([0x33; 32]) }),
-    );
-
-    fixture.processor.recovery_finalize_parent_chain();
+    // Persisted finalized prefix ending at slot 2 (rooted at slot 1). Recovery
+    // sets the boundary to slot 3 and step 12 (finalize_parent_chain) must seed
+    // available_base for the current first_non_finalized slot from the slot-2
+    // finalized record.
+    let slot1 = make_candidate_id(1, 0x33);
+    let slot2 = make_candidate_id(2, 0x44);
+    let mut bootstrap = empty_bootstrap();
+    bootstrap.finalized_blocks = vec![
+        crate::database::FinalizedBlockRecord {
+            candidate_id: slot1.clone(),
+            block_id: make_block_id(101),
+            parent: None,
+            is_final: true,
+        },
+        crate::database::FinalizedBlockRecord {
+            candidate_id: slot2.clone(),
+            block_id: make_block_id(102),
+            parent: Some(slot1.clone()),
+            is_final: true,
+        },
+    ];
+    run_apply_bootstrap(&mut fixture, bootstrap);
 
     let parent = fixture
         .processor
         .simplex_state
-        .get_available_parent(&fixture.processor.description, SlotIndex::new(3));
+        .get_available_parent(fixture.processor.runtime.description(), SlotIndex::new(3));
     assert_eq!(
         parent,
-        Some(crate::block::CandidateParentInfo {
-            slot: SlotIndex::new(2),
-            hash: UInt256::from([0x44; 32]),
-        }),
+        Some(crate::block::CandidateParentInfo { slot: slot2.slot, hash: slot2.hash.clone() }),
         "recovery must seed available_base for the current first_non_finalized slot"
     );
 }
@@ -1816,7 +2084,7 @@ fn test_skip_certificate_cancels_stale_candidate_request_repairs() {
 
     fixture.processor.request_candidate(slot, block_hash.clone(), Some(Duration::from_secs(1)));
     assert!(
-        fixture.processor.requested_candidates.contains_key(&candidate_id),
+        fixture.processor.requested_candidates().contains_key(&candidate_id),
         "request should be scheduled before skip"
     );
 
@@ -1825,7 +2093,7 @@ fn test_skip_certificate_cancels_stale_candidate_request_repairs() {
     fixture.processor.on_certificate(1, tl_cert);
 
     assert!(
-        !fixture.processor.requested_candidates.contains_key(&candidate_id),
+        !fixture.processor.requested_candidates().contains_key(&candidate_id),
         "skip must cancel scheduled requestCandidate repairs for the skipped slot"
     );
 
@@ -1859,11 +2127,11 @@ fn test_handle_notarization_reached_requests_missing_candidate_body() {
 
     // Ensure the candidate body is missing.
     assert!(
-        !fixture.processor.received_candidates.contains_key(&candidate_id),
+        !fixture.processor.candidate_book().contains_received(&candidate_id),
         "test setup: candidate body must be missing"
     );
     assert!(
-        !fixture.processor.requested_candidates.contains_key(&candidate_id),
+        !fixture.processor.requested_candidates().contains_key(&candidate_id),
         "test setup: candidate must not be pre-requested"
     );
 
@@ -1885,9 +2153,12 @@ fn test_handle_notarization_reached_requests_missing_candidate_body() {
 
     // Act: should schedule requestCandidate for missing body.
     fixture.processor.handle_notarization_reached(event);
+    // `request_candidate` is a deferred ConsensusBackend effect bounced
+    // onto SXMAIN; drain the queue so the real request runs before asserting.
+    fixture.run_pending_tasks();
 
     assert!(
-        fixture.processor.requested_candidates.contains_key(&candidate_id),
+        fixture.processor.requested_candidates().contains_key(&candidate_id),
         "expected SessionProcessor to schedule requestCandidate for missing notarized block body"
     );
 }
@@ -1982,7 +2253,7 @@ fn test_batch_finalization_notarized_parents_finalized_descendant() {
 
     let recording = RecordingListener::new();
     let listener: Arc<dyn consensus_common::SessionListener + Send + Sync> = recording.clone();
-    fixture.processor.listener = Arc::downgrade(&listener);
+    fixture.processor.set_listener_for_test(Arc::downgrade(&listener));
 
     let (leader_1, id_1, bcast_1) = make_signed_block_broadcast(&fixture, 31, vec![1u8, 2, 3]);
     fixture.processor.on_candidate_received(leader_1, bcast_1, None);
@@ -1997,22 +2268,22 @@ fn test_batch_finalization_notarized_parents_finalized_descendant() {
 
     let block_1 = fixture
         .processor
-        .received_candidates
-        .get(&id_1)
+        .candidate_book()
+        .received(&id_1)
         .expect("slot 31 candidate must exist")
         .block_id
         .clone();
     let block_2 = fixture
         .processor
-        .received_candidates
-        .get(&id_2)
+        .candidate_book()
+        .received(&id_2)
         .expect("slot 32 candidate must exist")
         .block_id
         .clone();
     let block_3 = fixture
         .processor
-        .received_candidates
-        .get(&id_3)
+        .candidate_book()
+        .received(&id_3)
         .expect("slot 33 candidate must exist")
         .block_id
         .clone();
@@ -2054,11 +2325,11 @@ fn test_batch_finalization_notarized_parents_finalized_descendant() {
         "trigger block must be emitted in FinalCert mode (is_final=true)"
     );
 
-    assert!(fixture.processor.finalized_blocks.contains(&id_1));
-    assert!(fixture.processor.finalized_blocks.contains(&id_2));
-    assert!(fixture.processor.finalized_blocks.contains(&id_3));
+    assert!(fixture.processor.consensus.is_finalized_block(&id_1));
+    assert!(fixture.processor.consensus.is_finalized_block(&id_2));
+    assert!(fixture.processor.consensus.is_finalized_block(&id_3));
     assert!(
-        fixture.processor.finalized_pending_body.is_empty(),
+        fixture.processor.consensus.finalized_pending_body_is_empty(),
         "completed recursive chain must not stay in pending journal"
     );
 }
@@ -2095,7 +2366,7 @@ fn test_slot_entry_structure_simplified() {
     let slot = SlotIndex::new(5);
 
     // Initially no slot entry exists
-    assert!(fixture.processor.slots.get(&slot).is_none());
+    assert!(fixture.processor.runtime.slot_entry(slot).is_none());
 }
 
 /// Test that slot_entry_mut creates entry with runtime on first access
@@ -2106,10 +2377,11 @@ fn test_slot_entry_mut_creates_runtime() {
     let slot = SlotIndex::new(7);
 
     // Access runtime (should create entry)
-    fixture.processor.slot_runtime_mut(slot).pending_generate = true;
+    let now = fixture.processor.now();
+    fixture.processor.runtime.slot_runtime_mut(slot, now).pending_generate = true;
 
     // Verify entry exists with runtime
-    let entry = fixture.processor.slots.get(&slot);
+    let entry = fixture.processor.runtime.slot_entry(slot);
     assert!(entry.is_some(), "Slot entry should exist after slot_runtime_mut");
     assert!(entry.unwrap().runtime.is_some(), "Runtime should be created");
     assert!(
@@ -2126,14 +2398,15 @@ fn test_slot_runtime_collation_tracking() {
     let slot = SlotIndex::new(3);
 
     // Set collation state
-    fixture.processor.slot_set_pending_generate(slot, true);
-    assert!(fixture.processor.slot_is_pending_generate(slot));
+    let now = fixture.processor.now();
+    fixture.processor.runtime.set_pending_generate(slot, true, now);
+    assert!(fixture.processor.runtime.is_pending_generate(slot));
 
-    fixture.processor.slot_set_generated(slot, true);
-    assert!(fixture.processor.slot_is_generated(slot));
+    fixture.processor.runtime.set_generated(slot, true, now);
+    assert!(fixture.processor.runtime.is_generated(slot));
 
-    fixture.processor.slot_set_sent_generated(slot, true);
-    assert!(fixture.processor.slot_is_sent_generated(slot));
+    fixture.processor.runtime.set_sent_generated(slot, true, now);
+    assert!(fixture.processor.runtime.is_sent_generated(slot));
 }
 
 /// Test that slot_started_at tracks when slot processing began
@@ -2144,9 +2417,10 @@ fn test_slot_started_at_tracking() {
     let slot = SlotIndex::new(10);
 
     // Access slot to create runtime with default start time
-    fixture.processor.slot_runtime_mut(slot);
+    let now = fixture.processor.now();
+    fixture.processor.runtime.slot_runtime_mut(slot, now);
 
-    let started_at = fixture.processor.slot_started_at(slot);
+    let started_at = fixture.processor.runtime.started_at(slot, now);
     let now = fixture.description.get_time();
 
     // Started time should be close to now (within 1 second)
@@ -2164,7 +2438,7 @@ fn test_candidate_decision_fail_drops_late_failure_for_finalized_block() {
     let candidate_id = RawCandidateId { slot, hash: UInt256::rand() };
 
     // Pretend we've already finalized past this block seqno.
-    fixture.processor.finalized_head_seqno = Some(100);
+    fixture.processor.consensus.set_finalized_head_seqno(Some(100));
 
     // Create a non-empty RawCandidate with seqno <= finalized_head_seqno.
     let block_id =
@@ -2185,7 +2459,7 @@ fn test_candidate_decision_fail_drops_late_failure_for_finalized_block() {
         vec![],
     );
 
-    fixture.processor.pending_validations.insert(
+    fixture.processor.validation.insert_pending_validation(
         candidate_id.clone(),
         PendingValidation {
             raw_candidate,
@@ -2194,17 +2468,17 @@ fn test_candidate_decision_fail_drops_late_failure_for_finalized_block() {
             source_idx: ValidatorIndex::new(0),
         },
     );
-    fixture.processor.pending_approve.insert(candidate_id.clone());
-    fixture.processor.validation_attempt_map.insert(candidate_id.clone(), 0);
+    fixture.processor.validation.insert_pending_approve(candidate_id.clone());
+    fixture.processor.validation.insert_validation_attempt(candidate_id.clone(), 0);
 
     fixture.processor.candidate_decision_fail(slot, candidate_id.clone(), error!("boom"));
 
     // Must be dropped (no retry scheduling, no rejection bookkeeping).
-    assert!(!fixture.processor.pending_validations.contains_key(&candidate_id));
-    assert!(!fixture.processor.pending_approve.contains(&candidate_id));
-    assert!(!fixture.processor.validation_attempt_map.contains_key(&candidate_id));
-    assert!(!fixture.processor.pending_reject.contains_key(&candidate_id));
-    assert!(!fixture.processor.rejected.contains(&candidate_id));
+    assert!(!fixture.processor.validation.pending_validation_contains(&candidate_id));
+    assert!(!fixture.processor.validation.pending_approve_contains(&candidate_id));
+    assert!(!fixture.processor.validation.validation_attempt_contains(&candidate_id));
+    assert!(!fixture.processor.validation.pending_reject_contains(&candidate_id));
+    assert!(!fixture.processor.validation.is_rejected(&candidate_id));
 }
 
 // ============================================================================
@@ -2251,7 +2525,7 @@ fn make_test_empty_candidate_with_block(
     )
 }
 
-/// Helper: insert a minimal ReceivedCandidate into the processor's received_candidates map.
+/// Helper: insert a minimal ReceivedCandidate into the processor's candidate book.
 fn insert_received_candidate(
     processor: &mut SessionProcessor,
     candidate_id: &RawCandidateId,
@@ -2277,12 +2551,11 @@ fn insert_received_candidate_with_gen_utime_ms(
     parent_id: Option<RawCandidateId>,
     gen_utime_ms: Option<u64>,
 ) {
-    processor.received_candidates.insert(
+    processor.candidate_book_mut().insert_received(
         candidate_id.clone(),
         ReceivedCandidate {
             slot: candidate_id.slot,
             source_idx: ValidatorIndex::new(0),
-            candidate_id_hash: candidate_id.hash.clone(),
             candidate_hash_data_bytes: Vec::new(),
             block_id: block_id.clone(),
             root_hash: block_id.root_hash.clone(),
@@ -2306,7 +2579,7 @@ fn insert_pending_validation(
     raw_candidate: crate::block::RawCandidate,
     time: SystemTime,
 ) {
-    processor.pending_validations.insert(
+    processor.validation.insert_pending_validation(
         candidate_id.clone(),
         PendingValidation {
             raw_candidate,
@@ -2370,7 +2643,7 @@ fn test_check_validation_forwards_candidate_with_notarized_parent() {
     // Before notarization the candidate must stay blocked by WaitForParent.
     fixture.processor.check_validation();
     assert!(
-        !fixture.processor.pending_approve.contains(&child_id),
+        !fixture.processor.validation.pending_approve_contains(&child_id),
         "candidate must not be forwarded when parent is not notarized"
     );
 
@@ -2384,7 +2657,7 @@ fn test_check_validation_forwards_candidate_with_notarized_parent() {
     // After notarization: check_validation should forward the candidate
     fixture.processor.check_validation();
     assert!(
-        fixture.processor.pending_approve.contains(&child_id),
+        fixture.processor.validation.pending_approve_contains(&child_id),
         "candidate must be forwarded to validation when parent is notarized"
     );
 }
@@ -2407,11 +2680,11 @@ fn test_check_validation_blocks_candidate_with_non_notarized_parent() {
     // Parent is NOT notarized — candidate must stay in pending_validations.
     fixture.processor.check_validation();
     assert!(
-        !fixture.processor.pending_approve.contains(&child_id),
+        !fixture.processor.validation.pending_approve_contains(&child_id),
         "candidate must NOT be forwarded when parent slot is not notarized"
     );
     assert!(
-        fixture.processor.pending_validations.contains_key(&child_id),
+        fixture.processor.validation.pending_validation_contains(&child_id),
         "candidate must remain in pending_validations"
     );
 }
@@ -2430,7 +2703,7 @@ fn test_check_validation_forwards_genesis_candidate_without_parent() {
     // Genesis (no parent) should always be forwarded
     fixture.processor.check_validation();
     assert!(
-        fixture.processor.pending_approve.contains(&candidate_id),
+        fixture.processor.validation.pending_approve_contains(&candidate_id),
         "genesis candidate (no parent) must be forwarded unconditionally"
     );
 }
@@ -2471,11 +2744,11 @@ fn test_check_validation_rejects_genesis_parent_candidate_after_skips_and_finali
 
     fixture.processor.check_validation();
     assert!(
-        fixture.processor.rejected.contains(&child_id),
+        fixture.processor.validation.is_rejected(&child_id),
         "post-skip candidate with parent_id=None must be rejected by strict C++ WaitForParent parity"
     );
     assert!(
-        !fixture.processor.pending_validations.contains_key(&child_id),
+        !fixture.processor.validation.pending_validation_contains(&child_id),
         "rejected post-skip candidate must be removed from pending_validations"
     );
 }
@@ -2523,7 +2796,7 @@ fn test_check_validation_auto_approves_empty_blocks() {
     // C++ block-validator.cpp accepts when block == event->state->as_normal().
     fixture.processor.check_validation();
     assert!(
-        !fixture.processor.pending_validations.contains_key(&child_id),
+        !fixture.processor.validation.pending_validation_contains(&child_id),
         "empty block must be approved when referenced block matches parent normal tip"
     );
 }
@@ -2569,11 +2842,11 @@ fn test_empty_block_accepted_when_referenced_block_matches_parent() {
 
     fixture.processor.check_validation();
     assert!(
-        !fixture.processor.pending_validations.contains_key(&child_id),
+        !fixture.processor.validation.pending_validation_contains(&child_id),
         "empty block must be approved when referenced block matches parent normal tip"
     );
     assert!(
-        fixture.processor.approved.contains_key(&child_id),
+        fixture.processor.validation.approved_contains(&child_id),
         "empty block must appear in approved set after matching reference check"
     );
 }
@@ -2618,11 +2891,11 @@ fn test_empty_block_rejected_when_referenced_block_differs() {
     // does not match event->state->as_normal(). Rust must do the same.
     fixture.processor.check_validation();
     assert!(
-        fixture.processor.rejected.contains(&child_id),
+        fixture.processor.validation.is_rejected(&child_id),
         "empty block must be rejected when referenced block differs from parent normal tip"
     );
     assert!(
-        !fixture.processor.approved.contains_key(&child_id),
+        !fixture.processor.validation.approved_contains(&child_id),
         "rejected empty block must not appear in approved set"
     );
 }
@@ -2640,11 +2913,11 @@ fn test_check_validation_skips_already_approved_candidates() {
 
     // Pre-mark as approved (value is (validity_start_time, signature_payload))
     let dummy_payload = consensus_common::ConsensusCommonFactory::create_block_payload(vec![]);
-    fixture.processor.approved.insert(candidate_id.clone(), (time, dummy_payload));
+    fixture.processor.validation.insert_approved(candidate_id.clone(), (time, dummy_payload));
 
     fixture.processor.check_validation();
     assert!(
-        !fixture.processor.pending_approve.contains(&candidate_id),
+        !fixture.processor.validation.pending_approve_contains(&candidate_id),
         "already-approved candidate must not be re-submitted for validation"
     );
 }
@@ -2661,11 +2934,11 @@ fn test_check_validation_skips_already_rejected_candidates() {
     insert_pending_validation(&mut fixture.processor, &candidate_id, raw_candidate, time);
 
     // Pre-mark as rejected
-    fixture.processor.rejected.insert(candidate_id.clone());
+    fixture.processor.validation.insert_rejected(candidate_id.clone());
 
     fixture.processor.check_validation();
     assert!(
-        !fixture.processor.pending_approve.contains(&candidate_id),
+        !fixture.processor.validation.pending_approve_contains(&candidate_id),
         "already-rejected candidate must not be re-submitted for validation"
     );
 }
@@ -2682,14 +2955,14 @@ fn test_check_validation_skips_pending_approve_candidates() {
     insert_pending_validation(&mut fixture.processor, &candidate_id, raw_candidate, time);
 
     // Pre-mark as pending_approve (already being validated)
-    fixture.processor.pending_approve.insert(candidate_id.clone());
+    fixture.processor.validation.insert_pending_approve(candidate_id.clone());
 
     // check_validation should not double-insert
     fixture.processor.check_validation();
 
     // validation_attempt_map should NOT have been updated (try_approve_block not called)
     assert!(
-        !fixture.processor.validation_attempt_map.contains_key(&candidate_id),
+        !fixture.processor.validation.validation_attempt_contains(&candidate_id),
         "candidate already in pending_approve must not be re-submitted"
     );
 }
@@ -2720,11 +2993,11 @@ fn test_check_validation_chains_notarized_parent_to_descendant() {
     // - B should wait until parent slot A is notarized
     fixture.processor.check_validation();
     assert!(
-        fixture.processor.pending_approve.contains(&id_a),
+        fixture.processor.validation.pending_approve_contains(&id_a),
         "genesis candidate A must be forwarded"
     );
     assert!(
-        !fixture.processor.pending_approve.contains(&id_b),
+        !fixture.processor.validation.pending_approve_contains(&id_b),
         "candidate B must wait until parent slot is notarized"
     );
 
@@ -2734,7 +3007,7 @@ fn test_check_validation_chains_notarized_parent_to_descendant() {
     // Second check_validation: B should now pass
     fixture.processor.check_validation();
     assert!(
-        fixture.processor.pending_approve.contains(&id_b),
+        fixture.processor.validation.pending_approve_contains(&id_b),
         "candidate B must be forwarded after parent slot is notarized"
     );
 }
@@ -2762,7 +3035,7 @@ fn test_check_validation_wait_for_parent_requires_gap_skip_certificates() {
     notarize_slot(&mut fixture, parent_slot, &parent_hash);
     fixture.processor.check_validation();
     assert!(
-        !fixture.processor.pending_approve.contains(&child_id),
+        !fixture.processor.validation.pending_approve_contains(&child_id),
         "candidate must be blocked until all intermediate slots are skip-certified"
     );
 
@@ -2770,7 +3043,7 @@ fn test_check_validation_wait_for_parent_requires_gap_skip_certificates() {
     skip_slot(&mut fixture, SlotIndex::new(1));
     fixture.processor.check_validation();
     assert!(
-        !fixture.processor.pending_approve.contains(&child_id),
+        !fixture.processor.validation.pending_approve_contains(&child_id),
         "candidate must remain blocked when gap skip coverage is partial"
     );
 
@@ -2778,7 +3051,7 @@ fn test_check_validation_wait_for_parent_requires_gap_skip_certificates() {
     skip_slot(&mut fixture, SlotIndex::new(2));
     fixture.processor.check_validation();
     assert!(
-        fixture.processor.pending_approve.contains(&child_id),
+        fixture.processor.validation.pending_approve_contains(&child_id),
         "candidate must be forwarded once parent and full skip-gap readiness are satisfied"
     );
 }
@@ -2804,11 +3077,11 @@ fn test_check_validation_wait_for_parent_rejects_parent_hash_mismatch() {
     fixture.processor.check_validation();
 
     assert!(
-        fixture.processor.rejected.contains(&child_id),
+        fixture.processor.validation.is_rejected(&child_id),
         "candidate must be rejected when parent hash mismatches notarized block"
     );
     assert!(
-        !fixture.processor.pending_validations.contains_key(&child_id),
+        !fixture.processor.validation.pending_validation_contains(&child_id),
         "rejected candidate must be removed from pending_validations"
     );
 }
@@ -2819,7 +3092,7 @@ fn test_check_validation_blocks_skipped_frontier_parent_even_with_bridge_head_se
 
     // Simulate bridge-side applied head already at seqno=1 while slot 0 in this
     // session ended with a skip certificate (no notarized block hash for slot 0).
-    fixture.processor.accepted_normal_head_seqno = 1;
+    fixture.processor.consensus.set_accepted_normal_head_seqno(1);
     skip_slot(&mut fixture, SlotIndex::new(0));
 
     let parent_id = RawCandidateId { slot: SlotIndex::new(0), hash: UInt256::from([0x44; 32]) };
@@ -2832,12 +3105,12 @@ fn test_check_validation_blocks_skipped_frontier_parent_even_with_bridge_head_se
 
     fixture.processor.check_validation();
     assert!(
-        !fixture.processor.pending_approve.contains(&child_id),
+        !fixture.processor.validation.pending_approve_contains(&child_id),
         "strict C++ parity must not forward skipped-frontier bypass candidates \
          even when seqno matches accepted_normal_head_seqno + 1"
     );
     assert!(
-        fixture.processor.pending_validations.contains_key(&child_id),
+        fixture.processor.validation.pending_validation_contains(&child_id),
         "blocked skipped-frontier candidate must remain pending until parent readiness changes"
     );
 }
@@ -2873,18 +3146,18 @@ fn test_on_candidate_received_non_empty_does_not_wait_for_unresolved_ancestor_ch
     fixture.processor.on_candidate_received(leader_source, broadcast, None);
 
     assert!(
-        fixture.processor.pending_validations.contains_key(&child_id),
+        fixture.processor.validation.pending_validation_contains(&child_id),
         "non-empty candidate must be admitted immediately even if only ancestor metadata is missing"
     );
     assert!(
-        fixture.processor.requested_candidates.is_empty(),
+        fixture.processor.requested_candidates().is_empty(),
         "non-empty admission must not trigger ancestor prefetch requests"
     );
 
     let received = fixture
         .processor
-        .received_candidates
-        .get(&child_id)
+        .candidate_book()
+        .received(&child_id)
         .expect("child candidate must be stored");
     assert!(
         received.parent_id.as_ref() == Some(&parent_id),
@@ -2913,31 +3186,36 @@ fn test_on_candidate_received_empty_waits_in_pending_validation_and_requests_mis
     fixture.processor.on_candidate_received(leader_source, broadcast, None);
 
     assert!(
-        fixture.processor.pending_validations.contains_key(&child_id),
+        fixture.processor.validation.pending_validation_contains(&child_id),
         "empty candidate must enter pending_validations immediately after ingress"
     );
     assert!(
-        fixture.processor.requested_candidates.is_empty(),
+        fixture.processor.requested_candidates().is_empty(),
         "ingress must not prefetch parent metadata before WaitForParent is satisfied"
     );
 
     notarize_slot(&mut fixture, parent_id.slot, &parent_id.hash);
     fixture.processor.check_validation();
+    // `ensure_empty_parent_tip_ready` (now on `ValidationController`) requests the
+    // missing parent through the borrowing `ValidationBackend`, which bounces the
+    // `&mut SessionProcessor` `request_candidate` call onto the task queue; flush
+    // it so the request lands, exactly as the SXMAIN loop would next iteration.
+    fixture.run_pending_tasks();
 
     assert!(
-        fixture.processor.pending_validations.contains_key(&child_id),
+        fixture.processor.validation.pending_validation_contains(&child_id),
         "empty candidate must remain pending while parent metadata is still missing"
     );
     assert!(
-        fixture.processor.requested_candidates.contains_key(&parent_id),
+        fixture.processor.requested_candidates().contains_key(&parent_id),
         "validation path must request the missing parent metadata on demand"
     );
     assert!(
-        !fixture.processor.pending_approve.contains(&child_id),
+        !fixture.processor.validation.pending_approve_contains(&child_id),
         "empty candidate must not enter pending_approve until the parent normal tip is resolvable"
     );
     assert!(
-        !fixture.processor.rejected.contains(&child_id),
+        !fixture.processor.validation.is_rejected(&child_id),
         "missing parent metadata must defer empty approval instead of rejecting it"
     );
 }
@@ -2965,7 +3243,7 @@ fn test_ensure_candidate_available_requests_even_if_slot_skipped() {
     );
 
     assert!(
-        fixture.processor.requested_candidates.contains_key(&candidate_id),
+        fixture.processor.requested_candidates().contains_key(&candidate_id),
         "resolver ensure must request body even for skipped slot"
     );
 
@@ -3036,15 +3314,15 @@ fn test_ensure_candidate_available_requests_parent_chain_when_enabled() {
     );
 
     assert!(
-        fixture.processor.requested_candidates.contains_key(&child_id),
+        fixture.processor.requested_candidates().contains_key(&child_id),
         "child must be requested"
     );
     assert!(
-        fixture.processor.requested_candidates.contains_key(&parent_id),
+        fixture.processor.requested_candidates().contains_key(&parent_id),
         "parent must be requested when include_parent_chain=true"
     );
     assert!(
-        fixture.processor.requested_candidates.contains_key(&root_id),
+        fixture.processor.requested_candidates().contains_key(&root_id),
         "root ancestor must be requested when metadata chain is available"
     );
 }
@@ -3079,15 +3357,15 @@ fn test_ensure_candidate_available_requests_immediate_parent_and_stops_on_missin
     );
 
     assert!(
-        fixture.processor.requested_candidates.contains_key(&child_id),
+        fixture.processor.requested_candidates().contains_key(&child_id),
         "target candidate must be requested"
     );
     assert!(
-        fixture.processor.requested_candidates.contains_key(&parent_id),
+        fixture.processor.requested_candidates().contains_key(&parent_id),
         "immediate parent must be requested even when parent metadata is missing"
     );
     assert_eq!(
-        fixture.processor.requested_candidates.len(),
+        fixture.processor.requested_candidates().len(),
         2,
         "traversal must stop after requesting the first missing parent metadata"
     );
@@ -3212,9 +3490,13 @@ fn test_ensure_candidate_available_deferred_retry_on_missing_mapping() {
             include_parent_chain: false,
         },
     );
+    // The controller schedules its retry through the controller queue, which
+    // bounces an immediate task onto the main queue that then arms the runtime
+    // delayed action; drain that SXMAIN hop before inspecting the timer.
+    fixture.run_pending_tasks();
 
     assert_eq!(
-        fixture.processor.delayed_actions.len(),
+        fixture.processor.runtime.delayed_actions_count(),
         1,
         "must schedule exactly one deferred retry on missing mapping"
     );
@@ -3239,7 +3521,7 @@ fn test_ensure_candidate_available_deferred_retry_on_missing_mapping() {
     fixture.processor.process_delayed_actions();
 
     assert!(
-        fixture.processor.requested_candidates.contains_key(&candidate_id),
+        fixture.processor.requested_candidates().contains_key(&candidate_id),
         "deferred retry must request the candidate once mapping becomes available"
     );
 
@@ -3277,11 +3559,15 @@ fn test_ensure_candidate_available_deferred_retry_gives_up_after_max_retries() {
             include_parent_chain: false,
         },
     );
+    // The retry is scheduled through the controller queue, which bounces an
+    // immediate task onto the main queue that arms the runtime delayed action;
+    // drain that SXMAIN hop so the timer is observable.
+    fixture.run_pending_tasks();
 
     // Repeatedly advance time and process delayed actions until retries are exhausted.
     for i in 0..RESOLVER_AVAILABILITY_MAX_RETRIES {
         assert_eq!(
-            fixture.processor.delayed_actions.len(),
+            fixture.processor.runtime.delayed_actions_count(),
             1,
             "attempt {}: must have exactly one pending deferred retry",
             i
@@ -3289,11 +3575,14 @@ fn test_ensure_candidate_available_deferred_retry_gives_up_after_max_retries() {
         let advance = RESOLVER_AVAILABILITY_RETRY_DELAY + Duration::from_millis(1);
         fixture.processor.set_time(base_time + advance * (i + 1));
         fixture.processor.process_delayed_actions();
+        // Each still-unresolved retry re-arms the next one through the same
+        // controller-queue bounce; flush it before the next count assertion.
+        fixture.run_pending_tasks();
     }
 
     // After max retries, no more deferred actions should be scheduled.
     assert!(
-        fixture.processor.delayed_actions.is_empty(),
+        fixture.processor.runtime.delayed_actions_count() == 0,
         "must not schedule more retries after exhausting max attempts"
     );
 }
@@ -3306,7 +3595,7 @@ fn test_ensure_candidate_available_deferred_retry_gives_up_after_max_retries() {
 /// cooldown checks work correctly in tests (HealthAlertState is initialized
 /// with real SystemTime::now() during SessionProcessor::new).
 fn reset_health_alert_time(processor: &mut SessionProcessor, base: SystemTime) {
-    let s = &mut processor.health_alert_state;
+    let mut s = processor.telemetry.health_alert_state_for_test();
     s.last_progress_warn = base;
     s.last_activity_warn = base;
     s.last_cert_fail_warn = base;
@@ -3332,13 +3621,17 @@ fn test_health_check_cert_verify_fail_anomaly() {
     fixture.processor.run_health_checks();
 
     // Simulate cert verify failure
-    fixture.processor.cert_verify_fails_total = 1;
+    fixture
+        .processor
+        .telemetry
+        .cert_verify_fails_total
+        .store(1, std::sync::atomic::Ordering::Relaxed);
 
     // Advance past cooldown (default 30s)
     fixture.processor.set_time(base_time + Duration::from_secs(31));
     fixture.processor.run_health_checks();
 
-    assert_eq!(fixture.processor.health_alert_state.prev_cert_verify_fails, 1);
+    assert_eq!(fixture.processor.telemetry.health_alert_state_for_test().prev_cert_verify_fails, 1);
 }
 
 #[test]
@@ -3351,12 +3644,20 @@ fn test_health_check_standstill_anomaly() {
 
     fixture.processor.run_health_checks();
 
-    fixture.processor.receiver_health_counters.standstill_triggers.store(3, Ordering::Relaxed);
+    fixture
+        .processor
+        .telemetry
+        .receiver_health_counters
+        .standstill_triggers
+        .store(3, Ordering::Relaxed);
 
     fixture.processor.set_time(base_time + Duration::from_secs(31));
     fixture.processor.run_health_checks();
 
-    assert_eq!(fixture.processor.health_alert_state.prev_standstill_triggers, 3);
+    assert_eq!(
+        fixture.processor.telemetry.health_alert_state_for_test().prev_standstill_triggers,
+        3
+    );
 }
 
 #[test]
@@ -3369,12 +3670,17 @@ fn test_health_check_candidate_giveup_anomaly() {
 
     fixture.processor.run_health_checks();
 
-    fixture.processor.receiver_health_counters.candidate_giveups.store(2, Ordering::Relaxed);
+    fixture
+        .processor
+        .telemetry
+        .receiver_health_counters
+        .candidate_giveups
+        .store(2, Ordering::Relaxed);
 
     fixture.processor.set_time(base_time + Duration::from_secs(31));
     fixture.processor.run_health_checks();
 
-    assert_eq!(fixture.processor.health_alert_state.prev_candidate_giveups, 2);
+    assert_eq!(fixture.processor.telemetry.health_alert_state_for_test().prev_candidate_giveups, 2);
 }
 
 #[test]
@@ -3388,18 +3694,26 @@ fn test_health_check_skip_vote_dominance_anomaly() {
     fixture.processor.run_health_checks();
 
     // High skip-dominant window (delta-based): should trigger skip ratio anomaly.
-    fixture.processor.votes_in_skip_total = 24;
-    fixture.processor.votes_in_notarize_total = 2;
-    fixture.processor.votes_in_finalize_total = 1;
+    fixture.processor.telemetry.votes_in_skip_total.store(24, std::sync::atomic::Ordering::Relaxed);
+    fixture
+        .processor
+        .telemetry
+        .votes_in_notarize_total
+        .store(2, std::sync::atomic::Ordering::Relaxed);
+    fixture
+        .processor
+        .telemetry
+        .votes_in_finalize_total
+        .store(1, std::sync::atomic::Ordering::Relaxed);
 
     fixture.processor.set_time(base_time + Duration::from_secs(31));
     fixture.processor.run_health_checks();
 
-    assert_eq!(fixture.processor.health_alert_state.prev_votes_in_skip, 24);
-    assert_eq!(fixture.processor.health_alert_state.prev_votes_in_notarize, 2);
-    assert_eq!(fixture.processor.health_alert_state.prev_votes_in_finalize, 1);
+    assert_eq!(fixture.processor.telemetry.health_alert_state_for_test().prev_votes_in_skip, 24);
+    assert_eq!(fixture.processor.telemetry.health_alert_state_for_test().prev_votes_in_notarize, 2);
+    assert_eq!(fixture.processor.telemetry.health_alert_state_for_test().prev_votes_in_finalize, 1);
     assert_eq!(
-        fixture.processor.health_alert_state.last_skip_ratio_warn,
+        fixture.processor.telemetry.health_alert_state_for_test().last_skip_ratio_warn,
         base_time + Duration::from_secs(31)
     );
 }
@@ -3416,17 +3730,31 @@ fn test_health_check_skip_vote_dominance_ignores_sparse_zero_denominator() {
 
     // One stream is absent in the current window, but the overall progress vote
     // stream is still healthy enough that skip traffic is not dominant.
-    fixture.processor.votes_in_skip_total = 3;
-    fixture.processor.votes_in_notarize_total = 0;
-    fixture.processor.votes_in_finalize_total = 10;
+    fixture.processor.telemetry.votes_in_skip_total.store(3, std::sync::atomic::Ordering::Relaxed);
+    fixture
+        .processor
+        .telemetry
+        .votes_in_notarize_total
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    fixture
+        .processor
+        .telemetry
+        .votes_in_finalize_total
+        .store(10, std::sync::atomic::Ordering::Relaxed);
 
     fixture.processor.set_time(base_time + Duration::from_secs(31));
     fixture.processor.run_health_checks();
 
-    assert_eq!(fixture.processor.health_alert_state.prev_votes_in_skip, 3);
-    assert_eq!(fixture.processor.health_alert_state.prev_votes_in_notarize, 0);
-    assert_eq!(fixture.processor.health_alert_state.prev_votes_in_finalize, 10);
-    assert_eq!(fixture.processor.health_alert_state.last_skip_ratio_warn, base_time);
+    assert_eq!(fixture.processor.telemetry.health_alert_state_for_test().prev_votes_in_skip, 3);
+    assert_eq!(fixture.processor.telemetry.health_alert_state_for_test().prev_votes_in_notarize, 0);
+    assert_eq!(
+        fixture.processor.telemetry.health_alert_state_for_test().prev_votes_in_finalize,
+        10
+    );
+    assert_eq!(
+        fixture.processor.telemetry.health_alert_state_for_test().last_skip_ratio_warn,
+        base_time
+    );
 }
 
 #[test]
@@ -3438,21 +3766,29 @@ fn test_health_check_cooldown_prevents_spam() {
     reset_health_alert_time(&mut fixture.processor, base_time);
 
     // First cert verify fail — advance past initial cooldown
-    fixture.processor.cert_verify_fails_total = 1;
+    fixture
+        .processor
+        .telemetry
+        .cert_verify_fails_total
+        .store(1, std::sync::atomic::Ordering::Relaxed);
     fixture.processor.set_time(base_time + Duration::from_secs(31));
     fixture.processor.run_health_checks();
-    assert_eq!(fixture.processor.health_alert_state.prev_cert_verify_fails, 1);
+    assert_eq!(fixture.processor.telemetry.health_alert_state_for_test().prev_cert_verify_fails, 1);
 
     // More cert verify fails, but within cooldown since last warn at t+31
-    fixture.processor.cert_verify_fails_total = 5;
+    fixture
+        .processor
+        .telemetry
+        .cert_verify_fails_total
+        .store(5, std::sync::atomic::Ordering::Relaxed);
     fixture.processor.set_time(base_time + Duration::from_secs(35));
     fixture.processor.run_health_checks();
-    assert_eq!(fixture.processor.health_alert_state.prev_cert_verify_fails, 1);
+    assert_eq!(fixture.processor.telemetry.health_alert_state_for_test().prev_cert_verify_fails, 1);
 
     // After cooldown passes (31 + 30 = 61, use 62)
     fixture.processor.set_time(base_time + Duration::from_secs(62));
     fixture.processor.run_health_checks();
-    assert_eq!(fixture.processor.health_alert_state.prev_cert_verify_fails, 5);
+    assert_eq!(fixture.processor.telemetry.health_alert_state_for_test().prev_cert_verify_fails, 5);
 }
 
 #[test]
@@ -3482,39 +3818,45 @@ fn test_health_check_configurable_cooldown() {
     let listener_weak = Arc::downgrade(&listener);
     let task_queue = TestTaskQueue::new();
     let callback_queue: CallbackTaskQueuePtr = Arc::new(TestCallbackQueue);
-    let overlay_manager = consensus_common::ConsensusCommonFactory::create_dummy_overlay_manager();
     let receiver = MockReceiver::new();
     let db = MockDb::new();
     let stop_flag = Arc::new(AtomicBool::new(false));
     let health_counters = Arc::new(crate::receiver::ReceiverHealthCounters::new());
 
+    let callbacks = Arc::new(crate::session_callbacks::SessionCallbacks::new(
+        description.get_session_id().clone(),
+        stop_flag.clone(),
+        false,
+        callback_queue,
+        listener_weak,
+    ));
     let mut processor = SessionProcessor::new(
         description,
         make_start_prev_blocks(&shard, 1),
-        listener_weak,
         task_queue as TaskQueuePtr,
-        callback_queue,
-        overlay_manager,
         receiver as crate::receiver::ReceiverPtr,
         stop_flag,
         db,
         0,
         health_counters,
+        callbacks,
+        None,
+        0,
     )
     .unwrap();
 
-    assert_eq!(processor.health_alert_state.cooldown, Duration::from_secs(10));
+    assert_eq!(processor.telemetry.health_alert_state_for_test().cooldown, Duration::from_secs(10));
 
     let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     processor.set_time(base_time);
     reset_health_alert_time(&mut processor, base_time);
 
-    processor.cert_verify_fails_total = 1;
+    processor.telemetry.cert_verify_fails_total.store(1, std::sync::atomic::Ordering::Relaxed);
 
     // After 11s (> 10s cooldown), should trigger
     processor.set_time(base_time + Duration::from_secs(11));
     processor.run_health_checks();
-    assert_eq!(processor.health_alert_state.prev_cert_verify_fails, 1);
+    assert_eq!(processor.telemetry.health_alert_state_for_test().prev_cert_verify_fails, 1);
 }
 
 // ============================================================================
@@ -3527,12 +3869,15 @@ fn test_update_collation_pacing_sets_earliest_time() {
     let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     fixture.processor.set_time(base_time);
 
-    assert!(fixture.processor.earliest_collation_time.is_none());
+    assert!(fixture.processor.collation.earliest_collation_time().is_none());
 
-    fixture.processor.update_collation_pacing();
+    fixture.processor.collation.update_collation_pacing();
 
     let target_rate = fixture.description.opts().target_rate;
-    assert_eq!(fixture.processor.earliest_collation_time, Some(base_time + target_rate),);
+    assert_eq!(
+        fixture.processor.collation.earliest_collation_time(),
+        Some(base_time + target_rate),
+    );
 }
 
 #[test]
@@ -3543,14 +3888,17 @@ fn test_update_collation_pacing_advances_on_repeated_calls() {
 
     let target_rate = fixture.description.opts().target_rate;
 
-    fixture.processor.update_collation_pacing();
-    assert_eq!(fixture.processor.earliest_collation_time, Some(base_time + target_rate));
+    fixture.processor.collation.update_collation_pacing();
+    assert_eq!(
+        fixture.processor.collation.earliest_collation_time(),
+        Some(base_time + target_rate)
+    );
 
     // Advance time by half the target_rate and pace again
     fixture.advance_time(target_rate / 2);
-    fixture.processor.update_collation_pacing();
+    fixture.processor.collation.update_collation_pacing();
     assert_eq!(
-        fixture.processor.earliest_collation_time,
+        fixture.processor.collation.earliest_collation_time(),
         Some(base_time + target_rate / 2 + target_rate),
     );
 }
@@ -3635,7 +3983,7 @@ fn test_check_collation_blocks_before_earliest_time() {
     fixture.processor.set_time(base_time);
 
     let gate_time = base_time + Duration::from_millis(500);
-    fixture.processor.earliest_collation_time = Some(gate_time);
+    fixture.processor.collation.set_earliest_collation_time(Some(gate_time));
 
     fixture.processor.reset_next_awake_time();
 
@@ -3655,7 +4003,7 @@ fn test_check_collation_proceeds_after_pacing_expires() {
     fixture.processor.set_time(base_time);
 
     let gate_time = base_time + Duration::from_millis(500);
-    fixture.processor.earliest_collation_time = Some(gate_time);
+    fixture.processor.collation.set_earliest_collation_time(Some(gate_time));
 
     fixture.advance_time(Duration::from_millis(600));
 
@@ -3676,13 +4024,13 @@ fn test_check_collation_pacing_gate_is_idempotent() {
     fixture.processor.set_time(base_time);
 
     let gate_time = base_time + Duration::from_millis(500);
-    fixture.processor.earliest_collation_time = Some(gate_time);
+    fixture.processor.collation.set_earliest_collation_time(Some(gate_time));
 
     fixture.processor.reset_next_awake_time();
     fixture.processor.check_collation();
     assert_eq!(fixture.processor.get_next_awake_time(), base_time + MAX_AWAKE_TIMEOUT);
 
-    assert_eq!(fixture.processor.earliest_collation_time, Some(gate_time));
+    assert_eq!(fixture.processor.collation.earliest_collation_time(), Some(gate_time));
 
     fixture.processor.reset_next_awake_time();
     fixture.processor.check_collation();
@@ -3709,7 +4057,7 @@ fn test_collation_starts_metric_tracks_precollated_fast_path() {
     let request = AsyncRequestImpl::new(11, false, fixture.description.get_time());
     let candidate = make_local_collated_candidate(&fixture, 1, 0x41);
 
-    fixture.processor.precollated_blocks.insert(
+    fixture.processor.collation.insert_precollated(
         slot,
         PrecollatedBlock { request, result: Some(CollationResult::Block(candidate)), parent: None },
     );
@@ -3730,11 +4078,36 @@ fn test_self_collation_acceptance_marks_success_and_records_latency() {
     let block_id =
         BlockIdExt::with_params(ShardIdent::masterchain(), 1, UInt256::rand(), UInt256::rand());
 
-    fixture.processor.record_self_collation_start(slot, 1, CollationAttempt::Initial, None, &[]);
-    fixture.processor.record_self_collation_generated(slot, "unit_test_generated");
-    fixture.processor.link_self_collation_candidate(slot, &candidate_id);
+    let now = fixture.processor.now();
+    fixture.processor.telemetry.record_self_collation_start(
+        fixture.processor.runtime.description(),
+        slot,
+        1,
+        None,
+        None,
+        &[],
+        now,
+    );
+    fixture.processor.telemetry.record_self_collation_generated(
+        slot,
+        "unit_test_generated",
+        fixture.processor.runtime.description(),
+        now,
+    );
+    fixture.processor.telemetry.link_self_collation_candidate(
+        slot,
+        &candidate_id,
+        fixture.processor.runtime.description(),
+    );
     fixture.advance_time(Duration::from_millis(25));
-    fixture.processor.record_self_collation_acceptance(&candidate_id, &block_id, true);
+    let now = fixture.processor.now();
+    fixture.processor.telemetry.record_self_collation_acceptance(
+        &candidate_id,
+        &block_id,
+        true,
+        fixture.processor.runtime.description(),
+        now,
+    );
 
     let snapshot = fixture.processor.get_metrics_receiver().snapshot();
     assert_eq!(snapshot.counters.get("simplex_self_collates.total").copied().unwrap_or(0), 1);
@@ -3753,23 +4126,36 @@ fn test_self_collation_acceptance_marks_success_and_records_latency() {
 
 #[test]
 fn test_self_collation_retry_counts_total_only_once() {
-    let mut fixture = TestFixture::new(4);
+    let fixture = TestFixture::new(4);
     let slot = SlotIndex::new(0);
 
-    fixture.processor.record_self_collation_start(slot, 1, CollationAttempt::Initial, None, &[]);
-    fixture.processor.record_self_collation_start(
+    let now = fixture.processor.now();
+    fixture.processor.telemetry.record_self_collation_start(
+        fixture.processor.runtime.description(),
         slot,
         1,
-        CollationAttempt::Retry { retry_count: 1 },
+        None,
         None,
         &[],
+        now,
     );
-    fixture.processor.record_self_collation_start(
+    fixture.processor.telemetry.record_self_collation_start(
+        fixture.processor.runtime.description(),
         slot,
         1,
-        CollationAttempt::Retry { retry_count: 2 },
+        Some(1),
         None,
         &[],
+        now,
+    );
+    fixture.processor.telemetry.record_self_collation_start(
+        fixture.processor.runtime.description(),
+        slot,
+        1,
+        Some(2),
+        None,
+        &[],
+        now,
     );
 
     assert_eq!(
@@ -3782,21 +4168,34 @@ fn test_self_collation_retry_counts_total_only_once() {
 }
 
 #[test]
-fn test_self_collation_failure_only_on_final_attempt() {
+fn test_self_collation_failure_only_on_terminal_drop() {
     let mut fixture = TestFixture::new(4);
     let slot = SlotIndex::new(0);
     let request_id = 904;
-    let retry_max = fixture.description.opts().collation_retry_max_attempts;
 
-    fixture.processor.record_self_collation_start(slot, 1, CollationAttempt::Initial, None, &[]);
+    let now = fixture.processor.now();
+    fixture.processor.telemetry.record_self_collation_start(
+        fixture.processor.runtime.description(),
+        slot,
+        1,
+        None,
+        None,
+        &[],
+        now,
+    );
 
-    // An intermediate attempt failure (will be retried) MUST NOT bump self-collation failure.
-    fixture.processor.on_collation_failed_impl(slot, request_id, error!("first attempt"), 0);
+    // A genuine error while the slot is still current schedules a single
+    // restart sharing the window-end budget - it is NOT terminal, so the
+    // self-collation funnel records no failure (the whole slot is one
+    // self-collation, regardless of how many times the real collation restarts).
+    fixture.processor.on_collation_failed_impl(slot, request_id, error!("transient error"));
     assert_eq!(metrics_counter(&fixture.processor, "simplex_self_collates.failure"), 0);
     assert_eq!(metrics_counter(&fixture.processor, "simplex_self_collates.total"), 1);
 
-    // The terminal attempt (retry_count == retry_max) marks the flow as final failure.
-    fixture.processor.on_collation_failed_impl(slot, request_id, error!("max retries"), retry_max);
+    // Once the slot has progressed past (here: skip-certified by consensus), a
+    // failure for it is terminal and marks the self-collation flow as failed.
+    skip_slot(&mut fixture, slot);
+    fixture.processor.on_collation_failed_impl(slot, request_id, error!("slot already passed"));
 
     assert_eq!(metrics_counter(&fixture.processor, "simplex_self_collates.total"), 1);
     assert_eq!(metrics_counter(&fixture.processor, "simplex_self_collates.success"), 0);
@@ -3805,17 +4204,30 @@ fn test_self_collation_failure_only_on_final_attempt() {
 
 #[test]
 fn test_self_collation_ignore_paths_do_not_increment_failure() {
-    let mut fixture = TestFixture::new(4);
+    let fixture = TestFixture::new(4);
     let slot = SlotIndex::new(0);
 
-    fixture.processor.record_self_collation_start(slot, 1, CollationAttempt::Initial, None, &[]);
+    let now = fixture.processor.now();
+    fixture.processor.telemetry.record_self_collation_start(
+        fixture.processor.runtime.description(),
+        slot,
+        1,
+        None,
+        None,
+        &[],
+        now,
+    );
 
     // An "ignore" path (e.g. cancelled callback / pipeline reset) just drops tracking
     // — it must NOT bump success or failure. The ignore metric is auto-derived
     // by `add_compute_result_metric` as `total - success - failure`.
-    fixture
-        .processor
-        .forget_self_collation_tracking(slot, "callback_cancelled_before_generation_result");
+    let now = fixture.processor.now();
+    fixture.processor.telemetry.forget_self_collation_tracking(
+        slot,
+        "callback_cancelled_before_generation_result",
+        fixture.processor.runtime.description(),
+        now,
+    );
 
     assert_eq!(metrics_counter(&fixture.processor, "simplex_self_collates.total"), 1);
     assert_eq!(metrics_counter(&fixture.processor, "simplex_self_collates.success"), 0);
@@ -3834,7 +4246,10 @@ fn test_candidate_query_fallback_cache_hit() {
     let candidate_id = RawCandidateId { slot, hash: block_hash.clone() };
 
     let fake_candidate_bytes = vec![0xCA, 0xFE, 0xBA, 0xBE];
-    fixture.processor.candidate_data_cache.insert(candidate_id, fake_candidate_bytes.clone());
+    fixture
+        .processor
+        .candidate_book_mut()
+        .insert_cached_data(candidate_id, fake_candidate_bytes.clone());
 
     let (tx, rx) = channel();
     let callback: crate::QueryResponseCallback = Box::new(move |result| {
@@ -3902,7 +4317,7 @@ fn make_signed_block_broadcast_with_parent(
 ) -> (u32, RawCandidateId, CandidateData) {
     let collated_data: Vec<u8> = vec![];
     let root_hash = UInt256::from_slice(&sha256_digest(&block_data));
-    let shard = fixture.processor.description.get_shard().clone();
+    let shard = fixture.processor.runtime.description().get_shard().clone();
 
     let block_id = BlockIdExt {
         shard_id: shard,
@@ -3922,8 +4337,8 @@ fn make_signed_block_broadcast_with_parent(
     );
 
     let session_id = fixture.processor.session_id().clone();
-    let leader_idx = fixture.processor.description.get_leader(SlotIndex::new(slot));
-    let leader_key = fixture.processor.description.get_source_public_key(leader_idx);
+    let leader_idx = fixture.processor.runtime.description().get_leader(SlotIndex::new(slot));
+    let leader_key = fixture.processor.runtime.description().get_source_public_key(leader_idx);
     let signature =
         crate::utils::sign_candidate_u32(&session_id, slot, &candidate_hash, leader_key)
             .expect("signing failed");
@@ -3969,8 +4384,8 @@ fn make_signed_empty_block_broadcast_with_parent(
         (parent_id.slot, &parent_id.hash),
     );
     let session_id = fixture.processor.session_id().clone();
-    let leader_idx = fixture.processor.description.get_leader(SlotIndex::new(slot));
-    let leader_key = fixture.processor.description.get_source_public_key(leader_idx);
+    let leader_idx = fixture.processor.runtime.description().get_leader(SlotIndex::new(slot));
+    let leader_key = fixture.processor.runtime.description().get_source_public_key(leader_idx);
     let signature =
         crate::utils::sign_candidate_u32(&session_id, slot, &candidate_hash, leader_key)
             .expect("signing failed");
@@ -3999,7 +4414,7 @@ fn make_local_collated_candidate(
     let collated_boc = make_test_boc(&[tag.wrapping_add(1)], BocFlags::Crc32);
     let root_hash = UInt256::from_slice(&sha256_digest(&block_boc));
     let block_id = BlockIdExt {
-        shard_id: fixture.processor.description.get_shard().clone(),
+        shard_id: fixture.processor.runtime.description().get_shard().clone(),
         seq_no: seqno,
         root_hash: root_hash.clone(),
         file_hash: root_hash,
@@ -4027,20 +4442,20 @@ fn test_candidate_data_cache_populated_on_candidate_received() {
         make_signed_block_broadcast(&fixture, slot, vec![1u8, 2, 3, 4, 5]);
 
     assert!(
-        !fixture.processor.candidate_data_cache.contains_key(&candidate_id),
+        !fixture.processor.candidate_book().contains_cached_data(&candidate_id),
         "cache should be empty before on_candidate_received"
     );
 
     fixture.processor.on_candidate_received(leader_source, broadcast, None);
 
     assert!(
-        fixture.processor.candidate_data_cache.contains_key(&candidate_id),
+        fixture.processor.candidate_book().contains_cached_data(&candidate_id),
         "cache should be populated after on_candidate_received"
     );
 
     assert!(
-        fixture.processor.received_candidates.contains_key(&candidate_id),
-        "received_candidates should also have the candidate"
+        fixture.processor.candidate_book().contains_received(&candidate_id),
+        "candidate_book should also have the candidate"
     );
 }
 
@@ -4078,15 +4493,15 @@ fn test_old_slot_broadcast_is_dropped_without_persistence_side_effects() {
     fixture.processor.on_candidate_received(leader_source, broadcast, None /* broadcast */);
 
     assert!(
-        !fixture.processor.candidate_data_cache.contains_key(&candidate_id),
+        !fixture.processor.candidate_book().contains_cached_data(&candidate_id),
         "old-slot broadcast must not populate candidate_data_cache"
     );
     assert!(
-        !fixture.processor.received_candidates.contains_key(&candidate_id),
-        "old-slot broadcast must not populate received_candidates"
+        !fixture.processor.candidate_book().contains_received(&candidate_id),
+        "old-slot broadcast must not populate candidate_book"
     );
     assert!(
-        !fixture.processor.seen_broadcast_candidates.contains_key(&SlotIndex::new(slot)),
+        !fixture.processor.candidate_book().contains_seen_broadcast(SlotIndex::new(slot)),
         "old-slot broadcast should be dropped before broadcast dedup state is updated"
     );
 }
@@ -4102,7 +4517,7 @@ fn test_candidate_precheck_keeps_simple_addition_rule() {
     fixture.processor.on_candidate_received(leader_source, broadcast, None);
 
     assert!(
-        !fixture.processor.candidate_data_cache.contains_key(&candidate_id),
+        !fixture.processor.candidate_book().contains_cached_data(&candidate_id),
         "candidate above the simple-addition bound must be dropped before caching"
     );
     assert_eq!(
@@ -4130,7 +4545,7 @@ fn test_candidate_precheck_progress_gap_uses_progress_cursor() {
     fixture.processor.on_candidate_received(leader_source, broadcast, None);
 
     assert!(
-        fixture.processor.candidate_data_cache.contains_key(&candidate_id),
+        fixture.processor.candidate_book().contains_cached_data(&candidate_id),
         "candidate at the progress-anchored boundary should survive precheck even when finalization lags"
     );
 }
@@ -4152,15 +4567,19 @@ fn test_register_candidate_for_validation_keeps_slot_behind_progress_cursor_unti
     let raw_candidate = make_test_non_empty_candidate(candidate_id.clone(), None, &fixture.nodes);
     let receive_time = fixture.description.get_time();
 
-    fixture.processor.register_candidate_for_validation(
+    let now = fixture.processor.now();
+    fixture.processor.validation.register_candidate_for_validation(
         raw_candidate,
         slot,
         fixture.description.get_self_idx(),
         receive_time,
+        now,
+        &fixture.processor.simplex_state,
+        &mut fixture.processor.runtime,
     );
 
     assert!(
-        fixture.processor.pending_validations.contains_key(&candidate_id),
+        fixture.processor.validation.pending_validation_contains(&candidate_id),
         "candidate behind first_non_progressed_slot must stay eligible until the slot is finalized"
     );
 }
@@ -4179,7 +4598,7 @@ fn test_conflicting_second_broadcast_same_slot_is_dropped_by_precheck() {
     );
 
     assert!(
-        fixture.processor.received_candidates.contains_key(&first_id),
+        fixture.processor.candidate_book().contains_received(&first_id),
         "first broadcast candidate should be accepted"
     );
 
@@ -4194,41 +4613,59 @@ fn test_conflicting_second_broadcast_same_slot_is_dropped_by_precheck() {
     );
 
     assert!(
-        !fixture.processor.received_candidates.contains_key(&second_id),
+        !fixture.processor.candidate_book().contains_received(&second_id),
         "conflicting second broadcast for same slot must be dropped"
     );
     assert!(
-        !fixture.processor.candidate_data_cache.contains_key(&second_id),
+        !fixture.processor.candidate_book().contains_cached_data(&second_id),
         "conflicting second broadcast must not be persisted in candidate_data_cache"
     );
     assert_eq!(
-        fixture.processor.seen_broadcast_candidates.get(&SlotIndex::new(slot)).cloned(),
+        fixture.processor.candidate_book().seen_broadcast(SlotIndex::new(slot)).cloned(),
         Some(first_id),
         "slot dedup state should keep first accepted broadcast candidate id"
     );
 }
 
 #[test]
-fn test_broadcast_from_unexpected_sender_is_dropped_by_precheck() {
+fn test_relayed_broadcast_from_non_leader_is_accepted() {
+    // Regression: an authentic, leader-signed broadcast candidate that is
+    // delivered by a relay / gossip peer (sender != slot leader, no attached notar cert)
+    // must be ACCEPTED, not dropped. Dropping it strands any node that missed the leader's
+    // direct delivery: it can never notarize the slot, is forced to skip, and a single such
+    // node is enough to wedge finalization on a notarized slot (releasenet MC stall).
+    //
+    // Before the fix this candidate was dropped with precheck_drop_reason=unexpected_sender;
+    // after the fix it is accepted and authenticated by the leader-signature check.
     let mut fixture = TestFixture::new(4);
     let slot = 0u32;
     let (leader_source, candidate_id, broadcast) =
         make_signed_block_broadcast(&fixture, slot, vec![3u8, 4, 5, 6]);
-    let unexpected_sender = (leader_source + 1) % 4;
 
-    fixture.processor.on_candidate_received(
-        unexpected_sender,
-        broadcast,
-        None, /* broadcast */
-    );
+    // Deliver the leader-signed broadcast from a peer that is NOT the slot leader,
+    // exactly as a relay / gossip hop would (notar_cert = None => broadcast path).
+    let relay_sender = (leader_source + 1) % 4;
+    assert_ne!(relay_sender, leader_source, "relay sender must differ from the slot leader");
+
+    fixture.processor.on_candidate_received(relay_sender, broadcast, None /* broadcast */);
 
     assert!(
-        !fixture.processor.received_candidates.contains_key(&candidate_id),
-        "broadcast from non-leader sender must be dropped by precheck"
+        fixture.processor.candidate_book().contains_received(&candidate_id),
+        "relayed leader-signed broadcast must be accepted into received_candidates"
     );
     assert!(
-        !fixture.processor.candidate_data_cache.contains_key(&candidate_id),
-        "broadcast from non-leader sender must not be persisted"
+        fixture.processor.candidate_book().contains_cached_data(&candidate_id),
+        "relayed leader-signed broadcast must be persisted in candidate_data_cache"
+    );
+    assert_eq!(
+        fixture.processor.candidate_book().seen_broadcast(SlotIndex::new(slot)).cloned(),
+        Some(candidate_id),
+        "relayed broadcast must update the slot dedup state"
+    );
+    assert_eq!(
+        metrics_counter(&fixture.processor, "simplex_candidate_relayed_broadcast"),
+        1,
+        "relayed broadcast observability counter must increment"
     );
 }
 
@@ -4244,15 +4681,15 @@ fn test_has_real_candidate_body_returns_false_for_stub() {
     let candidate_id = RawCandidateId { slot, hash: hash.clone() };
 
     // No entry => false
-    assert!(!fixture.processor.has_real_candidate_body(&candidate_id));
+    assert!(!fixture.processor.candidate_book().has_real_body(&candidate_id));
 
     // Insert a finalized-boundary stub (empty candidate_hash_data_bytes)
-    fixture.processor.received_candidates.insert(
+    let receive_time = fixture.processor.now();
+    fixture.processor.candidate_book_mut().insert_received(
         candidate_id.clone(),
         ReceivedCandidate {
             slot,
             source_idx: ValidatorIndex::new(0),
-            candidate_id_hash: hash.clone(),
             candidate_hash_data_bytes: Vec::new(), // stub marker
             block_id: BlockIdExt::default(),
             root_hash: UInt256::default(),
@@ -4262,7 +4699,7 @@ fn test_has_real_candidate_body_returns_false_for_stub() {
                 Vec::new(),
             ),
             gen_utime_ms: None,
-            receive_time: fixture.processor.now(),
+            receive_time,
             is_empty: false,
             parent_id: None,
         },
@@ -4270,21 +4707,21 @@ fn test_has_real_candidate_body_returns_false_for_stub() {
 
     // Stub => false
     assert!(
-        !fixture.processor.has_real_candidate_body(&candidate_id),
+        !fixture.processor.candidate_book().has_real_body(&candidate_id),
         "finalized-boundary stub must NOT count as real body"
     );
 
     // Overwrite with real data
     fixture
         .processor
-        .received_candidates
-        .get_mut(&candidate_id)
+        .candidate_book_mut()
+        .received_mut(&candidate_id)
         .unwrap()
         .candidate_hash_data_bytes = vec![1, 2, 3];
 
     // Now should be true
     assert!(
-        fixture.processor.has_real_candidate_body(&candidate_id),
+        fixture.processor.candidate_book().has_real_body(&candidate_id),
         "entry with non-empty candidate_hash_data_bytes must count as real body"
     );
 }
@@ -4311,11 +4748,11 @@ fn test_candidate_query_fallback_returns_notar_only_when_body_missing() {
 fn test_initial_mc_tracking_seeds_from_initial_block_seqno() {
     let fixture = TestFixture::new(4);
 
-    assert_eq!(fixture.processor.last_mc_finalized_seqno, Some(0));
-    assert_eq!(fixture.processor.last_consensus_finalized_seqno, Some(0));
-    assert_eq!(fixture.processor.accepted_normal_head_seqno, 0);
+    assert_eq!(fixture.processor.consensus.last_mc_finalized_seqno(), Some(0));
+    assert_eq!(fixture.processor.consensus.last_consensus_finalized_seqno(), Some(0));
+    assert_eq!(fixture.processor.consensus.accepted_normal_head_seqno(), 0);
     assert!(
-        fixture.processor.accepted_normal_head_block_id.is_none(),
+        fixture.processor.consensus.accepted_normal_head_block_id().is_none(),
         "exact accepted head should be unknown until manager/recovery/finalization supplies a block id"
     );
 }
@@ -4325,8 +4762,8 @@ fn test_set_mc_finalized_block_couples_consensus_finalized_seqno_for_mc_session(
     let mut fixture = TestFixture::new(4);
 
     // Initially 0
-    assert_eq!(fixture.processor.last_mc_finalized_seqno, Some(0));
-    assert_eq!(fixture.processor.last_consensus_finalized_seqno, Some(0));
+    assert_eq!(fixture.processor.consensus.last_mc_finalized_seqno(), Some(0));
+    assert_eq!(fixture.processor.consensus.last_consensus_finalized_seqno(), Some(0));
 
     // Set MC-registered top to seqno 42 for this session shard.
     let mc_registered_top =
@@ -4335,24 +4772,27 @@ fn test_set_mc_finalized_block_couples_consensus_finalized_seqno_for_mc_session(
 
     // C++ parity: external MC notify updates both the applied-top cursor and the
     // producer-side consensus-finalized seqno used for empty-block policy.
-    assert_eq!(fixture.processor.last_mc_finalized_seqno, Some(42));
+    assert_eq!(fixture.processor.consensus.last_mc_finalized_seqno(), Some(42));
     assert_eq!(
-        fixture.processor.last_consensus_finalized_seqno,
+        fixture.processor.consensus.last_consensus_finalized_seqno(),
         Some(42),
         "set_mc_finalized_block must advance last_consensus_finalized_seqno with the applied top"
     );
-    assert_eq!(fixture.processor.accepted_normal_head_seqno, 42);
-    assert_eq!(fixture.processor.accepted_normal_head_block_id.as_ref(), Some(&mc_registered_top));
+    assert_eq!(fixture.processor.consensus.accepted_normal_head_seqno(), 42);
+    assert_eq!(
+        fixture.processor.consensus.accepted_normal_head_block_id().as_ref(),
+        Some(&mc_registered_top)
+    );
 
     // Set consensus finalized higher via direct field (simulating a finalization)
-    fixture.processor.last_consensus_finalized_seqno = Some(100);
+    fixture.processor.consensus.set_last_consensus_finalized_seqno(Some(100));
 
     // Set MC finalized lower => should NOT decrease consensus
     let older_top =
         BlockIdExt::with_params(ShardIdent::masterchain(), 50, UInt256::rand(), UInt256::rand());
     fixture.processor.set_mc_finalized_block(older_top);
     assert_eq!(
-        fixture.processor.last_consensus_finalized_seqno,
+        fixture.processor.consensus.last_consensus_finalized_seqno(),
         Some(100),
         "set_mc_finalized_block must not decrease an already advanced consensus-finalized head"
     );
@@ -4360,17 +4800,17 @@ fn test_set_mc_finalized_block_couples_consensus_finalized_seqno_for_mc_session(
     // Monotonic MC seqno: out-of-order MC event with lower seqno must not regress.
     // C++ parity uses the updated monotonic MC cursor when recomputing
     // last_consensus_finalized_seqno.
-    fixture.processor.last_mc_finalized_seqno = Some(200);
+    fixture.processor.consensus.set_last_mc_finalized_seqno(Some(200));
     let out_of_order_top =
         BlockIdExt::with_params(ShardIdent::masterchain(), 150, UInt256::rand(), UInt256::rand());
     fixture.processor.set_mc_finalized_block(out_of_order_top);
     assert_eq!(
-        fixture.processor.last_mc_finalized_seqno,
+        fixture.processor.consensus.last_mc_finalized_seqno(),
         Some(200),
         "set_mc_finalized_block must keep last_mc_finalized_seqno monotonic"
     );
     assert_eq!(
-        fixture.processor.last_consensus_finalized_seqno,
+        fixture.processor.consensus.last_consensus_finalized_seqno(),
         Some(200),
         "set_mc_finalized_block must recompute last_consensus_finalized_seqno from the monotonic MC cursor"
     );
@@ -4382,9 +4822,16 @@ fn test_mc_applied_top_disables_empty_block_recovery_for_seqno_2() {
 
     // Session starts from zerostate: seqno 1 is the first real block, so seqno 2 is
     // initially "ahead" and triggers empty-block recovery.
-    assert_eq!(fixture.processor.last_consensus_finalized_seqno, Some(0));
+    assert_eq!(fixture.processor.consensus.last_consensus_finalized_seqno(), Some(0));
     assert!(
-        fixture.processor.should_generate_empty_block(SlotIndex::new(1), 2, None),
+        fixture.processor.collation.should_generate_empty_block(
+            SlotIndex::new(1),
+            2,
+            None,
+            fixture.processor.consensus.finalized_head_before_split(),
+            fixture.processor.consensus.last_consensus_finalized_seqno(),
+            fixture.processor.consensus.last_mc_finalized_seqno(),
+        ),
         "with finalized seqno 0, MC seqno 2 must use empty-block recovery"
     );
 
@@ -4394,16 +4841,26 @@ fn test_mc_applied_top_disables_empty_block_recovery_for_seqno_2() {
         BlockIdExt::with_params(ShardIdent::masterchain(), 1, UInt256::rand(), UInt256::rand());
     fixture.processor.set_mc_finalized_block(applied_mc_top.clone());
 
-    assert_eq!(fixture.processor.last_mc_finalized_seqno, Some(1));
-    assert_eq!(fixture.processor.accepted_normal_head_seqno, 1);
-    assert_eq!(fixture.processor.accepted_normal_head_block_id.as_ref(), Some(&applied_mc_top));
+    assert_eq!(fixture.processor.consensus.last_mc_finalized_seqno(), Some(1));
+    assert_eq!(fixture.processor.consensus.accepted_normal_head_seqno(), 1);
     assert_eq!(
-        fixture.processor.last_consensus_finalized_seqno,
+        fixture.processor.consensus.accepted_normal_head_block_id().as_ref(),
+        Some(&applied_mc_top)
+    );
+    assert_eq!(
+        fixture.processor.consensus.last_consensus_finalized_seqno(),
         Some(1),
         "applied-top updates must promote the producer-side consensus-finalized seqno"
     );
     assert!(
-        !fixture.processor.should_generate_empty_block(SlotIndex::new(1), 2, None),
+        !fixture.processor.collation.should_generate_empty_block(
+            SlotIndex::new(1),
+            2,
+            None,
+            fixture.processor.consensus.finalized_head_before_split(),
+            fixture.processor.consensus.last_consensus_finalized_seqno(),
+            fixture.processor.consensus.last_mc_finalized_seqno(),
+        ),
         "applied-top seqno 1 must suppress empty-block recovery for MC seqno 2 in C++ parity mode"
     );
 }
@@ -4411,9 +4868,9 @@ fn test_mc_applied_top_disables_empty_block_recovery_for_seqno_2() {
 #[test]
 fn test_set_mc_finalized_block_zero_seqno_does_not_seed_exact_accepted_head() {
     let mut fixture = TestFixture::new(4);
-    assert_eq!(fixture.processor.accepted_normal_head_seqno, 0);
+    assert_eq!(fixture.processor.consensus.accepted_normal_head_seqno(), 0);
     assert!(
-        fixture.processor.accepted_normal_head_block_id.is_none(),
+        fixture.processor.consensus.accepted_normal_head_block_id().is_none(),
         "exact accepted head starts unknown at zerostate"
     );
 
@@ -4421,11 +4878,11 @@ fn test_set_mc_finalized_block_zero_seqno_does_not_seed_exact_accepted_head() {
         BlockIdExt::with_params(ShardIdent::masterchain(), 0, UInt256::rand(), UInt256::rand());
     fixture.processor.set_mc_finalized_block(zerostate_top);
 
-    assert_eq!(fixture.processor.last_mc_finalized_seqno, Some(0));
-    assert_eq!(fixture.processor.last_consensus_finalized_seqno, Some(0));
-    assert_eq!(fixture.processor.accepted_normal_head_seqno, 0);
+    assert_eq!(fixture.processor.consensus.last_mc_finalized_seqno(), Some(0));
+    assert_eq!(fixture.processor.consensus.last_consensus_finalized_seqno(), Some(0));
+    assert_eq!(fixture.processor.consensus.accepted_normal_head_seqno(), 0);
     assert!(
-        fixture.processor.accepted_normal_head_block_id.is_none(),
+        fixture.processor.consensus.accepted_normal_head_block_id().is_none(),
         "C++ block-validator parity: external notify with seqno 0 must not seed exact accepted head"
     );
 }
@@ -4435,8 +4892,8 @@ fn test_set_mc_finalized_block_ignores_mismatched_shard() {
     let mut fixture = TestFixture::new(4);
     assert!(fixture.description.get_shard().is_masterchain());
 
-    fixture.processor.last_mc_finalized_seqno = Some(123);
-    fixture.processor.last_consensus_finalized_seqno = Some(123);
+    fixture.processor.consensus.set_last_mc_finalized_seqno(Some(123));
+    fixture.processor.consensus.set_last_consensus_finalized_seqno(Some(123));
 
     let shard_block = BlockIdExt::with_params(
         ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap(),
@@ -4447,12 +4904,12 @@ fn test_set_mc_finalized_block_ignores_mismatched_shard() {
     fixture.processor.set_mc_finalized_block(shard_block);
 
     assert_eq!(
-        fixture.processor.last_mc_finalized_seqno,
+        fixture.processor.consensus.last_mc_finalized_seqno(),
         Some(123),
         "mismatched shard update must be ignored"
     );
     assert_eq!(
-        fixture.processor.last_consensus_finalized_seqno,
+        fixture.processor.consensus.last_consensus_finalized_seqno(),
         Some(123),
         "consensus finalized must not change on mismatched shard update"
     );
@@ -4463,7 +4920,7 @@ fn test_set_mc_finalized_block_wakes_processor() {
     let mut fixture = TestFixture::new(4);
     let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     fixture.processor.set_time(base_time);
-    fixture.processor.next_awake_time = base_time + Duration::from_secs(60);
+    fixture.processor.runtime.force_next_awake_time(base_time + Duration::from_secs(60));
 
     let mc_registered_top =
         BlockIdExt::with_params(ShardIdent::masterchain(), 42, UInt256::rand(), UInt256::rand());
@@ -4503,11 +4960,11 @@ fn test_check_validation_does_not_wait_for_mc_applied_head_before_submitting() {
 
     fixture.processor.check_validation();
     assert!(
-        fixture.processor.pending_approve.contains(&child_id),
+        fixture.processor.validation.pending_approve_contains(&child_id),
         "candidate should be submitted without a SessionProcessor wait on the accepted MC head"
     );
     assert!(
-        !fixture.processor.rejected.contains(&child_id),
+        !fixture.processor.validation.is_rejected(&child_id),
         "SessionProcessor should not reject while validator-side MC stale protection owns this check"
     );
 }
@@ -4535,16 +4992,16 @@ fn test_check_all_releases_validation_retry_before_revalidation() {
     insert_pending_validation(&mut fixture.processor, &child_id, raw_candidate, time);
     notarize_slot(&mut fixture, parent_slot, &parent_id.hash);
 
-    fixture.processor.pending_approve.insert(child_id.clone());
+    fixture.processor.validation.insert_pending_approve(child_id.clone());
     let child_id_for_release = child_id.clone();
     fixture.processor.post_delayed_action(time, move |processor| {
-        processor.pending_approve.remove(&child_id_for_release);
+        processor.validation.remove_pending_approve(&child_id_for_release);
     });
 
     fixture.processor.check_all();
 
     assert!(
-        fixture.processor.pending_approve.contains(&child_id),
+        fixture.processor.validation.pending_approve_contains(&child_id),
         "retry gate release should happen before check_validation so the candidate is resubmitted in the same pass"
     );
 }
@@ -4561,7 +5018,7 @@ fn test_check_validation_waits_for_min_block_interval() {
     );
     let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     fixture.processor.set_time(base_time);
-    fixture.processor.next_awake_time = base_time + Duration::from_secs(60);
+    fixture.processor.runtime.force_next_awake_time(base_time + Duration::from_secs(60));
 
     let parent_slot = SlotIndex::new(0);
     let child_slot = SlotIndex::new(1);
@@ -4593,7 +5050,7 @@ fn test_check_validation_waits_for_min_block_interval() {
     fixture.processor.check_validation();
 
     assert!(
-        !fixture.processor.pending_approve.contains(&child_id),
+        !fixture.processor.validation.pending_approve_contains(&child_id),
         "candidate should not be submitted before the min_block_interval elapses"
     );
     assert_eq!(
@@ -4603,11 +5060,11 @@ fn test_check_validation_waits_for_min_block_interval() {
     );
 
     fixture.advance_time(Duration::from_millis(600));
-    fixture.processor.next_awake_time = base_time + Duration::from_secs(60);
+    fixture.processor.runtime.force_next_awake_time(base_time + Duration::from_secs(60));
     fixture.processor.check_validation();
 
     assert!(
-        fixture.processor.pending_approve.contains(&child_id),
+        fixture.processor.validation.pending_approve_contains(&child_id),
         "candidate should be submitted after the min_block_interval elapses"
     );
 }
@@ -4650,49 +5107,13 @@ fn test_check_validation_does_not_reject_mc_candidate_with_wrong_exact_parent_he
 
     fixture.processor.check_validation();
     assert!(
-        fixture.processor.pending_approve.contains(&child_id),
+        fixture.processor.validation.pending_approve_contains(&child_id),
         "candidate should be submitted without exact-head rejection in SessionProcessor"
     );
     assert!(
-        !fixture.processor.rejected.contains(&child_id),
+        !fixture.processor.validation.is_rejected(&child_id),
         "SessionProcessor should not reject on exact-head mismatch; validator-side MC fork prevention covers this"
     );
-}
-
-#[test]
-fn test_resolve_parent_normal_tip_walks_empty_parent_chain() {
-    let mut fixture = TestFixture::new(4);
-
-    let root_id = RawCandidateId { slot: SlotIndex::new(0), hash: UInt256::from([0x01; 32]) };
-    let empty_a_id = RawCandidateId { slot: SlotIndex::new(1), hash: UInt256::from([0x02; 32]) };
-    let empty_b_id = RawCandidateId { slot: SlotIndex::new(2), hash: UInt256::from([0x03; 32]) };
-    let child_id = RawCandidateId { slot: SlotIndex::new(3), hash: UInt256::from([0x04; 32]) };
-    let root_block_id = BlockIdExt::with_params(
-        ShardIdent::masterchain(),
-        1,
-        UInt256::from([0x31; 32]),
-        UInt256::from([0x32; 32]),
-    );
-
-    insert_received_candidate(&mut fixture.processor, &root_id, root_block_id.clone(), false, None);
-    insert_received_candidate(
-        &mut fixture.processor,
-        &empty_a_id,
-        root_block_id.clone(),
-        true,
-        Some(root_id.clone()),
-    );
-    insert_received_candidate(
-        &mut fixture.processor,
-        &empty_b_id,
-        root_block_id.clone(),
-        true,
-        Some(empty_a_id.clone()),
-    );
-
-    let raw_candidate =
-        make_test_empty_candidate_with_block(child_id, empty_b_id, root_block_id.clone());
-    assert_eq!(fixture.processor.resolve_parent_normal_tip(&raw_candidate), Some(root_block_id));
 }
 
 #[test]
@@ -4713,7 +5134,7 @@ fn test_should_generate_empty_block_uses_parent_before_split_hint() {
         false,
         None,
     );
-    fixture.processor.before_split_by_block_id.insert(parent_block_id.clone(), true);
+    fixture.processor.consensus.insert_before_split(parent_block_id.clone(), true);
 
     let parent_info =
         crate::block::CandidateParentInfo { slot: parent_id.slot, hash: parent_id.hash.clone() };
@@ -4727,95 +5148,18 @@ fn test_should_generate_empty_block_uses_parent_before_split_hint() {
         "parent-derived before_split must be resolved from current parent state"
     );
 
-    fixture.processor.finalized_head_before_split = false;
-    fixture.processor.last_mc_finalized_seqno = Some(100);
+    fixture.processor.consensus.set_finalized_head_before_split(false);
+    fixture.processor.consensus.set_last_mc_finalized_seqno(Some(100));
     assert!(
-        fixture.processor.should_generate_empty_block(SlotIndex::new(1), 101, parent_before_split),
+        fixture.processor.collation.should_generate_empty_block(
+            SlotIndex::new(1),
+            101,
+            parent_before_split,
+            fixture.processor.consensus.finalized_head_before_split(),
+            fixture.processor.consensus.last_consensus_finalized_seqno(),
+            fixture.processor.consensus.last_mc_finalized_seqno(),
+        ),
         "parent before_split=true must force empty generation even when lag gating is false"
-    );
-}
-
-#[test]
-fn test_resolve_parent_normal_tip_allows_deep_empty_chain_beyond_warn_threshold() {
-    let mut fixture = TestFixture::new(4);
-
-    let root_id = RawCandidateId { slot: SlotIndex::new(0), hash: UInt256::from([0x61; 32]) };
-    let root_block_id = BlockIdExt::with_params(
-        ShardIdent::masterchain(),
-        1,
-        UInt256::from([0x62; 32]),
-        UInt256::from([0x63; 32]),
-    );
-    insert_received_candidate(&mut fixture.processor, &root_id, root_block_id.clone(), false, None);
-
-    let chain_len = EMPTY_CHAIN_WARN_DEPTH + 32;
-    let mut prev_id = root_id;
-    for idx in 1..=chain_len {
-        let mut hash_bytes = [0u8; 32];
-        hash_bytes[..4].copy_from_slice(&idx.to_le_bytes());
-        let candidate_id =
-            RawCandidateId { slot: SlotIndex::new(idx), hash: UInt256::from(hash_bytes) };
-        insert_received_candidate(
-            &mut fixture.processor,
-            &candidate_id,
-            root_block_id.clone(),
-            true,
-            Some(prev_id.clone()),
-        );
-        prev_id = candidate_id;
-    }
-
-    let child_id =
-        RawCandidateId { slot: SlotIndex::new(chain_len + 1), hash: UInt256::from([0x64; 32]) };
-    let raw_candidate =
-        make_test_empty_candidate_with_block(child_id, prev_id, root_block_id.clone());
-
-    assert_eq!(
-        fixture.processor.resolve_parent_normal_tip(&raw_candidate),
-        Some(root_block_id),
-        "deep empty chains past 10k must still resolve normal tip (hard stop is 100k)"
-    );
-}
-
-#[test]
-fn test_find_first_missing_parent_metadata_allows_deep_empty_chain_beyond_warn_threshold() {
-    let mut fixture = TestFixture::new(4);
-
-    let missing_id = RawCandidateId { slot: SlotIndex::new(0), hash: UInt256::from([0x71; 32]) };
-    let referenced_block = BlockIdExt::with_params(
-        ShardIdent::masterchain(),
-        1,
-        UInt256::from([0x72; 32]),
-        UInt256::from([0x73; 32]),
-    );
-
-    let chain_len = EMPTY_CHAIN_WARN_DEPTH + 32;
-    let mut prev_id = missing_id.clone();
-    for idx in 1..=chain_len {
-        let mut hash_bytes = [0u8; 32];
-        hash_bytes[..4].copy_from_slice(&(idx + 10_000).to_le_bytes());
-        let candidate_id =
-            RawCandidateId { slot: SlotIndex::new(idx), hash: UInt256::from(hash_bytes) };
-        insert_received_candidate(
-            &mut fixture.processor,
-            &candidate_id,
-            referenced_block.clone(),
-            true,
-            Some(prev_id.clone()),
-        );
-        prev_id = candidate_id;
-    }
-
-    let raw_candidate = make_test_empty_candidate_with_block(
-        RawCandidateId { slot: SlotIndex::new(chain_len + 1), hash: UInt256::from([0x74; 32]) },
-        prev_id,
-        referenced_block,
-    );
-
-    assert_eq!(
-        fixture.processor.find_first_missing_parent_metadata(&raw_candidate),
-        Some(missing_id),
-        "deep empty chains past 10k must continue walking and request the true missing parent"
     );
 }
 
@@ -4840,7 +5184,8 @@ fn test_recovery_seed_received_candidates_preserves_persisted_empty_records() {
         UInt256::from([0xB4; 32]),
     );
 
-    fixture.processor.recovery_seed_received_candidates(&[
+    let mut bootstrap = empty_bootstrap();
+    bootstrap.finalized_blocks = vec![
         FinalizedBlockRecord {
             candidate_id: c1.clone(),
             block_id: b1.clone(),
@@ -4859,17 +5204,18 @@ fn test_recovery_seed_received_candidates_preserves_persisted_empty_records() {
             parent: Some(c2.clone()),
             is_final: true,
         },
-    ]);
+    ];
+    run_apply_bootstrap(&mut fixture, bootstrap);
 
-    let root = fixture.processor.received_candidates.get(&c1).expect("root record");
+    let root = fixture.processor.candidate_book().received(&c1).expect("root record");
     assert!(!root.is_empty);
 
-    let empty = fixture.processor.received_candidates.get(&c2).expect("empty record");
+    let empty = fixture.processor.candidate_book().received(&c2).expect("empty record");
     assert!(empty.is_empty, "persisted empty MC record must remain marked empty on recovery");
     assert_eq!(empty.parent_id.as_ref(), Some(&c1));
     assert_eq!(empty.block_id, b1);
 
-    let child = fixture.processor.received_candidates.get(&c3).expect("child record");
+    let child = fixture.processor.candidate_book().received(&c3).expect("child record");
     assert!(!child.is_empty);
     assert_eq!(child.parent_id.as_ref(), Some(&c2));
     assert_eq!(child.block_id, b3);
@@ -4903,6 +5249,7 @@ fn test_foreign_notarization_cert_is_relayed() {
     };
 
     fixture.processor.handle_notarization_reached(event);
+    fixture.drain_pending_async_db_results();
 
     let actions = fixture.drain_receiver_actions();
     assert!(
@@ -4935,6 +5282,7 @@ fn test_foreign_finalization_cert_is_relayed() {
     };
 
     fixture.processor.handle_finalization_reached(event);
+    fixture.drain_pending_async_db_results();
 
     let actions = fixture.drain_receiver_actions();
     assert!(
@@ -4991,20 +5339,466 @@ fn test_recovery_drain_startup_events_drops_certificate_relay_events() {
         .expect("set_notarize_certificate should succeed");
     assert!(stored, "notar cert should be stored before startup drain");
 
-    let kept_votes =
-        crate::startup_recovery::SessionStartupRecoveryListener::recovery_drain_startup_events(
-            &mut fixture.processor,
-        );
-    assert!(
-        kept_votes.is_empty(),
-        "this setup should produce only certificate events, no startup votes"
-    );
+    // Run startup recovery with a minimal non-empty bootstrap so the drain step
+    // (step 5: keep BroadcastVote only) executes and drops the pre-seeded
+    // NotarizationReached relay event. The finalized block sits at slot 0 so it
+    // does not interfere with the notar cert at slot 3.
+    let mut bootstrap = empty_bootstrap();
+    bootstrap.finalized_blocks = vec![crate::database::FinalizedBlockRecord {
+        candidate_id: make_candidate_id(0, 0x01),
+        block_id: make_block_id(1),
+        parent: None,
+        is_final: true,
+    }];
+    run_apply_bootstrap(&mut fixture, bootstrap);
 
+    // Clear restore-time receiver traffic, then verify the first normal tick does
+    // not re-broadcast the drained certificate-relay event.
+    fixture.drain_receiver_actions();
     fixture.processor.check_all();
     let actions = fixture.drain_receiver_actions();
     assert!(
         !actions.iter().any(|a| matches!(a, ReceiverAction::SendCertificate { .. })),
         "drained startup certificate events must not be re-broadcast on first normal tick"
+    );
+}
+
+// ============================================================================
+// Startup recovery orchestration (apply_bootstrap) — state-based tests
+//
+// These exercise the full `SessionStartupRecoveryProcessor::apply_bootstrap`
+// pipeline against a real `SessionProcessor` (which implements
+// `StartupRecoveryBackend`) and assert on the resulting kernel state +
+// drained receiver actions, replacing the former mock-listener ordering tests.
+// ============================================================================
+
+#[test]
+fn test_apply_bootstrap_restores_state_first_commit_strategy() {
+    // 2-validator session where self is validator 1.
+    let mut fixture = TestFixture::new_with_local_idx(2, 1, SessionOptions::default());
+    let session_id = fixture.description.get_session_id().clone();
+    let self_idx = ValidatorIndex::new(1);
+
+    let vote0 = crate::simplex_state::Vote::Notarize(crate::simplex_state::NotarizeVote {
+        slot: SlotIndex::new(10),
+        block_hash: UInt256::from([0xAA; 32]),
+    });
+    let vote1 = crate::simplex_state::Vote::Notarize(crate::simplex_state::NotarizeVote {
+        slot: SlotIndex::new(11),
+        block_hash: UInt256::from([0xBB; 32]),
+    });
+
+    let mut bootstrap = empty_bootstrap();
+    bootstrap.votes = vec![
+        make_vote_record(ValidatorIndex::new(0), vote0, &session_id, &fixture.nodes),
+        make_vote_record(self_idx, vote1, &session_id, &fixture.nodes),
+    ];
+    bootstrap.finalized_blocks = vec![
+        FinalizedBlockRecord {
+            candidate_id: make_candidate_id(5, 0x55),
+            block_id: make_block_id(100),
+            parent: None,
+            is_final: true,
+        },
+        FinalizedBlockRecord {
+            candidate_id: make_candidate_id(7, 0x77),
+            block_id: make_block_id(101),
+            parent: None,
+            is_final: true,
+        },
+    ];
+    bootstrap.notar_certs = vec![NotarCertRecord {
+        candidate_id: make_candidate_id(5, 0x55),
+        notar_cert_bytes: vec![1, 2, 3].into(),
+    }];
+    bootstrap.pool_state =
+        Some(PoolStateRecord { first_nonannounced_window: crate::block::WindowIndex::new(2) });
+
+    run_apply_bootstrap(&mut fixture, bootstrap);
+
+    // Finalized boundary = max finalized slot (7) + 1.
+    assert_eq!(
+        fixture.processor.simplex_state.get_first_non_finalized_slot(),
+        SlotIndex::new(8),
+        "finalized boundary must be max finalized slot + 1"
+    );
+
+    // Both finalized records seeded into received_candidates for restart lookups.
+    assert!(fixture.processor.candidate_book().received(&make_candidate_id(5, 0x55)).is_some());
+    assert!(fixture.processor.candidate_book().received(&make_candidate_id(7, 0x77)).is_some());
+
+    // Last-finalized notification advanced the finalized head to the newest record.
+    assert_eq!(fixture.processor.consensus.finalized_head_seqno(), Some(101));
+    assert_eq!(fixture.processor.consensus.finalized_head_slot(), Some(SlotIndex::new(7)));
+
+    let actions = fixture.drain_receiver_actions();
+    assert!(
+        actions.iter().any(|a| matches!(a, ReceiverAction::CacheNotarizationCert { slot: 5, .. })),
+        "notar cert must be restored into the receiver cache"
+    );
+    assert!(
+        actions.iter().any(|a| matches!(a, ReceiverAction::SetIngressSlotBegin { slot: 8 })),
+        "receiver ingress lower bound must be synced to the restored frontier"
+    );
+}
+
+#[test]
+fn test_apply_bootstrap_replays_final_certs_repairs_boundary() {
+    let mut fixture = TestFixture::new(4);
+    let session_id = fixture.description.get_session_id().clone();
+
+    let restored_final = make_candidate_id(736, 0xF7);
+    let final_cert =
+        make_final_cert_record(&session_id, &fixture.nodes, restored_final.clone(), &[0, 1, 2]);
+
+    let mut bootstrap = empty_bootstrap();
+    bootstrap.finalized_blocks = vec![FinalizedBlockRecord {
+        candidate_id: make_candidate_id(31, 0x31),
+        block_id: make_block_id(143_023),
+        parent: None,
+        is_final: true,
+    }];
+    bootstrap.final_certs = vec![final_cert];
+    bootstrap.pool_state =
+        Some(PoolStateRecord { first_nonannounced_window: crate::block::WindowIndex::new(94) });
+
+    run_apply_bootstrap(&mut fixture, bootstrap);
+
+    // Replaying the persisted FinalCert during recovery repairs the
+    // finalized boundary BEYOND the filtered finalized_blocks (slot 31 -> 737),
+    // which suppresses restart-skip generation for the already-finalized slot.
+    assert_eq!(
+        fixture.processor.simplex_state.get_first_non_finalized_slot(),
+        SlotIndex::new(737),
+        "FinalCert replay must repair the finalized boundary beyond finalized_blocks"
+    );
+    assert!(
+        fixture
+            .processor
+            .simplex_state
+            .get_finalize_certificate(restored_final.slot, &restored_final.hash)
+            .is_some(),
+        "persisted FinalCert must be seeded into simplex_state during recovery"
+    );
+}
+
+#[test]
+fn test_apply_bootstrap_replays_skip_certs() {
+    let mut fixture = TestFixture::new(4);
+    let session_id = fixture.description.get_session_id().clone();
+
+    let skip_slot = SlotIndex::new(656);
+    let skip_cert = make_skip_cert_record(&session_id, &fixture.nodes, skip_slot, &[0, 1, 2]);
+
+    let mut bootstrap = empty_bootstrap();
+    bootstrap.finalized_blocks = vec![FinalizedBlockRecord {
+        candidate_id: make_candidate_id(639, 0x63),
+        block_id: make_block_id(136_107),
+        parent: None,
+        is_final: true,
+    }];
+    bootstrap.skip_certs = vec![skip_cert];
+    bootstrap.pool_state =
+        Some(PoolStateRecord { first_nonannounced_window: crate::block::WindowIndex::new(83) });
+
+    run_apply_bootstrap(&mut fixture, bootstrap);
+
+    // Persisted SkipCert must be replayed/seeded during recovery (before
+    // restart-skip generation) so the skipped-slot progress cursor is restored.
+    assert!(
+        fixture.processor.simplex_state.has_skip_certificate(skip_slot),
+        "persisted SkipCert must be seeded into simplex_state during recovery"
+    );
+}
+
+#[test]
+fn test_apply_bootstrap_seeds_persisted_empty_mc_chain() {
+    let mut fixture = TestFixture::new(4);
+
+    let c1 = make_candidate_id(10, 0xA1);
+    let c2 = make_candidate_id(11, 0xA2);
+    let c3 = make_candidate_id(12, 0xA3);
+
+    let mut bootstrap = empty_bootstrap();
+    bootstrap.finalized_blocks = vec![
+        FinalizedBlockRecord {
+            candidate_id: c1.clone(),
+            block_id: make_block_id(100),
+            parent: None,
+            is_final: true,
+        },
+        // c2 shares c1's block_id (seqno 100) -> recognized as an empty MC record.
+        FinalizedBlockRecord {
+            candidate_id: c2.clone(),
+            block_id: make_block_id(100),
+            parent: Some(c1.clone()),
+            is_final: true,
+        },
+        FinalizedBlockRecord {
+            candidate_id: c3.clone(),
+            block_id: make_block_id(101),
+            parent: Some(c2.clone()),
+            is_final: true,
+        },
+    ];
+
+    run_apply_bootstrap(&mut fixture, bootstrap);
+
+    assert!(fixture.processor.candidate_book().received(&c1).is_some());
+    let mid = fixture.processor.candidate_book().received(&c2).expect("middle record");
+    assert!(mid.is_empty, "shared-block-id record must be marked empty on recovery");
+    assert_eq!(mid.parent_id.as_ref(), Some(&c1));
+    assert!(fixture.processor.candidate_book().received(&c3).is_some());
+
+    // Last-finalized notification still targets the newest final record.
+    assert_eq!(fixture.processor.consensus.finalized_head_seqno(), Some(101));
+    assert_eq!(fixture.processor.consensus.finalized_head_slot(), Some(c3.slot));
+}
+
+#[test]
+fn test_apply_bootstrap_does_not_generate_skip_votes_when_window_zero() {
+    let mut fixture = TestFixture::new(4);
+
+    let mut bootstrap = empty_bootstrap();
+    bootstrap.finalized_blocks = vec![FinalizedBlockRecord {
+        candidate_id: make_candidate_id(1, 0x11),
+        block_id: make_block_id(1),
+        parent: None,
+        is_final: true,
+    }];
+    bootstrap.pool_state =
+        Some(PoolStateRecord { first_nonannounced_window: crate::block::WindowIndex::new(0) });
+
+    run_apply_bootstrap(&mut fixture, bootstrap);
+
+    assert_eq!(
+        fixture.processor.simplex_state.get_first_non_finalized_slot(),
+        SlotIndex::new(2),
+        "finalized boundary must be max finalized slot + 1"
+    );
+    assert_eq!(fixture.processor.consensus.finalized_head_seqno(), Some(1));
+
+    // first_nonannounced_window == 0 => no restart skip votes generated, so the
+    // first normal tick broadcasts no votes.
+    fixture.drain_receiver_actions();
+    fixture.processor.check_all();
+    let actions = fixture.drain_receiver_actions();
+    assert!(
+        !actions.iter().any(|a| matches!(a, ReceiverAction::SendVote { .. })),
+        "no restart skip votes must be generated when first_nonannounced_window=0"
+    );
+}
+
+#[test]
+fn test_apply_bootstrap_restore_candidate_bytes_roundtrip_empty_and_non_empty() {
+    let mut fixture = TestFixture::new(1); // single validator is enough for this test
+
+    let shard = ShardIdent::masterchain();
+    let max_size = 1_000_000;
+
+    // Parent candidate id (used by both empty and non-empty for parent linkage).
+    let parent_id = RawCandidateId { slot: SlotIndex::new(9), hash: UInt256::from([0xAA; 32]) };
+
+    // Empty block record (CandidateHashDataEmpty).
+    let empty_referenced_block = BlockIdExt {
+        shard_id: shard.clone(),
+        seq_no: 50,
+        root_hash: UInt256::from([0x10; 32]),
+        file_hash: UInt256::from([0x11; 32]),
+    };
+    let empty_hash = crate::utils::compute_candidate_id_hash_empty(
+        &empty_referenced_block,
+        (parent_id.slot, &parent_id.hash),
+    );
+    let empty_candidate_id = RawCandidateId { slot: SlotIndex::new(10), hash: empty_hash };
+
+    // Non-empty block record (CandidateHashDataOrdinary + real candidate TL bytes).
+    let non_empty_round_seqno: i32 = 51;
+    let non_empty_root_hash = UInt256::from([0x22; 32]);
+    let non_empty_data = make_test_boc(b"block_data_bytes", BocFlags::all());
+    let non_empty_collated = make_test_boc(b"collated_data_bytes", BocFlags::Crc32);
+    let candidate_payload_bytes = make_validator_session_candidate_bytes(
+        non_empty_round_seqno,
+        non_empty_root_hash.clone(),
+        non_empty_data.clone(),
+        non_empty_collated.clone(),
+    );
+
+    let non_empty_hash = crate::utils::compute_candidate_id_hash_from_bytes(
+        SlotIndex::new(11),
+        &candidate_payload_bytes,
+        Some((parent_id.slot, &parent_id.hash)),
+        &shard,
+        max_size,
+        0,
+    )
+    .expect("compute_candidate_id_hash_from_bytes failed");
+    let non_empty_candidate_id = RawCandidateId { slot: SlotIndex::new(11), hash: non_empty_hash };
+
+    let non_empty_file_hash = UInt256::from_slice(&sha256_digest(&non_empty_data));
+    let non_empty_collated_file_hash = UInt256::from_slice(&sha256_digest(&non_empty_collated));
+    let non_empty_block_id = BlockIdExt {
+        shard_id: shard.clone(),
+        seq_no: non_empty_round_seqno as u32,
+        root_hash: non_empty_root_hash.clone(),
+        file_hash: non_empty_file_hash.clone(),
+    };
+
+    let empty_info = CandidateInfoRecord {
+        candidate_id: empty_candidate_id.clone(),
+        leader_idx: 0,
+        candidate_hash_data: make_candidate_hash_data_empty(
+            empty_referenced_block.clone(),
+            parent_id.clone(),
+        ),
+        signature: vec![0xE1; 64].into(),
+    };
+    let non_empty_info = CandidateInfoRecord {
+        candidate_id: non_empty_candidate_id.clone(),
+        leader_idx: 0,
+        candidate_hash_data: make_candidate_hash_data_with_parent(
+            non_empty_block_id.clone(),
+            non_empty_collated_file_hash.clone(),
+            Some(parent_id.clone()),
+        ),
+        signature: vec![0xB1; 64].into(),
+    };
+
+    let mut bootstrap = empty_bootstrap();
+    bootstrap.finalized_blocks = vec![
+        FinalizedBlockRecord {
+            candidate_id: empty_candidate_id.clone(),
+            block_id: empty_referenced_block.clone(),
+            parent: Some(parent_id.clone()),
+            is_final: true,
+        },
+        FinalizedBlockRecord {
+            candidate_id: non_empty_candidate_id.clone(),
+            block_id: non_empty_block_id.clone(),
+            parent: Some(empty_candidate_id.clone()),
+            is_final: true,
+        },
+    ];
+    bootstrap.candidate_infos = vec![empty_info.clone(), non_empty_info];
+
+    run_apply_bootstrap(&mut fixture, bootstrap);
+
+    // Only the empty candidate is cached; non-empty candidates are resolved via
+    // peer overlay, not reconstructed during recovery.
+    let actions = fixture.drain_receiver_actions();
+    let cached: Vec<(u32, UInt256, Vec<u8>)> = actions
+        .iter()
+        .filter_map(|a| match a {
+            ReceiverAction::CacheCandidateBytes { slot, block_hash, candidate_data } => {
+                Some((*slot, block_hash.clone(), candidate_data.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(cached.len(), 1, "only the empty candidate must be cached during recovery");
+
+    let (slot, _hash, bytes) = &cached[0];
+    assert_eq!(*slot, empty_candidate_id.slot.value());
+    let msg = deserialize_boxed(bytes).expect("deserialize CandidateData");
+    let candidate_data = msg.downcast::<CandidateData>().expect("downcast CandidateData");
+    match candidate_data {
+        CandidateData::Consensus_Empty(empty) => {
+            assert_eq!(SlotIndex::new(empty.slot as u32), empty_candidate_id.slot);
+            assert_eq!(empty.signature, empty_info.signature);
+            assert_eq!(empty.block, empty_referenced_block);
+            assert_eq!(SlotIndex::new(*empty.parent.slot() as u32), parent_id.slot);
+            assert_eq!(empty.parent.hash(), &parent_id.hash);
+        }
+        CandidateData::Consensus_Block(_) => {
+            panic!("non-empty block should not be cached during startup recovery");
+        }
+    }
+}
+
+#[test]
+fn test_apply_bootstrap_restore_candidate_bytes_skips_non_empty_and_keeps_empty() {
+    let mut fixture = TestFixture::new(1);
+
+    let shard = ShardIdent::masterchain();
+    let parent_id = RawCandidateId { slot: SlotIndex::new(9), hash: UInt256::from([0xAA; 32]) };
+
+    // Empty candidate (valid, reconstructable).
+    let empty_block = BlockIdExt {
+        shard_id: shard.clone(),
+        seq_no: 7,
+        root_hash: UInt256::from([0x10; 32]),
+        file_hash: UInt256::from([0x11; 32]),
+    };
+    let empty_hash = crate::utils::compute_candidate_id_hash_empty(
+        &empty_block,
+        (parent_id.slot, &parent_id.hash),
+    );
+    let empty_candidate_id = RawCandidateId { slot: SlotIndex::new(10), hash: empty_hash };
+
+    // Non-empty candidate (skipped during recovery).
+    let non_empty_candidate_id =
+        RawCandidateId { slot: SlotIndex::new(11), hash: UInt256::from([0x22; 32]) };
+    let non_empty_block_id = BlockIdExt {
+        shard_id: shard.clone(),
+        seq_no: 8,
+        root_hash: UInt256::from([0x33; 32]),
+        file_hash: UInt256::from([0x44; 32]),
+    };
+
+    let empty_info = CandidateInfoRecord {
+        candidate_id: empty_candidate_id.clone(),
+        leader_idx: 0,
+        candidate_hash_data: make_candidate_hash_data_empty(empty_block.clone(), parent_id.clone()),
+        signature: vec![0xE1; 64].into(),
+    };
+    let non_empty_info = CandidateInfoRecord {
+        candidate_id: non_empty_candidate_id.clone(),
+        leader_idx: 0,
+        candidate_hash_data: make_candidate_hash_data_with_parent(
+            non_empty_block_id.clone(),
+            UInt256::from([0x55; 32]),
+            Some(parent_id.clone()),
+        ),
+        signature: vec![0xB1; 64].into(),
+    };
+
+    let mut bootstrap = empty_bootstrap();
+    bootstrap.finalized_blocks = vec![
+        FinalizedBlockRecord {
+            candidate_id: empty_candidate_id.clone(),
+            block_id: empty_block.clone(),
+            parent: Some(parent_id.clone()),
+            is_final: true,
+        },
+        FinalizedBlockRecord {
+            candidate_id: non_empty_candidate_id.clone(),
+            block_id: non_empty_block_id.clone(),
+            parent: Some(empty_candidate_id.clone()),
+            is_final: true,
+        },
+    ];
+    bootstrap.candidate_infos = vec![empty_info, non_empty_info];
+
+    run_apply_bootstrap(&mut fixture, bootstrap);
+
+    let actions = fixture.drain_receiver_actions();
+    let cached: Vec<(u32, UInt256, Vec<u8>)> = actions
+        .iter()
+        .filter_map(|a| match a {
+            ReceiverAction::CacheCandidateBytes { slot, block_hash, candidate_data } => {
+                Some((*slot, block_hash.clone(), candidate_data.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(cached.len(), 1, "empty candidate cached, non-empty skipped (not fetched)");
+    assert_eq!(cached[0].0, SlotIndex::new(10).value());
+
+    let msg = deserialize_boxed(&cached[0].2).expect("deserialize CandidateData");
+    let candidate_data = msg.downcast::<CandidateData>().expect("downcast CandidateData");
+    assert!(
+        matches!(candidate_data, CandidateData::Consensus_Empty(_)),
+        "expected empty candidate to be reconstructed"
     );
 }
 
@@ -5041,46 +5835,42 @@ fn test_journal_cleanup_removes_stale_entries() {
 
     let now = fixture.description.get_time();
 
-    fixture.processor.finalized_pending_body.insert(
+    fixture.processor.consensus.insert_pending_body_for_test(
         old_id.clone(),
-        FinalizedEntry {
-            event: BlockFinalizedEvent {
-                slot: old_slot,
-                block_hash: old_hash,
-                block_id: None,
-                certificate: dummy_cert,
-            },
-            finalized_at: now - Duration::from_secs(60),
+        BlockFinalizedEvent {
+            slot: old_slot,
+            block_hash: old_hash,
+            block_id: None,
+            certificate: dummy_cert,
         },
+        now - Duration::from_secs(60),
     );
 
-    fixture.processor.finalized_pending_body.insert(
+    fixture.processor.consensus.insert_pending_body_for_test(
         current_id.clone(),
-        FinalizedEntry {
-            event: BlockFinalizedEvent {
-                slot: current_slot,
-                block_hash: current_hash,
-                block_id: None,
-                certificate: dummy_cert2,
-            },
-            finalized_at: now,
+        BlockFinalizedEvent {
+            slot: current_slot,
+            block_hash: current_hash,
+            block_id: None,
+            certificate: dummy_cert2,
         },
+        now,
     );
 
-    assert_eq!(fixture.processor.finalized_pending_body.len(), 2);
+    assert_eq!(fixture.processor.consensus.finalized_pending_body_len(), 2);
 
     let errors_before =
-        fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
 
     // Cleanup slots < 10 — old_slot(5) should be removed, current_slot(20) kept.
     fixture.processor.cleanup_old_candidates(SlotIndex::new(10));
 
-    assert_eq!(fixture.processor.finalized_pending_body.len(), 1);
-    assert!(!fixture.processor.finalized_pending_body.contains_key(&old_id));
-    assert!(fixture.processor.finalized_pending_body.contains_key(&current_id));
+    assert_eq!(fixture.processor.consensus.finalized_pending_body_len(), 1);
+    assert!(!fixture.processor.consensus.finalized_pending_body_contains(&old_id));
+    assert!(fixture.processor.consensus.finalized_pending_body_contains(&current_id));
 
     let errors_after =
-        fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
     assert_eq!(
         errors_after, errors_before,
         "stale finalized-journal entries should be pruned without incrementing error count"
@@ -5099,22 +5889,22 @@ fn test_cleanup_old_candidates_prunes_candidate_info_store_results() {
     fixture.processor.on_candidate_received(leader_new, new_broadcast, None);
 
     assert!(
-        fixture.processor.candidate_info_store_results.contains_key(&old_id),
+        fixture.processor.database.contains_candidate_info_store(&old_id),
         "old candidate must exist before cleanup"
     );
     assert!(
-        fixture.processor.candidate_info_store_results.contains_key(&new_id),
+        fixture.processor.database.contains_candidate_info_store(&new_id),
         "new candidate must exist before cleanup"
     );
 
     fixture.processor.cleanup_old_candidates(SlotIndex::new(10));
 
     assert!(
-        !fixture.processor.candidate_info_store_results.contains_key(&old_id),
+        !fixture.processor.database.contains_candidate_info_store(&old_id),
         "candidate_info_store_results must prune entries below cleanup slot"
     );
     assert!(
-        fixture.processor.candidate_info_store_results.contains_key(&new_id),
+        fixture.processor.database.contains_candidate_info_store(&new_id),
         "candidate_info_store_results must keep entries at/above cleanup slot"
     );
 }
@@ -5131,19 +5921,19 @@ fn test_finalized_callback_not_emitted_when_finalized_record_persist_fails() {
 
     let recording = RecordingListener::new();
     let listener: Arc<dyn consensus_common::SessionListener + Send + Sync> = recording.clone();
-    fixture.processor.listener = Arc::downgrade(&listener);
+    fixture.processor.set_listener_for_test(Arc::downgrade(&listener));
 
     let (leader_source, candidate_id, broadcast) =
         make_signed_block_broadcast(&fixture, 94, vec![0x10, 0x20, 0x30]);
     fixture.processor.on_candidate_received(leader_source, broadcast, None);
     let received = fixture
         .processor
-        .received_candidates
-        .get(&candidate_id)
+        .candidate_book()
+        .received(&candidate_id)
         .expect("candidate must exist")
         .clone();
 
-    fixture.processor.db.fail_next_finalized_block_save_for_test();
+    fixture.processor.database.db().fail_next_finalized_block_save_for_test();
     fixture.processor.handle_block_finalized(BlockFinalizedEvent {
         slot: candidate_id.slot,
         block_hash: candidate_id.hash.clone(),
@@ -5157,24 +5947,41 @@ fn test_finalized_callback_not_emitted_when_finalized_record_persist_fails() {
         "callback must not be emitted when finalized record persistence fails"
     );
     assert!(
-        !fixture.processor.finalized_blocks.contains(&candidate_id),
+        !fixture.processor.consensus.is_finalized_block(&candidate_id),
         "candidate must not enter finalized_blocks set on persist failure"
     );
     assert!(
-        fixture.processor.finalized_pending_body.contains_key(&candidate_id),
+        fixture.processor.consensus.finalized_pending_body_contains(&candidate_id),
         "trigger must remain pending for retry after persist failure"
     );
 }
 
+/// Finalized-record persist now happens asynchronously through the SXMAIN
+/// async-DB-results registry (`maybe_apply_finalized_state` migration). The
+/// listener callback fires before the persist completes — matching C++
+/// `state-resolver.cpp::do_finalize_blocks`:
+///
+/// ```text
+///   co_await owning_bus().publish<FinalizeBlock>(candidate, sig_set);  // callback
+///   ...
+///   co_await bus.db->set(std::move(key), td::BufferSlice());           // persist
+/// ```
+///
+/// This test verifies the new ordering invariants:
+/// 1. The `on_block_finalized` callback fires (immediately, with the in-memory
+///    state already applied).
+/// 2. The finalized record is eventually durable in the DB after the SXMAIN
+///    registry continuation drains and the storage queue flushes.
 #[test]
-fn test_finalized_callback_observes_persisted_record() {
-    struct PersistOrderListener {
+fn test_finalized_callback_fires_then_record_eventually_persists() {
+    struct CallbackTracker {
         db: crate::database::SimplexDbPtr,
         candidate_id: RawCandidateId,
-        persisted_visible: Arc<AtomicBool>,
+        callback_invoked: Arc<AtomicBool>,
+        persisted_visible_during_callback: Arc<AtomicBool>,
     }
 
-    impl consensus_common::SessionListener for PersistOrderListener {
+    impl consensus_common::SessionListener for CallbackTracker {
         fn on_candidate(
             &self,
             _source_info: BlockSourceInfo,
@@ -5188,7 +5995,7 @@ fn test_finalized_callback_observes_persisted_record() {
         fn on_generate_slot(
             &self,
             _source_info: BlockSourceInfo,
-            _request: AsyncRequestPtr,
+            _request: AsyncCollationRequestPtr,
             _parent: CollationParentHint,
             _callback: ValidatorBlockCandidateCallback,
         ) {
@@ -5221,15 +6028,17 @@ fn test_finalized_callback_observes_persisted_record() {
             _signatures: BlockSignaturesVariant,
             _approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
         ) {
+            self.callback_invoked.store(true, Ordering::Relaxed);
+            // Snapshot DB visibility at callback time — informational only.
+            // The new ordering does NOT guarantee the record is persisted yet
+            // (matches C++ which `co_await`s FinalizeBlock before db->set).
             let has_record = self
                 .db
                 .load_finalized_blocks()
                 .expect("finalized records load must succeed")
                 .iter()
                 .any(|record| record.candidate_id == self.candidate_id);
-            if has_record {
-                self.persisted_visible.store(true, Ordering::Relaxed);
-            }
+            self.persisted_visible_during_callback.store(has_record, Ordering::Relaxed);
         }
 
         fn get_approved_candidate(
@@ -5241,7 +6050,7 @@ fn test_finalized_callback_observes_persisted_record() {
             _callback: ValidatorBlockCandidateCallback,
         ) {
             panic!(
-                "unexpected legacy get_approved_candidate request in PersistOrderListener (root_hash={})",
+                "unexpected legacy get_approved_candidate request in CallbackTracker (root_hash={})",
                 root_hash.to_hex_string()
             );
         }
@@ -5256,19 +6065,21 @@ fn test_finalized_callback_observes_persisted_record() {
     fixture.processor.on_candidate_received(leader_source, broadcast, None);
     let received = fixture
         .processor
-        .received_candidates
-        .get(&candidate_id)
+        .candidate_book()
+        .received(&candidate_id)
         .expect("candidate must exist")
         .clone();
 
-    let persisted_visible = Arc::new(AtomicBool::new(false));
+    let callback_invoked = Arc::new(AtomicBool::new(false));
+    let persisted_visible_during_callback = Arc::new(AtomicBool::new(false));
     let listener: Arc<dyn consensus_common::SessionListener + Send + Sync> =
-        Arc::new(PersistOrderListener {
-            db: fixture.processor.db.clone(),
+        Arc::new(CallbackTracker {
+            db: fixture.processor.database.db().clone(),
             candidate_id: candidate_id.clone(),
-            persisted_visible: persisted_visible.clone(),
+            callback_invoked: callback_invoked.clone(),
+            persisted_visible_during_callback: persisted_visible_during_callback.clone(),
         });
-    fixture.processor.listener = Arc::downgrade(&listener);
+    fixture.processor.set_listener_for_test(Arc::downgrade(&listener));
 
     fixture.processor.handle_block_finalized(BlockFinalizedEvent {
         slot: candidate_id.slot,
@@ -5278,8 +6089,31 @@ fn test_finalized_callback_observes_persisted_record() {
     });
 
     assert!(
-        persisted_visible.load(Ordering::Relaxed),
-        "on_block_finalized callback must observe persisted finalized record"
+        callback_invoked.load(Ordering::Relaxed),
+        "on_block_finalized callback must fire (state applied inline before persist)",
+    );
+    assert!(
+        fixture.processor.consensus.is_finalized_block(&candidate_id),
+        "finalized_blocks must contain the candidate after the inline apply",
+    );
+    let _ = persisted_visible_during_callback.load(Ordering::Relaxed);
+
+    // Drain the SXMAIN async-DB-results registry so the persist continuation
+    // runs, then sync the storage queue to flush the actual RocksDB write.
+    fixture.drain_pending_async_db_results();
+    fixture.processor.database.db().sync(Some(Duration::from_secs(2))).expect("sync must succeed");
+
+    let persisted_visible_after = fixture
+        .processor
+        .database
+        .db()
+        .load_finalized_blocks()
+        .expect("finalized records load must succeed")
+        .iter()
+        .any(|record| record.candidate_id == candidate_id);
+    assert!(
+        persisted_visible_after,
+        "finalized record must be visible in DB once registry drains and storage flushes",
     );
 }
 
@@ -5293,10 +6127,10 @@ fn test_finalized_with_body_advances_committed_seqno() {
 
     let recording = RecordingListener::new();
     let listener: Arc<dyn consensus_common::SessionListener + Send + Sync> = recording.clone();
-    fixture.processor.listener = Arc::downgrade(&listener);
+    fixture.processor.set_listener_for_test(Arc::downgrade(&listener));
 
-    assert_eq!(fixture.processor.finalized_head_seqno, Some(0));
-    assert_eq!(fixture.processor.last_consensus_finalized_seqno, Some(0));
+    assert_eq!(fixture.processor.consensus.finalized_head_seqno(), Some(0));
+    assert_eq!(fixture.processor.consensus.last_consensus_finalized_seqno(), Some(0));
 
     let slot = 5u32;
     let (leader_source, candidate_id, broadcast) =
@@ -5305,8 +6139,8 @@ fn test_finalized_with_body_advances_committed_seqno() {
 
     let received = fixture
         .processor
-        .received_candidates
-        .get(&candidate_id)
+        .candidate_book()
+        .received(&candidate_id)
         .expect("candidate must be present")
         .clone();
 
@@ -5319,17 +6153,17 @@ fn test_finalized_with_body_advances_committed_seqno() {
     fixture.processor.handle_block_finalized(event);
 
     assert_eq!(
-        fixture.processor.finalized_head_seqno,
+        fixture.processor.consensus.finalized_head_seqno(),
         Some(received.block_id.seq_no()),
         "finalized_head_seqno must advance to finalized block seqno"
     );
     assert_eq!(
-        fixture.processor.last_consensus_finalized_seqno,
+        fixture.processor.consensus.last_consensus_finalized_seqno(),
         Some(received.block_id.seq_no()),
         "last_consensus_finalized_seqno must advance to finalized block seqno"
     );
     assert!(
-        fixture.processor.finalized_blocks.contains(&candidate_id),
+        fixture.processor.consensus.is_finalized_block(&candidate_id),
         "candidate must be in finalized_blocks set"
     );
 
@@ -5350,14 +6184,14 @@ fn test_finalized_out_of_order_seqno_advances_monotonically() {
 
     let recording = RecordingListener::new();
     let listener: Arc<dyn consensus_common::SessionListener + Send + Sync> = recording.clone();
-    fixture.processor.listener = Arc::downgrade(&listener);
+    fixture.processor.set_listener_for_test(Arc::downgrade(&listener));
 
     let slot_high = 10u32;
     let (leader_high, id_high, broadcast_high) =
         make_signed_block_broadcast(&fixture, slot_high, vec![10, 20, 30]);
     fixture.processor.on_candidate_received(leader_high, broadcast_high, None);
 
-    let received_high = fixture.processor.received_candidates.get(&id_high).unwrap().clone();
+    let received_high = fixture.processor.candidate_book().received(&id_high).unwrap().clone();
 
     let event_high = BlockFinalizedEvent {
         slot: id_high.slot,
@@ -5367,15 +6201,15 @@ fn test_finalized_out_of_order_seqno_advances_monotonically() {
     };
     fixture.processor.handle_block_finalized(event_high);
 
-    let seqno_after_high = fixture.processor.finalized_head_seqno;
-    let consensus_after_high = fixture.processor.last_consensus_finalized_seqno;
+    let seqno_after_high = fixture.processor.consensus.finalized_head_seqno();
+    let consensus_after_high = fixture.processor.consensus.last_consensus_finalized_seqno();
 
     let slot_low = 3u32;
     let (leader_low, id_low, broadcast_low) =
         make_signed_block_broadcast(&fixture, slot_low, vec![40, 50, 60]);
     fixture.processor.on_candidate_received(leader_low, broadcast_low, None);
 
-    let received_low = fixture.processor.received_candidates.get(&id_low).unwrap().clone();
+    let received_low = fixture.processor.candidate_book().received(&id_low).unwrap().clone();
 
     let event_low = BlockFinalizedEvent {
         slot: id_low.slot,
@@ -5386,21 +6220,21 @@ fn test_finalized_out_of_order_seqno_advances_monotonically() {
     fixture.processor.handle_block_finalized(event_low);
 
     assert!(
-        fixture.processor.finalized_head_seqno >= seqno_after_high,
+        fixture.processor.consensus.finalized_head_seqno() >= seqno_after_high,
         "finalized_head_seqno must not decrease after lower-seqno finalization: \
         before={:?} after={:?}",
         seqno_after_high,
-        fixture.processor.finalized_head_seqno,
+        fixture.processor.consensus.finalized_head_seqno(),
     );
     assert!(
-        fixture.processor.last_consensus_finalized_seqno >= consensus_after_high,
+        fixture.processor.consensus.last_consensus_finalized_seqno() >= consensus_after_high,
         "last_consensus_finalized_seqno must not decrease after lower-seqno finalization: \
         before={:?} after={:?}",
         consensus_after_high,
-        fixture.processor.last_consensus_finalized_seqno,
+        fixture.processor.consensus.last_consensus_finalized_seqno(),
     );
-    assert!(fixture.processor.finalized_blocks.contains(&id_high));
-    assert!(fixture.processor.finalized_blocks.contains(&id_low));
+    assert!(fixture.processor.consensus.is_finalized_block(&id_high));
+    assert!(fixture.processor.consensus.is_finalized_block(&id_low));
 
     let events = recording.drain_events();
     let finalized_count =
@@ -5418,14 +6252,14 @@ fn test_finalized_duplicate_is_idempotent() {
 
     let recording = RecordingListener::new();
     let listener: Arc<dyn consensus_common::SessionListener + Send + Sync> = recording.clone();
-    fixture.processor.listener = Arc::downgrade(&listener);
+    fixture.processor.set_listener_for_test(Arc::downgrade(&listener));
 
     let slot = 7u32;
     let (leader_source, candidate_id, broadcast) =
         make_signed_block_broadcast(&fixture, slot, vec![0xDE, 0xAD]);
     fixture.processor.on_candidate_received(leader_source, broadcast, None);
 
-    let received = fixture.processor.received_candidates.get(&candidate_id).unwrap().clone();
+    let received = fixture.processor.candidate_book().received(&candidate_id).unwrap().clone();
 
     let event = BlockFinalizedEvent {
         slot: candidate_id.slot,
@@ -5435,14 +6269,14 @@ fn test_finalized_duplicate_is_idempotent() {
     };
     fixture.processor.handle_block_finalized(event.clone());
 
-    let seqno_after_first = fixture.processor.finalized_head_seqno;
-    let consensus_after_first = fixture.processor.last_consensus_finalized_seqno;
+    let seqno_after_first = fixture.processor.consensus.finalized_head_seqno();
+    let consensus_after_first = fixture.processor.consensus.last_consensus_finalized_seqno();
     let _ = recording.drain_events();
 
     fixture.processor.handle_block_finalized(event);
 
-    assert_eq!(fixture.processor.finalized_head_seqno, seqno_after_first);
-    assert_eq!(fixture.processor.last_consensus_finalized_seqno, consensus_after_first);
+    assert_eq!(fixture.processor.consensus.finalized_head_seqno(), seqno_after_first);
+    assert_eq!(fixture.processor.consensus.last_consensus_finalized_seqno(), consensus_after_first);
 
     let events_after_dup = recording.drain_events();
     assert!(
@@ -5459,13 +6293,13 @@ fn test_finalized_empty_block_does_not_advance_seqno() {
     opts.use_callback_thread = false;
     let mut fixture = TestFixture::new_with_opts(4, opts);
 
-    fixture.processor.finalized_head_seqno = Some(50);
-    fixture.processor.finalized_head_block_id = Some(BlockIdExt::with_params(
+    fixture.processor.consensus.set_finalized_head_seqno(Some(50));
+    fixture.processor.consensus.set_finalized_head_block_id(Some(BlockIdExt::with_params(
         ShardIdent::masterchain(),
         50,
         UInt256::rand(),
         UInt256::rand(),
-    ));
+    )));
 
     let slot = SlotIndex::new(22);
     let block_hash = UInt256::rand();
@@ -5478,12 +6312,11 @@ fn test_finalized_empty_block_does_not_advance_seqno() {
         UInt256::rand(),
     );
 
-    fixture.processor.received_candidates.insert(
+    fixture.processor.candidate_book_mut().insert_received(
         candidate_id.clone(),
         ReceivedCandidate {
             slot,
             source_idx: ValidatorIndex::new(0),
-            candidate_id_hash: block_hash.clone(),
             candidate_hash_data_bytes: vec![1, 2, 3],
             block_id: block_id.clone(),
             root_hash: block_id.root_hash.clone(),
@@ -5508,12 +6341,12 @@ fn test_finalized_empty_block_does_not_advance_seqno() {
     fixture.processor.handle_block_finalized(event);
 
     assert_eq!(
-        fixture.processor.finalized_head_seqno,
+        fixture.processor.consensus.finalized_head_seqno(),
         Some(50),
         "finalized_head_seqno must not advance for empty-block finalization"
     );
     assert!(
-        fixture.processor.finalized_blocks.contains(&candidate_id),
+        fixture.processor.consensus.is_finalized_block(&candidate_id),
         "empty-block candidate must be recorded in finalized_blocks"
     );
 }
@@ -5528,7 +6361,7 @@ fn test_finalized_reverse_order_keeps_highest_seqno() {
 
     let recording = RecordingListener::new();
     let listener: Arc<dyn consensus_common::SessionListener + Send + Sync> = recording.clone();
-    fixture.processor.listener = Arc::downgrade(&listener);
+    fixture.processor.set_listener_for_test(Arc::downgrade(&listener));
 
     let slots: Vec<u32> = vec![20, 15, 10, 5];
     let mut highest_seqno = 0u32;
@@ -5538,7 +6371,7 @@ fn test_finalized_reverse_order_keeps_highest_seqno() {
             make_signed_block_broadcast(&fixture, slot, vec![slot as u8, 0xFF]);
         fixture.processor.on_candidate_received(leader, bcast, None);
 
-        let received = fixture.processor.received_candidates.get(&cid).unwrap().clone();
+        let received = fixture.processor.candidate_book().received(&cid).unwrap().clone();
         let seqno = received.block_id.seq_no();
         if seqno > highest_seqno {
             highest_seqno = seqno;
@@ -5554,12 +6387,12 @@ fn test_finalized_reverse_order_keeps_highest_seqno() {
     }
 
     assert_eq!(
-        fixture.processor.finalized_head_seqno,
+        fixture.processor.consensus.finalized_head_seqno(),
         Some(highest_seqno),
         "finalized_head_seqno must be the highest seqno across all out-of-order finalizations"
     );
     assert_eq!(
-        fixture.processor.last_consensus_finalized_seqno,
+        fixture.processor.consensus.last_consensus_finalized_seqno(),
         Some(highest_seqno),
         "last_consensus_finalized_seqno must be the highest seqno across all out-of-order finalizations"
     );
@@ -5583,7 +6416,7 @@ fn test_finalized_clears_journal_entry_on_apply() {
         make_signed_block_broadcast(&fixture, slot, vec![0xCA, 0xFE]);
     fixture.processor.on_candidate_received(leader_source, broadcast, None);
 
-    let received = fixture.processor.received_candidates.get(&candidate_id).unwrap().clone();
+    let received = fixture.processor.candidate_book().received(&candidate_id).unwrap().clone();
 
     let event = BlockFinalizedEvent {
         slot: candidate_id.slot,
@@ -5594,11 +6427,11 @@ fn test_finalized_clears_journal_entry_on_apply() {
     fixture.processor.handle_block_finalized(event);
 
     assert!(
-        fixture.processor.finalized_pending_body.is_empty(),
+        fixture.processor.consensus.finalized_pending_body_is_empty(),
         "journal must be empty after finalization with body present"
     );
     assert!(
-        fixture.processor.finalized_blocks.contains(&candidate_id),
+        fixture.processor.consensus.is_finalized_block(&candidate_id),
         "candidate must be in finalized_blocks set"
     );
 }
@@ -5616,7 +6449,7 @@ fn test_recursive_finalization_defers_until_missing_parent_body_arrives() {
 
     let recording = RecordingListener::new();
     let listener: Arc<dyn consensus_common::SessionListener + Send + Sync> = recording.clone();
-    fixture.processor.listener = Arc::downgrade(&listener);
+    fixture.processor.set_listener_for_test(Arc::downgrade(&listener));
 
     let (parent_leader, parent_id, parent_broadcast) =
         make_signed_block_broadcast(&fixture, 41, vec![1u8, 2, 3]);
@@ -5630,8 +6463,8 @@ fn test_recursive_finalization_defers_until_missing_parent_body_arrives() {
     fixture.processor.on_candidate_received(child_leader, child_broadcast, None);
     let child_block = fixture
         .processor
-        .received_candidates
-        .get(&child_id)
+        .candidate_book()
+        .received(&child_id)
         .expect("child body must be present")
         .block_id
         .clone();
@@ -5644,6 +6477,9 @@ fn test_recursive_finalization_defers_until_missing_parent_body_arrives() {
         block_id: Some(child_block.clone()),
         certificate: make_test_final_cert(child_id.slot, child_id.hash.clone()),
     });
+    // Drain the deferred `request_candidate` bounce so the missing-parent
+    // repair request reaches the (fake) receiver before we inspect its actions.
+    fixture.run_pending_tasks();
 
     let initial_events = drain_finalized_events(&recording);
     assert_eq!(initial_events.len(), 1);
@@ -5652,7 +6488,7 @@ fn test_recursive_finalization_defers_until_missing_parent_body_arrives() {
         "trigger callback must be emitted immediately even when parent body is missing"
     );
     assert!(
-        fixture.processor.finalized_pending_body.contains_key(&child_id),
+        fixture.processor.consensus.finalized_pending_body_contains(&child_id),
         "trigger must remain in pending journal while parent body is missing"
     );
     assert!(
@@ -5668,8 +6504,8 @@ fn test_recursive_finalization_defers_until_missing_parent_body_arrives() {
     fixture.processor.on_candidate_received(parent_leader, parent_broadcast, None);
     let parent_block = fixture
         .processor
-        .received_candidates
-        .get(&parent_id)
+        .candidate_book()
+        .received(&parent_id)
         .expect("parent body must be present")
         .block_id
         .clone();
@@ -5680,7 +6516,7 @@ fn test_recursive_finalization_defers_until_missing_parent_body_arrives() {
         .iter()
         .any(|(block_id, is_final)| block_id == &parent_block && !is_final));
     assert!(
-        !fixture.processor.finalized_pending_body.contains_key(&child_id),
+        !fixture.processor.consensus.finalized_pending_body_contains(&child_id),
         "pending journal entry must clear after recursive completion"
     );
 }
@@ -5698,15 +6534,15 @@ fn test_recursive_finalization_defers_until_parent_notar_cert_arrives() {
 
     let recording = RecordingListener::new();
     let listener: Arc<dyn consensus_common::SessionListener + Send + Sync> = recording.clone();
-    fixture.processor.listener = Arc::downgrade(&listener);
+    fixture.processor.set_listener_for_test(Arc::downgrade(&listener));
 
     let (parent_leader, parent_id, parent_broadcast) =
         make_signed_block_broadcast(&fixture, 51, vec![7u8, 7, 7]);
     fixture.processor.on_candidate_received(parent_leader, parent_broadcast, None);
     let parent_block = fixture
         .processor
-        .received_candidates
-        .get(&parent_id)
+        .candidate_book()
+        .received(&parent_id)
         .expect("parent body must exist")
         .block_id
         .clone();
@@ -5720,8 +6556,8 @@ fn test_recursive_finalization_defers_until_parent_notar_cert_arrives() {
     fixture.processor.on_candidate_received(child_leader, child_broadcast, None);
     let child_block = fixture
         .processor
-        .received_candidates
-        .get(&child_id)
+        .candidate_book()
+        .received(&child_id)
         .expect("child body must exist")
         .block_id
         .clone();
@@ -5732,6 +6568,9 @@ fn test_recursive_finalization_defers_until_parent_notar_cert_arrives() {
         block_id: Some(child_block.clone()),
         certificate: make_test_final_cert(child_id.slot, child_id.hash.clone()),
     });
+    // Drain the deferred `request_candidate` bounce so the missing-ancestor
+    // repair request reaches the (fake) receiver before we inspect its actions.
+    fixture.run_pending_tasks();
 
     let initial_events = drain_finalized_events(&recording);
     assert_eq!(initial_events.len(), 1);
@@ -5740,7 +6579,7 @@ fn test_recursive_finalization_defers_until_parent_notar_cert_arrives() {
         "trigger callback must be emitted immediately even when ancestor NotarCert is missing"
     );
     assert!(
-        fixture.processor.finalized_pending_body.contains_key(&child_id),
+        fixture.processor.consensus.finalized_pending_body_contains(&child_id),
         "trigger must stay pending while ancestor NotarCert is missing"
     );
     assert!(
@@ -5761,6 +6600,10 @@ fn test_recursive_finalization_defers_until_parent_notar_cert_arrives() {
         &[0, 1, 2],
     );
     fixture.processor.process_received_notar_cert(parent_id.slot, &parent_id.hash, &notar_bytes);
+    // Notar-cert persist + FSM feed + retry_pending_recursive_finalization() now run from
+    // the SXMAIN async-DB-results registry continuation; drain so the recursive retry fires
+    // before we assert on its observable side-effects.
+    fixture.drain_pending_async_db_results();
 
     let finalized_events = drain_finalized_events(&recording);
     assert_eq!(finalized_events.len(), 1);
@@ -5768,7 +6611,7 @@ fn test_recursive_finalization_defers_until_parent_notar_cert_arrives() {
         .iter()
         .any(|(block_id, is_final)| block_id == &parent_block && !is_final));
     assert!(
-        !fixture.processor.finalized_pending_body.contains_key(&child_id),
+        !fixture.processor.consensus.finalized_pending_body_contains(&child_id),
         "pending journal entry must clear once notar cert arrives and retry runs"
     );
 }
@@ -5786,15 +6629,15 @@ fn test_recursive_finalization_traverses_empty_ancestor_without_callback() {
 
     let recording = RecordingListener::new();
     let listener: Arc<dyn consensus_common::SessionListener + Send + Sync> = recording.clone();
-    fixture.processor.listener = Arc::downgrade(&listener);
+    fixture.processor.set_listener_for_test(Arc::downgrade(&listener));
 
     let (root_leader, root_id, root_broadcast) =
         make_signed_block_broadcast(&fixture, 61, vec![1u8, 9, 1]);
     fixture.processor.on_candidate_received(root_leader, root_broadcast, None);
     let root_block = fixture
         .processor
-        .received_candidates
-        .get(&root_id)
+        .candidate_book()
+        .received(&root_id)
         .expect("root must exist")
         .block_id
         .clone();
@@ -5816,8 +6659,8 @@ fn test_recursive_finalization_traverses_empty_ancestor_without_callback() {
     fixture.processor.on_candidate_received(child_leader, child_broadcast, None);
     let child_block = fixture
         .processor
-        .received_candidates
-        .get(&child_id)
+        .candidate_book()
+        .received(&child_id)
         .expect("child must exist")
         .block_id
         .clone();
@@ -5845,7 +6688,7 @@ fn test_recursive_finalization_traverses_empty_ancestor_without_callback() {
         .iter()
         .any(|(block_id, is_final)| block_id == &child_block && *is_final));
     assert!(
-        fixture.processor.finalized_blocks.contains(&empty_id),
+        fixture.processor.consensus.is_finalized_block(&empty_id),
         "empty ancestor must still be finalized locally"
     );
 }
@@ -5863,15 +6706,15 @@ fn test_recursive_finalization_dedups_repeated_trigger_and_cert_retry() {
 
     let recording = RecordingListener::new();
     let listener: Arc<dyn consensus_common::SessionListener + Send + Sync> = recording.clone();
-    fixture.processor.listener = Arc::downgrade(&listener);
+    fixture.processor.set_listener_for_test(Arc::downgrade(&listener));
 
     let (root_leader, root_id, root_broadcast) =
         make_signed_block_broadcast(&fixture, 71, vec![3u8, 3, 3]);
     fixture.processor.on_candidate_received(root_leader, root_broadcast, None);
     let root_block = fixture
         .processor
-        .received_candidates
-        .get(&root_id)
+        .candidate_book()
+        .received(&root_id)
         .expect("root must exist")
         .block_id
         .clone();
@@ -5885,8 +6728,8 @@ fn test_recursive_finalization_dedups_repeated_trigger_and_cert_retry() {
     fixture.processor.on_candidate_received(child_leader, child_broadcast, None);
     let child_block = fixture
         .processor
-        .received_candidates
-        .get(&child_id)
+        .candidate_book()
+        .received(&child_id)
         .expect("child must exist")
         .block_id
         .clone();
@@ -5930,7 +6773,7 @@ fn test_recursive_finalization_masterchain_emits_finalcert_only() {
 
     let recording = RecordingListener::new();
     let listener: Arc<dyn consensus_common::SessionListener + Send + Sync> = recording.clone();
-    fixture.processor.listener = Arc::downgrade(&listener);
+    fixture.processor.set_listener_for_test(Arc::downgrade(&listener));
 
     let (parent_leader, parent_id, parent_broadcast) =
         make_signed_block_broadcast(&fixture, 81, vec![5u8, 5, 1]);
@@ -5945,8 +6788,8 @@ fn test_recursive_finalization_masterchain_emits_finalcert_only() {
     fixture.processor.on_candidate_received(child_leader, child_broadcast, None);
     let child_block = fixture
         .processor
-        .received_candidates
-        .get(&child_id)
+        .candidate_book()
+        .received(&child_id)
         .expect("child must exist")
         .block_id
         .clone();
@@ -5978,7 +6821,7 @@ fn test_recursive_finalization_masterchain_emits_finalcert_only() {
     // the walk stops (null cert + MC → co_return). The parent is NOT processed
     // by this finalization walk — it requires its own separate finalization event.
     assert!(
-        !fixture.processor.finalized_blocks.contains(&parent_id),
+        !fixture.processor.consensus.is_finalized_block(&parent_id),
         "C++ parity: MC parent must NOT be finalized by child's cert walk \
          (cert consumed by non-empty child, MC walk stops)"
     );
@@ -5997,7 +6840,7 @@ fn test_recursive_finalization_applied_top_floor_skips_older_ancestor_callbacks(
 
     let recording = RecordingListener::new();
     let listener: Arc<dyn consensus_common::SessionListener + Send + Sync> = recording.clone();
-    fixture.processor.listener = Arc::downgrade(&listener);
+    fixture.processor.set_listener_for_test(Arc::downgrade(&listener));
 
     fixture.processor.set_mc_finalized_block(BlockIdExt::with_params(
         fixture.description.get_shard().clone(),
@@ -6011,8 +6854,8 @@ fn test_recursive_finalization_applied_top_floor_skips_older_ancestor_callbacks(
     fixture.processor.on_candidate_received(old_leader, old_broadcast, None);
     let old_block = fixture
         .processor
-        .received_candidates
-        .get(&old_id)
+        .candidate_book()
+        .received(&old_id)
         .expect("old ancestor must exist")
         .block_id
         .clone();
@@ -6026,8 +6869,8 @@ fn test_recursive_finalization_applied_top_floor_skips_older_ancestor_callbacks(
     fixture.processor.on_candidate_received(mid_leader, mid_broadcast, None);
     let mid_block = fixture
         .processor
-        .received_candidates
-        .get(&mid_id)
+        .candidate_book()
+        .received(&mid_id)
         .expect("mid ancestor must exist")
         .block_id
         .clone();
@@ -6041,8 +6884,8 @@ fn test_recursive_finalization_applied_top_floor_skips_older_ancestor_callbacks(
     fixture.processor.on_candidate_received(trigger_leader, trigger_broadcast, None);
     let trigger_block = fixture
         .processor
-        .received_candidates
-        .get(&trigger_id)
+        .candidate_book()
+        .received(&trigger_id)
         .expect("trigger must exist")
         .block_id
         .clone();
@@ -6070,50 +6913,203 @@ fn test_recursive_finalization_applied_top_floor_skips_older_ancestor_callbacks(
         .iter()
         .any(|(block_id, is_final)| block_id == &trigger_block && *is_final));
     assert!(
-        fixture.processor.finalized_blocks.contains(&old_id),
+        fixture.processor.consensus.is_finalized_block(&old_id),
         "suppressed ancestor must still be finalized locally"
     );
 }
 
+// ============================================================================
+// `ensure_candidate_info_stored` — direct-API tests
+// ============================================================================
+//
+// These tests target `ensure_candidate_info_stored` directly to verify the three
+// completion paths (Ok inline, Err inline for missing entry, Ok via deferred
+// continuation). End-to-end coverage of the per-caller wiring lives further down
+// next to `broadcast_vote` / `process_received_notar_cert` / `process_validated_candidates`.
+
+/// Capture the `Result<()>` argument the callback receives, so tests can assert
+/// on the outcome after the call returns (inline) or after the registry drains
+/// (deferred). `None` means the callback hasn't fired yet.
+type EnsureCallbackOutcome = Arc<Mutex<Option<std::result::Result<(), String>>>>;
+
+/// Build an `EnsureCallbackOutcome` and a closure suitable for passing to
+/// `ensure_candidate_info_stored`. The closure stores `Ok(())` / `Err(msg)`
+/// into the shared cell; `msg` is the `Display`-formatted error so we don't
+/// have to clone failure errors.
+fn make_ensure_callback() -> (
+    EnsureCallbackOutcome,
+    impl FnOnce(&mut SessionProcessor, ton_block::Result<()>) + Send + 'static,
+) {
+    let outcome: EnsureCallbackOutcome = Arc::new(Mutex::new(None));
+    let outcome_for_cb = outcome.clone();
+    let cb = move |_processor: &mut SessionProcessor, res: ton_block::Result<()>| {
+        let stored = match res {
+            Ok(()) => Ok(()),
+            Err(e) => Err(e.to_string()),
+        };
+        *outcome_for_cb.lock().unwrap() = Some(stored);
+    };
+    (outcome, cb)
+}
+
+/// Missing dedup-map entry → callback fires inline with `Err(...)` and the
+/// session error counter is bumped.
 #[test]
-fn test_wait_candidate_info_stored_returns_false_when_missing_entry() {
+fn test_ensure_candidate_info_stored_callback_fires_inline_with_err_when_missing() {
     let mut fixture = TestFixture::new(4);
     let candidate_id = RawCandidateId { slot: SlotIndex::new(77), hash: UInt256::rand() };
     let errors_before =
-        fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
 
+    let (outcome, cb) = make_ensure_callback();
+    fixture.processor.ensure_candidate_info_stored(&candidate_id, true, false, cb);
+
+    let captured = outcome.lock().unwrap().clone().expect("callback must fire inline");
+    let err = captured.expect_err("missing candidateInfo entry must surface as Err");
     assert!(
-        !fixture.processor.wait_candidate_info_stored(&candidate_id, true, false),
-        "missing candidateInfo wait must report failure"
+        err.contains("missing candidateInfo store result"),
+        "Err must describe the missing prerequisite, got: {err}",
     );
 
     let errors_after =
-        fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
     assert!(
         errors_after > errors_before,
-        "missing candidateInfo wait must increment error counter"
+        "missing candidateInfo path must increment error counter (matches abort semantics)",
     );
 }
 
+/// Persisted candidateInfo → callback fires inline with `Ok(())` and the DB is
+/// queryable. No deferred entry is registered.
 #[test]
-fn test_wait_candidate_info_stored_returns_true_when_candidate_info_is_persisted() {
+fn test_ensure_candidate_info_stored_callback_fires_inline_with_ok_when_persisted() {
     let mut fixture = TestFixture::new(4);
     let (leader_source, candidate_id, broadcast) =
         make_signed_block_broadcast(&fixture, 78, vec![1, 2, 3, 4]);
     fixture.processor.on_candidate_received(leader_source, broadcast, None);
 
-    assert!(
-        fixture.processor.wait_candidate_info_stored(&candidate_id, true, false),
-        "persisted candidateInfo must satisfy wait"
+    // Wait for the storage thread to flush the candidateInfo write so the dedup-map
+    // entry's `is_ready()` is true at the time we call `ensure_*`.
+    for _ in 0..200 {
+        let res = fixture
+            .processor
+            .database
+            .candidate_info_store_result(&candidate_id)
+            .expect("save_candidate_info_async must register a dedup-map entry")
+            .clone();
+        if res.is_ready() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let pending_before = fixture.processor.database.pending_count();
+    let (outcome, cb) = make_ensure_callback();
+    fixture.processor.ensure_candidate_info_stored(&candidate_id, true, false, cb);
+
+    let captured = outcome.lock().unwrap().clone().expect("callback must fire inline");
+    captured.expect("inline-Ready callback must surface Ok(())");
+    assert_eq!(
+        fixture.processor.database.pending_count(),
+        pending_before,
+        "inline-Ready path must NOT register a deferred entry in the registry",
     );
     assert!(
         fixture
             .processor
-            .db
+            .database
+            .db()
             .load_candidate_info_by_id(&candidate_id, Duration::from_secs(1))
             .expect("candidate info lookup must succeed")
             .is_some(),
-        "candidateInfo must be present in DB"
+        "candidateInfo must be present in DB",
+    );
+}
+
+/// In-flight candidateInfo → callback is deferred via the SXMAIN async-DB-results
+/// registry; firing the registry drain only after completing the underlying
+/// result actually invokes the callback.
+#[test]
+fn test_ensure_candidate_info_stored_callback_is_deferred_when_in_flight() {
+    let mut fixture = TestFixture::new(4);
+    let candidate_id = RawCandidateId { slot: SlotIndex::new(79), hash: UInt256::rand() };
+    let pending = ManualAsyncResult::pending();
+    fixture.processor.database.insert_candidate_info_store(candidate_id.clone(), pending.clone());
+
+    let (outcome, cb) = make_ensure_callback();
+    fixture.processor.ensure_candidate_info_stored(&candidate_id, true, false, cb);
+
+    assert!(
+        outcome.lock().unwrap().is_none(),
+        "callback must NOT fire while the underlying result is still in flight",
+    );
+    let pending_entries: Vec<_> =
+        fixture.processor.database.pending_iter().map(|e| e.op_label).collect();
+    assert!(
+        pending_entries.contains(&"ensure_candidate_info_stored:candidate_info"),
+        "deferred path must register a registry entry with the candidate_info op label, \
+         got entries: {pending_entries:?}",
+    );
+
+    // Complete + drain → callback fires with Ok(()).
+    pending.complete_ok();
+    fixture.processor.process_pending_async_db_results();
+
+    let captured = outcome.lock().unwrap().clone().expect("callback must fire after drain");
+    captured.expect("deferred Ok must surface Ok(())");
+}
+
+/// Deferred path with a real storage error must surface `Err(...)` to the
+/// callback and bump the session error counter from inside the registry
+/// continuation (matches the inline-Err semantic).
+#[test]
+fn test_ensure_candidate_info_stored_callback_surfaces_err_from_deferred_failure() {
+    let mut fixture = TestFixture::new(4);
+    let candidate_id = RawCandidateId { slot: SlotIndex::new(80), hash: UInt256::rand() };
+    let pending = ManualAsyncResult::pending();
+    fixture.processor.database.insert_candidate_info_store(candidate_id.clone(), pending.clone());
+
+    let errors_before =
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+
+    let (outcome, cb) = make_ensure_callback();
+    fixture.processor.ensure_candidate_info_stored(&candidate_id, true, false, cb);
+
+    pending.complete_err("disk_unavailable");
+    fixture.processor.process_pending_async_db_results();
+
+    let captured = outcome.lock().unwrap().clone().expect("callback must fire after drain");
+    let err = captured.expect_err("deferred Err must surface Err");
+    assert!(
+        err.contains("disk_unavailable"),
+        "Err message must propagate from the storage layer, got: {err}",
+    );
+    let errors_after =
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        errors_after > errors_before,
+        "deferred-failure path must increment the session error counter from the continuation",
+    );
+}
+
+/// `wait_candidate_info=false && wait_notar_cert=false` → callback fires inline
+/// with `Ok(())` and nothing is registered. Lets callers (e.g., a future wrapper
+/// for `SkipVote`) avoid a special case in their own code.
+#[test]
+fn test_ensure_candidate_info_stored_callback_fires_inline_with_ok_when_no_wait_requested() {
+    let mut fixture = TestFixture::new(4);
+    let candidate_id = RawCandidateId { slot: SlotIndex::new(81), hash: UInt256::rand() };
+    let pending_before = fixture.processor.database.pending_count();
+
+    let (outcome, cb) = make_ensure_callback();
+    fixture.processor.ensure_candidate_info_stored(&candidate_id, false, false, cb);
+
+    let captured = outcome.lock().unwrap().clone().expect("callback must fire inline");
+    captured.expect("no-wait path must surface Ok(())");
+    assert_eq!(
+        fixture.processor.database.pending_count(),
+        pending_before,
+        "no-wait path must NOT register a deferred entry",
     );
 }
 
@@ -6186,6 +7182,78 @@ fn test_broadcast_skip_vote_bypasses_durability_wait() {
     );
 }
 
+// ----------------------------------------------------------------------------
+// `persist_our_vote_before_broadcast` migration to the async-DB-results registry.
+// ----------------------------------------------------------------------------
+//
+// C++ parity: `pool.cpp::handle(BroadcastVote)` publishes `OutgoingProtocolMessage`
+// while `db.cpp::process(BroadcastVote)` persists in a separate actor — the persist
+// `co_await` does NOT gate the broadcast. After this migration, the Rust runtime
+// behaves the same way: `broadcast_vote()` calls `receiver.send_vote(...)` immediately
+// after registering the persist with the async-DB-results registry, instead of parking
+// SXMAIN on `result.wait()`.
+
+/// `broadcast_vote` must register vote persist asynchronously and proceed with the
+/// network send immediately, matching C++ where pool's broadcast publish is not
+/// gated on db's `co_await db->set(...)`.
+#[test]
+fn test_broadcast_vote_registers_async_persist_and_sends_immediately() {
+    let mut fixture = TestFixture::new(4);
+    // Skip votes bypass the (still-synchronous) `wait_candidate_info_stored` path,
+    // so this test isolates the slice-1 (vote-persist) migration.
+    let slot = SlotIndex::new(123);
+    let vote = crate::simplex_state::Vote::Skip(crate::simplex_state::SkipVote { slot });
+
+    let pending_before = fixture.processor.database.pending_count();
+    let errors_before =
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+
+    fixture.processor.broadcast_vote(vote);
+
+    let actions = fixture.drain_receiver_actions();
+    assert!(
+        actions.iter().any(|a| matches!(a, ReceiverAction::SendVote { .. })),
+        "vote must be sent without blocking on persist completion",
+    );
+
+    assert_eq!(
+        fixture.processor.database.pending_count(),
+        pending_before + 1,
+        "persist_our_vote_before_broadcast must register exactly one pending entry",
+    );
+    let entry = fixture
+        .processor
+        .database
+        .pending_iter()
+        .last()
+        .expect("pending entry must exist after broadcast_vote");
+    assert_eq!(
+        entry.op_label, "persist_our_vote_before_broadcast",
+        "pending entry must carry the op label for diagnostics",
+    );
+
+    // Drain the registry — the real RocksDB write completes on the storage thread.
+    // Allow a few polls for the background storage thread to flush.
+    for _ in 0..200 {
+        fixture.processor.process_pending_async_db_results();
+        if fixture.processor.database.pending_is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    assert_eq!(
+        fixture.processor.database.pending_count(),
+        0,
+        "registry must drain after the storage thread confirms the write",
+    );
+    assert_eq!(
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed),
+        errors_before,
+        "successful vote persist must not bump the error counter",
+    );
+}
+
 #[test]
 fn test_process_validated_candidates_skips_candidate_when_candidate_info_missing() {
     let mut fixture = TestFixture::new(4);
@@ -6197,7 +7265,7 @@ fn test_process_validated_candidates_skips_candidate_when_candidate_info_missing
 
     let now = fixture.description.get_time();
     fixture.processor.candidate_decision_ok_internal(candidate_id.clone(), slot, now);
-    fixture.processor.candidate_info_store_results.remove(&candidate_id);
+    fixture.processor.database.remove_candidate_info_store(&candidate_id);
 
     fixture.processor.process_validated_candidates();
     fixture.processor.simplex_state.check_all(&fixture.description);
@@ -6228,7 +7296,7 @@ fn test_process_received_notar_cert_aborts_when_persist_fails() {
         make_signed_block_broadcast(&fixture, 93, vec![9, 3, 9, 3]);
     fixture.processor.on_candidate_received(leader_source, broadcast, None);
 
-    fixture.processor.db.fail_next_notar_cert_save_for_test();
+    fixture.processor.database.db().fail_next_notar_cert_save_for_test();
 
     let notar_bytes = make_notar_vote_signature_set_bytes(
         fixture.processor.session_id(),
@@ -6254,7 +7322,8 @@ fn test_process_received_notar_cert_aborts_when_persist_fails() {
     assert!(
         fixture
             .processor
-            .db
+            .database
+            .db()
             .load_notar_cert_by_id(&candidate_id, Duration::from_secs(1))
             .expect("notar cert lookup must succeed")
             .is_none(),
@@ -6281,7 +7350,7 @@ fn test_process_validated_candidates_before_fsm_timeout() {
     let time = fixture.description.get_time();
     fixture.processor.candidate_decision_ok_internal(candidate_id.clone(), slot, time);
     assert!(
-        !fixture.processor.validated_candidates.is_empty(),
+        !fixture.processor.validation.validated_is_empty(),
         "candidate must be in the validated_candidates queue"
     );
 
@@ -6290,6 +7359,14 @@ fn test_process_validated_candidates_before_fsm_timeout() {
 
     // --- Correct order (Fix A): feed candidates, THEN run FSM timeouts ---
     fixture.processor.process_validated_candidates();
+    // `process_validated_candidates()` routes the FSM feed through
+    // `ensure_candidate_info_stored()`: while the candidateInfo persist is still
+    // in flight on the background storage thread, the feed is deferred to the
+    // SXMAIN async-DB-results registry instead of running inline. Drain the
+    // registry so the candidate is fed to the FSM *before* the timeout is
+    // evaluated below; without this the feed races the storage write and the
+    // slot is skip-voted first (the flaky failure this test guards against).
+    fixture.drain_pending_async_db_results();
     fixture.processor.simplex_state.check_all(&fixture.description);
 
     // Collect FSM events produced by the two calls above.
@@ -6336,7 +7413,7 @@ fn test_candidate_decision_ok_does_not_drop_when_cand_seqno_greater_than_finaliz
     // make_test_non_empty_candidate uses slot.value()+1 as seq_no, so for
     // slot 0 the candidate seqno = 1.  Setting finalized_head to 0 means
     // cand_seqno (1) > finalized_seqno (0) → candidate must NOT be dropped.
-    fixture.processor.finalized_head_seqno = Some(0);
+    fixture.processor.consensus.set_finalized_head_seqno(Some(0));
 
     // Call the public wrapper which contains the guard.
     let validity_start = time;
@@ -6344,12 +7421,12 @@ fn test_candidate_decision_ok_does_not_drop_when_cand_seqno_greater_than_finaliz
 
     // The candidate must have been pushed to validated_candidates (not dropped).
     assert!(
-        !fixture.processor.validated_candidates.is_empty(),
+        !fixture.processor.validation.validated_is_empty(),
         "candidate with cand_seqno > committed_seqno must NOT be dropped"
     );
     // And it must have been removed from pending_validations (consumed, not leaked).
     assert!(
-        !fixture.processor.pending_validations.contains_key(&candidate_id),
+        !fixture.processor.validation.pending_validation_contains(&candidate_id),
         "pending_validations entry must be consumed"
     );
 }
@@ -6364,9 +7441,27 @@ fn test_generated_candidate_validation_missed_metric_increments_on_final_rejecti
     let time = fixture.description.get_time();
     insert_pending_validation(&mut fixture.processor, &candidate_id, raw_candidate, time);
 
-    fixture.processor.record_self_collation_start(slot, 1, CollationAttempt::Initial, None, &[]);
-    fixture.processor.record_self_collation_generated(slot, "unit_test_generated");
-    fixture.processor.link_self_collation_candidate(slot, &candidate_id);
+    let now = fixture.processor.now();
+    fixture.processor.telemetry.record_self_collation_start(
+        fixture.processor.runtime.description(),
+        slot,
+        1,
+        None,
+        None,
+        &[],
+        now,
+    );
+    fixture.processor.telemetry.record_self_collation_generated(
+        slot,
+        "unit_test_generated",
+        fixture.processor.runtime.description(),
+        now,
+    );
+    fixture.processor.telemetry.link_self_collation_candidate(
+        slot,
+        &candidate_id,
+        fixture.processor.runtime.description(),
+    );
     fixture.processor.track_generated_candidate_for_validation(candidate_id.clone());
     fixture.processor.mark_generated_candidate_validation_started(&candidate_id);
     fixture.processor.candidate_decision_fail(
@@ -6383,11 +7478,11 @@ fn test_generated_candidate_validation_missed_metric_increments_on_final_rejecti
     assert_eq!(metrics_counter(&fixture.processor, "simplex_self_collates.success"), 0);
     assert_eq!(metrics_counter(&fixture.processor, "simplex_self_collates.failure"), 1);
     assert!(
-        !fixture.processor.generated_candidates_waiting_validation.contains_key(&candidate_id),
+        !fixture.processor.telemetry.waiting_validation_contains(&candidate_id),
         "tracking entry must be removed after the miss is recorded"
     );
     assert!(
-        fixture.processor.rejected.contains(&candidate_id),
+        fixture.processor.validation.is_rejected(&candidate_id),
         "final rejection should still mark the candidate as rejected"
     );
 }
@@ -6400,8 +7495,8 @@ fn test_generated_candidate_validation_missed_metric_increments_on_final_rejecti
 #[test]
 fn test_local_chain_head_initial_state() {
     let fixture = TestFixture::new(4);
-    assert!(fixture.processor.local_chain_head.is_none());
-    assert!(fixture.processor.generated_parent_cache.is_empty());
+    assert!(fixture.processor.collation.local_chain_head().is_none());
+    assert!(fixture.processor.collation.generated_parent_cache_is_empty());
 }
 
 /// Test that invalidate_local_chain_head clears both the chain head and cache.
@@ -6420,22 +7515,21 @@ fn test_invalidate_local_chain_head_clears_state() {
         crate::block::CandidateParentInfo { slot: SlotIndex::new(0), hash: hash.clone() };
     let raw_id = RawCandidateId { slot: SlotIndex::new(0), hash: hash.clone() };
 
-    fixture.processor.local_chain_head = Some(LocalChainHead {
+    fixture.processor.collation.set_local_chain_head(Some(LocalChainHead {
         window: WindowIndex::new(0),
         slot: SlotIndex::new(0),
         parent_info,
-        block_id: block_id.clone(),
         gen_utime_ms: None,
-    });
-    fixture.processor.generated_parent_cache.insert(raw_id.clone(), block_id);
+    }));
+    fixture.processor.collation.insert_generated_parent(raw_id.clone(), block_id);
 
-    assert!(fixture.processor.local_chain_head.is_some());
-    assert!(!fixture.processor.generated_parent_cache.is_empty());
+    assert!(fixture.processor.collation.local_chain_head().is_some());
+    assert!(!fixture.processor.collation.generated_parent_cache_is_empty());
 
-    fixture.processor.invalidate_local_chain_head();
+    fixture.processor.collation.invalidate_local_chain_head();
 
-    assert!(fixture.processor.local_chain_head.is_none());
-    assert!(fixture.processor.generated_parent_cache.is_empty());
+    assert!(fixture.processor.collation.local_chain_head().is_none());
+    assert!(fixture.processor.collation.generated_parent_cache_is_empty());
 }
 
 /// Test that resolve_parent_block_id finds parents in generated_parent_cache
@@ -6455,14 +7549,18 @@ fn test_resolve_parent_from_generated_cache() {
         crate::block::CandidateParentInfo { slot: SlotIndex::new(5), hash: hash.clone() };
     let raw_id = RawCandidateId { slot: SlotIndex::new(5), hash: hash.clone() };
 
-    // Not in received_candidates yet
-    assert!(fixture.processor.resolve_parent_block_id(&parent_info).is_none());
+    // Not in candidate_book yet
+    assert!(fixture
+        .processor
+        .with_collation_backend(|c, b| c.resolve_parent_block_id(&parent_info, b))
+        .is_none());
 
     // Seed the generated_parent_cache (as generated_block would)
-    fixture.processor.generated_parent_cache.insert(raw_id, block_id.clone());
+    fixture.processor.collation.insert_generated_parent(raw_id, block_id.clone());
 
     // Now resolvable
-    let resolved = fixture.processor.resolve_parent_block_id(&parent_info);
+    let resolved =
+        fixture.processor.with_collation_backend(|c, b| c.resolve_parent_block_id(&parent_info, b));
     assert_eq!(resolved, Some(block_id));
 }
 
@@ -6472,27 +7570,20 @@ fn test_reset_precollations_clears_chain_head() {
     let mut fixture = TestFixture::new(4);
 
     let hash = UInt256::from([0x11; 32]);
-    let block_id = BlockIdExt::with_params(
-        ShardIdent::masterchain(),
-        1,
-        UInt256::from([0x22; 32]),
-        UInt256::from([0x33; 32]),
-    );
     let parent_info =
         crate::block::CandidateParentInfo { slot: SlotIndex::new(0), hash: hash.clone() };
 
-    fixture.processor.local_chain_head = Some(LocalChainHead {
+    fixture.processor.collation.set_local_chain_head(Some(LocalChainHead {
         window: WindowIndex::new(0),
         slot: SlotIndex::new(0),
         parent_info,
-        block_id,
         gen_utime_ms: None,
-    });
+    }));
 
     fixture.processor.reset_precollations();
 
-    assert!(fixture.processor.local_chain_head.is_none());
-    assert!(fixture.processor.generated_parent_cache.is_empty());
+    assert!(fixture.processor.collation.local_chain_head().is_none());
+    assert!(fixture.processor.collation.generated_parent_cache_is_empty());
 }
 
 /// Test that multi-slot window options produce correct precollation depth.
@@ -6517,7 +7608,7 @@ fn test_multi_slot_window_session_creation() {
     let opts = SessionOptions { slots_per_leader_window: 4, ..Default::default() };
     let fixture = TestFixture::new_with_opts(4, opts);
     assert_eq!(fixture.description.opts().slots_per_leader_window, 4);
-    assert!(fixture.processor.local_chain_head.is_none());
+    assert!(fixture.processor.collation.local_chain_head().is_none());
 }
 
 #[test]
@@ -6543,8 +7634,8 @@ fn test_on_collation_complete_publishes_future_slot_in_current_window() {
     let request = AsyncRequestImpl::new(request_id, false, fixture.description.get_time());
     fixture
         .processor
-        .precollated_blocks
-        .insert(slot, PrecollatedBlock { request, result: None, parent: None });
+        .collation
+        .insert_precollated(slot, PrecollatedBlock { request, result: None, parent: None });
 
     let block_id =
         BlockIdExt::with_params(ShardIdent::masterchain(), 1, UInt256::rand(), UInt256::rand());
@@ -6572,7 +7663,7 @@ fn test_on_collation_complete_publishes_future_slot_in_current_window() {
         "future in-window candidate must be broadcast immediately (C++ parity)"
     );
     assert!(
-        fixture.processor.slot_is_generated(slot),
+        fixture.processor.runtime.is_generated(slot),
         "future in-window slot must be marked generated after immediate publish"
     );
 }
@@ -6590,7 +7681,7 @@ fn test_on_collation_complete_publishes_future_empty_slot_in_current_window() {
     let parent_block_id =
         BlockIdExt::with_params(ShardIdent::masterchain(), 1, UInt256::rand(), UInt256::rand());
 
-    fixture.processor.precollated_blocks.insert(
+    fixture.processor.collation.insert_precollated(
         slot,
         PrecollatedBlock {
             request,
@@ -6616,7 +7707,7 @@ fn test_on_collation_complete_publishes_future_empty_slot_in_current_window() {
         "future in-window empty block must be broadcast immediately (C++ parity)"
     );
     assert!(
-        fixture.processor.slot_is_generated(slot),
+        fixture.processor.runtime.is_generated(slot),
         "future in-window empty slot must be marked generated after immediate publish"
     );
 }
@@ -6635,8 +7726,8 @@ fn test_on_collation_complete_publishes_late_same_window_slot_cpp_parity() {
     let request = AsyncRequestImpl::new(request_id, false, fixture.description.get_time());
     fixture
         .processor
-        .precollated_blocks
-        .insert(slot, PrecollatedBlock { request, result: None, parent: None });
+        .collation
+        .insert_precollated(slot, PrecollatedBlock { request, result: None, parent: None });
 
     assert_eq!(
         fixture.processor.simplex_state.get_first_non_progressed_slot(),
@@ -6688,7 +7779,7 @@ fn test_on_collation_complete_publishes_late_same_window_slot_cpp_parity() {
         "late same-window candidate must still be broadcast (C++ parity)"
     );
     assert!(
-        fixture.processor.slot_is_generated(slot),
+        fixture.processor.runtime.is_generated(slot),
         "late same-window slot must still be marked generated"
     );
 }
@@ -6706,13 +7797,16 @@ fn test_check_collation_cancels_stale_window_precollations_without_local_chain_h
     // Manually insert a precollated entry for slot 0 (window 0).
     let request_id = 90;
     let request = AsyncRequestImpl::new(request_id, false, fixture.description.get_time());
-    fixture
-        .processor
-        .precollated_blocks
-        .insert(SlotIndex::new(0), PrecollatedBlock { request, result: None, parent: None });
+    fixture.processor.collation.insert_precollated(
+        SlotIndex::new(0),
+        PrecollatedBlock { request, result: None, parent: None },
+    );
 
-    assert!(fixture.processor.local_chain_head.is_none(), "precondition: no local chain head");
-    assert!(!fixture.processor.precollated_blocks.is_empty(), "precondition: has stale entry");
+    assert!(
+        fixture.processor.collation.local_chain_head().is_none(),
+        "precondition: no local chain head"
+    );
+    assert!(!fixture.processor.collation.precollated_is_empty(), "precondition: has stale entry");
 
     // Advance the FSM to window 1 by skip-certing all of window 0.
     for s in 0..4u32 {
@@ -6730,7 +7824,7 @@ fn test_check_collation_cancels_stale_window_precollations_without_local_chain_h
     fixture.processor.check_collation();
 
     assert!(
-        fixture.processor.precollated_blocks.is_empty(),
+        fixture.processor.collation.precollated_is_empty(),
         "stale window-0 precollated entries must be cleared even without local_chain_head"
     );
 }
@@ -6749,14 +7843,14 @@ fn test_handle_slot_skipped_preserves_same_window_precollation() {
     let request = AsyncRequestImpl::new(request_id, false, fixture.description.get_time());
     fixture
         .processor
-        .precollated_blocks
-        .insert(slot, PrecollatedBlock { request, result: None, parent: None });
+        .collation
+        .insert_precollated(slot, PrecollatedBlock { request, result: None, parent: None });
 
     // Skip slot 0 (still same window 0).
     skip_slot(&mut fixture, slot);
 
     assert!(
-        fixture.processor.precollated_blocks.contains_key(&slot),
+        fixture.processor.collation.precollated_contains(slot),
         "same-window precollation must be preserved after per-slot skip"
     );
 }
@@ -6780,21 +7874,20 @@ fn test_precollate_same_window_slot_uses_local_chain_head_before_parent_notariza
         UInt256::from([0xB3; 32]),
     );
 
-    fixture.processor.local_chain_head = Some(LocalChainHead {
+    fixture.processor.collation.set_local_chain_head(Some(LocalChainHead {
         window: WindowIndex::new(0),
         slot: SlotIndex::new(0),
         parent_info: crate::block::CandidateParentInfo {
             slot: SlotIndex::new(0),
             hash: parent_hash.clone(),
         },
-        block_id: block_id.clone(),
         gen_utime_ms: None,
-    });
-    fixture.processor.generated_parent_cache.insert(
+    }));
+    fixture.processor.collation.insert_generated_parent(
         RawCandidateId { slot: SlotIndex::new(0), hash: parent_hash.clone() },
         block_id.clone(),
     );
-    fixture.processor.last_consensus_finalized_seqno = Some(block_id.seq_no);
+    fixture.processor.consensus.set_last_consensus_finalized_seqno(Some(block_id.seq_no));
 
     assert!(
         !fixture.processor.simplex_state.has_notarized_block(SlotIndex::new(0)),
@@ -6805,8 +7898,8 @@ fn test_precollate_same_window_slot_uses_local_chain_head_before_parent_notariza
 
     let precollated = fixture
         .processor
-        .precollated_blocks
-        .get(&SlotIndex::new(1))
+        .collation
+        .precollated(SlotIndex::new(1))
         .expect("same-window child slot must be precollated immediately");
     let parent = precollated.parent.as_ref().expect("precollated slot must capture parent");
     assert_eq!(parent.slot, SlotIndex::new(0));
@@ -6821,21 +7914,15 @@ fn test_precollate_first_slot_in_new_window_uses_fsm_available_base() {
     let mut fixture = TestFixture::new_with_local_idx(4, local_idx, opts);
 
     let stale_hash = UInt256::from([0xC0; 32]);
-    fixture.processor.local_chain_head = Some(LocalChainHead {
+    fixture.processor.collation.set_local_chain_head(Some(LocalChainHead {
         window: WindowIndex::new(0),
         slot: SlotIndex::new(1),
         parent_info: crate::block::CandidateParentInfo {
             slot: SlotIndex::new(1),
             hash: stale_hash.clone(),
         },
-        block_id: BlockIdExt::with_params(
-            ShardIdent::masterchain(),
-            50,
-            UInt256::from([0xC1; 32]),
-            UInt256::from([0xC2; 32]),
-        ),
         gen_utime_ms: None,
-    });
+    }));
 
     let fsm_parent_id = RawCandidateId { slot: SlotIndex::new(1), hash: UInt256::from([0xC3; 32]) };
     let fsm_parent_block_id = BlockIdExt::with_params(
@@ -6862,7 +7949,10 @@ fn test_precollate_first_slot_in_new_window_uses_fsm_available_base() {
         SlotIndex::new(1),
         fsm_parent_id.hash.clone(),
     );
-    fixture.processor.last_consensus_finalized_seqno = Some(fsm_parent_block_id.seq_no);
+    fixture
+        .processor
+        .consensus
+        .set_last_consensus_finalized_seqno(Some(fsm_parent_block_id.seq_no));
 
     assert_eq!(
         fixture.processor.simplex_state.get_current_leader_window_idx(),
@@ -6874,8 +7964,8 @@ fn test_precollate_first_slot_in_new_window_uses_fsm_available_base() {
 
     let precollated = fixture
         .processor
-        .precollated_blocks
-        .get(&SlotIndex::new(2))
+        .collation
+        .precollated(SlotIndex::new(2))
         .expect("first slot in the new window must use the FSM base");
     let parent = precollated.parent.as_ref().expect("new-window slot must capture parent");
     assert_eq!(parent.slot, fsm_parent_id.slot);
@@ -6900,17 +7990,16 @@ fn test_check_collation_resets_stale_local_chain_head_on_window_change() {
         UInt256::from([0xD1; 32]),
         UInt256::from([0xD2; 32]),
     );
-    fixture.processor.local_chain_head = Some(LocalChainHead {
+    fixture.processor.collation.set_local_chain_head(Some(LocalChainHead {
         window: WindowIndex::new(0),
         slot: stale_raw_id.slot,
         parent_info: crate::block::CandidateParentInfo {
             slot: stale_raw_id.slot,
             hash: stale_raw_id.hash.clone(),
         },
-        block_id: stale_block_id.clone(),
         gen_utime_ms: None,
-    });
-    fixture.processor.generated_parent_cache.insert(stale_raw_id.clone(), stale_block_id);
+    }));
+    fixture.processor.collation.insert_generated_parent(stale_raw_id.clone(), stale_block_id);
 
     let fsm_parent_id = RawCandidateId { slot: SlotIndex::new(1), hash: UInt256::from([0xD3; 32]) };
     let fsm_parent_block_id = BlockIdExt::with_params(
@@ -6937,24 +8026,27 @@ fn test_check_collation_resets_stale_local_chain_head_on_window_change() {
         SlotIndex::new(1),
         fsm_parent_id.hash.clone(),
     );
-    fixture.processor.last_consensus_finalized_seqno = Some(fsm_parent_block_id.seq_no);
+    fixture
+        .processor
+        .consensus
+        .set_last_consensus_finalized_seqno(Some(fsm_parent_block_id.seq_no));
 
     fixture.processor.check_collation();
 
     assert!(
-        fixture.processor.local_chain_head.is_none(),
+        fixture.processor.collation.local_chain_head().is_none(),
         "window change must invalidate the stale local chain head"
     );
     let precollated = fixture
         .processor
-        .precollated_blocks
-        .get(&SlotIndex::new(2))
+        .collation
+        .precollated(SlotIndex::new(2))
         .expect("after clearing stale local state, collation must fall back to the FSM base");
     let parent = precollated.parent.as_ref().expect("precollated slot must capture parent");
     assert_eq!(parent.slot, fsm_parent_id.slot);
     assert_eq!(parent.hash, fsm_parent_id.hash);
     assert!(
-        fixture.processor.generated_parent_cache.is_empty(),
+        fixture.processor.collation.generated_parent_cache_is_empty(),
         "reset_precollations must also clear the old generated_parent_cache"
     );
 }
@@ -7028,12 +8120,12 @@ fn test_second_leader_collates_after_timeout_skip() {
     // The second leader must have initiated collation for slot 1.
     let slot1 = SlotIndex::new(1);
     assert!(
-        fixture.processor.precollated_blocks.contains_key(&slot1)
-            || fixture.processor.slot_is_pending_generate(slot1),
+        fixture.processor.collation.precollated_contains(slot1)
+            || fixture.processor.runtime.is_pending_generate(slot1),
         "second leader (v1) must initiate collation for slot 1 after window 0 skip. \
         precollated_blocks={:?}, pending_generate={}",
-        fixture.processor.precollated_blocks.keys().collect::<Vec<_>>(),
-        fixture.processor.slot_is_pending_generate(slot1),
+        fixture.processor.collation.precollated_slots(),
+        fixture.processor.runtime.is_pending_generate(slot1),
     );
 }
 
@@ -7091,12 +8183,12 @@ fn test_late_join_finalization_cert_without_body_then_child_validates() {
     // The finalization should be in finalized_pending_body since no body exists.
     let far_id = RawCandidateId { slot: far_slot, hash: far_block_hash.clone() };
     assert!(
-        fixture.processor.finalized_pending_body.contains_key(&far_id),
+        fixture.processor.consensus.finalized_pending_body_contains(&far_id),
         "finalization for bodyless slot 50 must be recorded in finalized_pending_body"
     );
 
     // finalized_head_seqno must NOT advance (no body to materialize).
-    let head_before = fixture.processor.finalized_head_seqno;
+    let head_before = fixture.processor.consensus.finalized_head_seqno();
 
     // 2. Inject skip certificates for the gap slots 51..55 (exclusive).
     for gap in 51..55u32 {
@@ -7119,20 +8211,21 @@ fn test_late_join_finalization_cert_without_body_then_child_validates() {
     fixture.processor.check_validation();
 
     assert!(
-        fixture.processor.pending_approve.contains(&child_id),
+        fixture.processor.validation.pending_approve_contains(&child_id),
         "child candidate at slot 55 must enter validation pipeline (not stall). \
         The parent at slot 50 has a finalization certificate even though the body is missing."
     );
 
     // finalized_head_seqno must remain unchanged (parent body still missing).
     assert_eq!(
-        fixture.processor.finalized_head_seqno, head_before,
+        fixture.processor.consensus.finalized_head_seqno(),
+        head_before,
         "finalized_head_seqno must NOT advance when the parent body is still missing"
     );
 
     // finalized_pending_body must still contain the slot 50 entry.
     assert!(
-        fixture.processor.finalized_pending_body.contains_key(&far_id),
+        fixture.processor.consensus.finalized_pending_body_contains(&far_id),
         "finalized_pending_body must retain slot 50 entry until body arrives"
     );
 }
@@ -7155,7 +8248,7 @@ fn test_mc_empty_final_trigger_emits_callback_for_non_empty_ancestor_cpp_parity(
 
     let recording = RecordingListener::new();
     let listener: Arc<dyn consensus_common::SessionListener + Send + Sync> = recording.clone();
-    fixture.processor.listener = Arc::downgrade(&listener);
+    fixture.processor.set_listener_for_test(Arc::downgrade(&listener));
 
     // Build chain: parent(non-empty, slot 90) → empty(slot 91, FinalCert trigger)
     let (parent_leader, parent_id, parent_broadcast) =
@@ -7163,8 +8256,8 @@ fn test_mc_empty_final_trigger_emits_callback_for_non_empty_ancestor_cpp_parity(
     fixture.processor.on_candidate_received(parent_leader, parent_broadcast, None);
     let parent_block = fixture
         .processor
-        .received_candidates
-        .get(&parent_id)
+        .candidate_book()
+        .received(&parent_id)
         .expect("parent must exist")
         .block_id
         .clone();
@@ -7208,11 +8301,11 @@ fn test_mc_empty_final_trigger_emits_callback_for_non_empty_ancestor_cpp_parity(
 
     // Both empty trigger and parent must be locally finalized.
     assert!(
-        fixture.processor.finalized_blocks.contains(&empty_id),
+        fixture.processor.consensus.is_finalized_block(&empty_id),
         "empty trigger must be locally finalized"
     );
     assert!(
-        fixture.processor.finalized_blocks.contains(&parent_id),
+        fixture.processor.consensus.is_finalized_block(&parent_id),
         "non-empty parent must be locally finalized"
     );
 }
@@ -7228,7 +8321,7 @@ fn test_mc_deep_empty_chain_delivers_finalcert_to_first_non_empty_ancestor() {
 
     let recording = RecordingListener::new();
     let listener: Arc<dyn consensus_common::SessionListener + Send + Sync> = recording.clone();
-    fixture.processor.listener = Arc::downgrade(&listener);
+    fixture.processor.set_listener_for_test(Arc::downgrade(&listener));
 
     // Chain: root(non-empty, s100) → empty1(s101) → empty2(s102, FinalCert trigger)
     let (root_leader, root_id, root_broadcast) =
@@ -7236,8 +8329,8 @@ fn test_mc_deep_empty_chain_delivers_finalcert_to_first_non_empty_ancestor() {
     fixture.processor.on_candidate_received(root_leader, root_broadcast, None);
     let root_block = fixture
         .processor
-        .received_candidates
-        .get(&root_id)
+        .candidate_book()
+        .received(&root_id)
         .expect("root must exist")
         .block_id
         .clone();
@@ -7249,8 +8342,13 @@ fn test_mc_deep_empty_chain_delivers_finalcert_to_first_non_empty_ancestor() {
         root_block.clone(),
     );
     fixture.processor.on_candidate_received(e1_leader, e1_broadcast, None);
-    let e1_block =
-        fixture.processor.received_candidates.get(&e1_id).expect("e1 must exist").block_id.clone();
+    let e1_block = fixture
+        .processor
+        .candidate_book()
+        .received(&e1_id)
+        .expect("e1 must exist")
+        .block_id
+        .clone();
 
     let (e2_leader, e2_id, e2_broadcast) = make_signed_empty_block_broadcast_with_parent(
         &fixture,
@@ -7278,9 +8376,9 @@ fn test_mc_deep_empty_chain_delivers_finalcert_to_first_non_empty_ancestor() {
     assert_eq!(finalized_events[0].0, root_block);
     assert!(finalized_events[0].1, "must carry FinalCert semantics");
 
-    assert!(fixture.processor.finalized_blocks.contains(&e2_id));
-    assert!(fixture.processor.finalized_blocks.contains(&e1_id));
-    assert!(fixture.processor.finalized_blocks.contains(&root_id));
+    assert!(fixture.processor.consensus.is_finalized_block(&e2_id));
+    assert!(fixture.processor.consensus.is_finalized_block(&e1_id));
+    assert!(fixture.processor.consensus.is_finalized_block(&root_id));
 }
 
 /// C++ parity: on MC, the recursive walk must stop after the first non-empty
@@ -7294,7 +8392,7 @@ fn test_mc_walk_stops_after_cert_consumed_by_non_empty_block() {
 
     let recording = RecordingListener::new();
     let listener: Arc<dyn consensus_common::SessionListener + Send + Sync> = recording.clone();
-    fixture.processor.listener = Arc::downgrade(&listener);
+    fixture.processor.set_listener_for_test(Arc::downgrade(&listener));
 
     // Chain: grandparent(non-empty, s110) → parent(non-empty, s111) → empty(s112, trigger)
     let (gp_leader, gp_id, gp_broadcast) =
@@ -7310,8 +8408,8 @@ fn test_mc_walk_stops_after_cert_consumed_by_non_empty_block() {
     fixture.processor.on_candidate_received(parent_leader, parent_broadcast, None);
     let parent_block = fixture
         .processor
-        .received_candidates
-        .get(&parent_id)
+        .candidate_book()
+        .received(&parent_id)
         .expect("parent must exist")
         .block_id
         .clone();
@@ -7350,11 +8448,11 @@ fn test_mc_walk_stops_after_cert_consumed_by_non_empty_block() {
     assert!(finalized_events[0].1, "must carry FinalCert semantics");
 
     // Empty trigger and parent must be locally finalized.
-    assert!(fixture.processor.finalized_blocks.contains(&empty_id));
-    assert!(fixture.processor.finalized_blocks.contains(&parent_id));
+    assert!(fixture.processor.consensus.is_finalized_block(&empty_id));
+    assert!(fixture.processor.consensus.is_finalized_block(&parent_id));
     // Grandparent should NOT be locally finalized by this walk (MC stops early).
     assert!(
-        !fixture.processor.finalized_blocks.contains(&gp_id),
+        !fixture.processor.consensus.is_finalized_block(&gp_id),
         "grandparent must NOT be finalized by the MC empty-cert walk (cert consumed)"
     );
 }
@@ -7362,3 +8460,1453 @@ fn test_mc_walk_stops_after_cert_consumed_by_non_empty_block() {
 // ============================================================================
 // Standstill parity: certificate acceptance feedback
 // =====================================================================
+
+// ============================================================================
+// Pending async DB results registry
+// ============================================================================
+//
+// Cover `post_async_db_result()` / `process_pending_async_db_results()` and
+// the `pending_async_db_results` field on `SessionProcessor`. The registry
+// lets callers register an in-flight `*_async()` DB result with a one-shot
+// continuation that is invoked on completion (or timeout) from `check_all()`,
+// without blocking SXMAIN on `wait()`.
+
+/// Deterministic `StorageAsyncResult<()>` test stub. Starts pending; tests
+/// flip it to Ok / Err via `complete_*()` to exercise the registry.
+struct ManualAsyncResult {
+    state: Mutex<Option<ton_block::Result<()>>>,
+}
+
+impl ManualAsyncResult {
+    fn pending() -> Arc<Self> {
+        Arc::new(Self { state: Mutex::new(None) })
+    }
+
+    fn complete_ok(self: &Arc<Self>) {
+        *self.state.lock().unwrap() = Some(Ok(()));
+    }
+
+    fn complete_err(self: &Arc<Self>, msg: &str) {
+        *self.state.lock().unwrap() = Some(Err(error!("{}", msg)));
+    }
+
+    /// Inject the typed [`StorageResultAlreadyTaken`] sentinel — the same
+    /// value that `StorageAsyncResultImpl::{try_get, wait_timeout}` emit when
+    /// the inner result was consumed by a prior caller. Used by the
+    /// "redundant FSM re-emit" regression tests so they exercise the real
+    /// `downcast_ref` detection path used by the cert callbacks instead of
+    /// stringly comparing error messages.
+    fn complete_taken_sentinel(self: &Arc<Self>) {
+        *self.state.lock().unwrap() = Some(Err(consensus_common::StorageResultAlreadyTaken.into()));
+    }
+}
+
+impl consensus_common::StorageAsyncResult<()> for ManualAsyncResult {
+    fn is_ready(&self) -> bool {
+        self.state.lock().unwrap().is_some()
+    }
+
+    fn try_get(&self) -> Option<ton_block::Result<()>> {
+        self.state.lock().unwrap().take()
+    }
+
+    fn wait_timeout(&self, _: Duration) -> Option<ton_block::Result<()>> {
+        self.try_get()
+    }
+}
+
+/// Ready-then-Ok callback fires once and removes the entry.
+#[test]
+fn test_post_async_db_result_invokes_ok_callback_when_ready() {
+    let mut fixture = TestFixture::new(4);
+    let result = ManualAsyncResult::pending();
+
+    let outcome = Arc::new(Mutex::new(None::<bool>));
+    let outcome_cb = outcome.clone();
+
+    fixture.processor.post_async_db_result(
+        "test_ok",
+        result.clone(),
+        Duration::from_secs(60),
+        move |_processor, res| {
+            *outcome_cb.lock().unwrap() = Some(res.is_ok());
+        },
+    );
+
+    assert_eq!(fixture.processor.database.pending_count(), 1);
+
+    // Drain while pending: callback must NOT fire.
+    fixture.processor.process_pending_async_db_results();
+    assert!(outcome.lock().unwrap().is_none(), "callback must not fire while pending");
+    assert_eq!(fixture.processor.database.pending_count(), 1);
+
+    // Complete and re-drain: callback fires with Ok and entry is removed.
+    result.complete_ok();
+    fixture.processor.process_pending_async_db_results();
+    assert_eq!(*outcome.lock().unwrap(), Some(true), "callback must observe Ok");
+    assert_eq!(fixture.processor.database.pending_count(), 0);
+}
+
+/// Storage Err propagates verbatim to the continuation.
+#[test]
+fn test_post_async_db_result_propagates_storage_error() {
+    let mut fixture = TestFixture::new(4);
+    let result = ManualAsyncResult::pending();
+
+    let captured = Arc::new(Mutex::new(None::<String>));
+    let captured_cb = captured.clone();
+
+    fixture.processor.post_async_db_result(
+        "test_err",
+        result.clone(),
+        Duration::from_secs(60),
+        move |_processor, res| match res {
+            Ok(()) => panic!("expected error from storage layer"),
+            Err(e) => *captured_cb.lock().unwrap() = Some(e.to_string()),
+        },
+    );
+
+    result.complete_err("disk_full");
+    fixture.processor.process_pending_async_db_results();
+
+    let msg = captured.lock().unwrap().clone().expect("callback must fire");
+    assert!(msg.contains("disk_full"), "error message must reach the continuation: {msg}");
+    assert_eq!(fixture.processor.database.pending_count(), 0);
+}
+
+/// Deadline elapsed while still pending: continuation receives `Err(...timed out...)`
+/// and the timeout counter increments.
+#[test]
+fn test_post_async_db_result_times_out_when_deadline_passes() {
+    let mut fixture = TestFixture::new(4);
+    let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    fixture.processor.set_time(base_time);
+
+    let result = ManualAsyncResult::pending();
+    let outcome = Arc::new(Mutex::new(None::<String>));
+    let outcome_cb = outcome.clone();
+
+    fixture.processor.post_async_db_result(
+        "test_timeout",
+        result.clone(),
+        Duration::from_millis(500),
+        move |_processor, res| match res {
+            Ok(()) => panic!("expected timeout error"),
+            Err(e) => *outcome_cb.lock().unwrap() = Some(e.to_string()),
+        },
+    );
+
+    let timeouts_before = metrics_counter(&fixture.processor, "simplex_async_db_timeout_total");
+
+    // Within deadline: callback must NOT fire.
+    fixture.advance_time(Duration::from_millis(100));
+    fixture.processor.process_pending_async_db_results();
+    assert!(outcome.lock().unwrap().is_none(), "callback must not fire before deadline");
+
+    // Past deadline (> 500ms total): callback fires with Err timeout.
+    fixture.advance_time(Duration::from_millis(500));
+    fixture.processor.process_pending_async_db_results();
+    let msg = outcome.lock().unwrap().clone().expect("callback must fire on timeout");
+    assert!(msg.contains("test_timeout"), "label must appear in timeout error: {msg}");
+    assert!(msg.contains("timed out"), "timeout error must mention 'timed out': {msg}");
+    assert_eq!(fixture.processor.database.pending_count(), 0);
+    assert_eq!(
+        metrics_counter(&fixture.processor, "simplex_async_db_timeout_total"),
+        timeouts_before + 1,
+        "timeout counter must increment exactly once"
+    );
+}
+
+/// Pending entry causes `next_awake_time` to be advanced to `now + ASYNC_DB_POLL_DELAY`.
+#[test]
+fn test_post_async_db_result_pending_schedules_next_awake() {
+    let mut fixture = TestFixture::new(4);
+    let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    fixture.processor.set_time(base_time);
+
+    let result = ManualAsyncResult::pending();
+    fixture.processor.post_async_db_result(
+        "test_awake",
+        result,
+        Duration::from_secs(60),
+        |_processor, _res| {},
+    );
+
+    fixture.processor.reset_next_awake_time();
+    let before = fixture.processor.get_next_awake_time();
+    fixture.processor.process_pending_async_db_results();
+    let after = fixture.processor.get_next_awake_time();
+    assert!(
+        after <= base_time + Duration::from_millis(5),
+        "pending entry must schedule wake at <= now + ASYNC_DB_POLL_DELAY (5ms); got after={:?} before={:?}",
+        after,
+        before,
+    );
+}
+
+/// Continuations may register new pending entries; ready ones are drained by
+/// the same loop pass (matching `process_delayed_actions()` semantics). Pending
+/// continuation registrations stay in the queue for the next `check_all()` pass.
+#[test]
+fn test_pending_async_db_results_drains_chained_ready_continuations_in_one_pass() {
+    let mut fixture = TestFixture::new(4);
+    let outer = ManualAsyncResult::pending();
+    let ready_inner = ManualAsyncResult::pending();
+    ready_inner.complete_ok();
+    let pending_inner = ManualAsyncResult::pending();
+
+    let ready_inner_cb = ready_inner.clone();
+    let pending_inner_cb = pending_inner.clone();
+    let ready_called = Arc::new(AtomicBool::new(false));
+    let pending_called = Arc::new(AtomicBool::new(false));
+    let ready_called_for_cb = ready_called.clone();
+    let pending_called_for_cb = pending_called.clone();
+
+    fixture.processor.post_async_db_result(
+        "test_outer",
+        outer.clone(),
+        Duration::from_secs(60),
+        move |processor, _res| {
+            let ready_cb = ready_called_for_cb.clone();
+            processor.post_async_db_result(
+                "test_inner_ready",
+                ready_inner_cb,
+                Duration::from_secs(60),
+                move |_p, _r| {
+                    ready_cb.store(true, Ordering::SeqCst);
+                },
+            );
+            let pending_cb = pending_called_for_cb.clone();
+            processor.post_async_db_result(
+                "test_inner_pending",
+                pending_inner_cb,
+                Duration::from_secs(60),
+                move |_p, _r| {
+                    pending_cb.store(true, Ordering::SeqCst);
+                },
+            );
+        },
+    );
+
+    outer.complete_ok();
+    fixture.processor.process_pending_async_db_results();
+    assert!(
+        ready_called.load(Ordering::SeqCst),
+        "ready continuation registered inside callback must drain in same pass"
+    );
+    assert!(!pending_called.load(Ordering::SeqCst), "pending continuation must wait");
+    assert_eq!(
+        fixture.processor.database.pending_count(),
+        1,
+        "only the still-pending continuation entry must remain queued",
+    );
+
+    pending_inner.complete_ok();
+    fixture.processor.process_pending_async_db_results();
+    assert!(pending_called.load(Ordering::SeqCst), "pending continuation must fire on next pass");
+    assert_eq!(fixture.processor.database.pending_count(), 0);
+}
+
+// ----------------------------------------------------------------------------
+// `maybe_store_pool_state` migration to the async-DB-results registry.
+// ----------------------------------------------------------------------------
+
+/// When the FSM has not crossed the next leader window yet, `maybe_store_pool_state`
+/// must be a no-op: no DB write scheduled, no registry entry, cursor unchanged.
+#[test]
+fn test_maybe_store_pool_state_is_noop_when_window_not_advanced() {
+    let mut fixture = TestFixture::new(4);
+    let initial_window = WindowIndex::new(5);
+    fixture.processor.database.set_first_nonannounced_window(initial_window);
+    assert_eq!(
+        fixture.processor.simplex_state.get_current_leader_window_idx(),
+        WindowIndex::new(0)
+    );
+
+    fixture.processor.maybe_store_pool_state();
+
+    assert_eq!(
+        fixture.processor.database.first_nonannounced_window(),
+        initial_window,
+        "first_nonannounced_window must not move when current window is behind it",
+    );
+    assert_eq!(
+        fixture.processor.database.pending_count(),
+        0,
+        "no-op call must not register a pending DB result",
+    );
+}
+
+/// When the FSM is at-or-past the announced cursor, `maybe_store_pool_state` must:
+/// - advance the in-memory cursor synchronously (matches C++ ordering); and
+/// - register a `PendingAsyncDbEntry` for the durability wait without blocking SXMAIN.
+///
+/// Draining the registry once the write completes must remove the entry without
+/// incrementing the error counter.
+#[test]
+fn test_maybe_store_pool_state_advances_cursor_and_registers_pending_write() {
+    let mut fixture = TestFixture::new(4);
+    let errors_before =
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(fixture.processor.database.first_nonannounced_window(), WindowIndex::new(0));
+    assert_eq!(
+        fixture.processor.simplex_state.get_current_leader_window_idx(),
+        WindowIndex::new(0)
+    );
+    assert_eq!(fixture.processor.database.pending_count(), 0);
+
+    fixture.processor.maybe_store_pool_state();
+
+    assert_eq!(
+        fixture.processor.database.first_nonannounced_window(),
+        WindowIndex::new(1),
+        "in-memory cursor must advance to current_window + 1 synchronously",
+    );
+    assert_eq!(
+        fixture.processor.database.pending_count(),
+        1,
+        "the durability wait must be registered, not blocked on inline",
+    );
+    assert_eq!(
+        fixture.processor.database.pending_iter().next().expect("entry must exist").op_label,
+        "maybe_store_pool_state",
+        "registered entry must carry the op label for diagnostics",
+    );
+
+    // A subsequent call before the write completes must still be a no-op
+    // (cursor already advanced, so the guard kicks in).
+    fixture.processor.maybe_store_pool_state();
+    assert_eq!(
+        fixture.processor.database.pending_count(),
+        1,
+        "second call must not enqueue a duplicate write while the first is in flight",
+    );
+
+    // Drain the registry — the real RocksDB write completes within the bench
+    // ManualAsyncResult-equivalent latency window. Allow a few polls for the
+    // background storage thread to flush.
+    for _ in 0..200 {
+        fixture.processor.process_pending_async_db_results();
+        if fixture.processor.database.pending_is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    assert_eq!(
+        fixture.processor.database.pending_count(),
+        0,
+        "registry must drain after the storage thread confirms the write",
+    );
+    assert_eq!(
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed),
+        errors_before,
+        "successful pool_state persist must not bump the error counter",
+    );
+}
+
+// ============================================================================
+// `SessionProcessor::stop()` shutdown drain + db.sync() parity
+// ============================================================================
+//
+// C++ parity: `validator/consensus/bridge.cpp::destroy_inner()` publishes
+// `StopRequested` and then `co_await`s `bus_->db->close()`, forcing the db
+// actor to drain its queued `co_await db->set(...)` tasks before the bus is
+// torn down. The Rust equivalent is `SessionProcessor::stop()` which:
+//   1) drains `pending_async_db_results` so any registered continuation runs
+//      on SXMAIN (`drain_pending_async_db_results_for_shutdown`),
+//   2) calls `db.sync(SHUTDOWN_DB_SYNC_TIMEOUT)` to flush the storage queue.
+
+/// `stop()` must not regress when there is nothing in-flight: empty registry,
+/// zero error increments, db.sync() succeeds quickly.
+#[test]
+fn test_stop_completes_with_empty_registry_and_no_errors() {
+    let mut fixture = TestFixture::new(4);
+    assert_eq!(fixture.processor.database.pending_count(), 0);
+    let errors_before =
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+
+    fixture.processor.stop(false);
+
+    assert_eq!(
+        fixture.processor.database.pending_count(),
+        0,
+        "no entries to drain on a fresh processor",
+    );
+    assert_eq!(
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed),
+        errors_before,
+        "successful stop must not bump the error counter",
+    );
+}
+
+/// When async-DB-result entries are still in flight at shutdown, `stop()` must
+/// drain them on SXMAIN so registered continuations fire (matches C++
+/// `co_await bus_->db->close()` semantics where queued `db->set(...)` tasks
+/// complete with Ok or `cancelled` before the bus is dropped).
+#[test]
+fn test_stop_drains_pending_async_db_results_with_real_db() {
+    let mut fixture = TestFixture::new(4);
+    let errors_before =
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+
+    // Register a real RocksDB-backed write through the registry and confirm it sits
+    // in the queue (not blocked on inline) before we tear the session down.
+    fixture.processor.maybe_store_pool_state();
+    assert_eq!(
+        fixture.processor.database.pending_count(),
+        1,
+        "pool_state write must be queued in the registry",
+    );
+
+    fixture.processor.stop(false);
+
+    assert_eq!(
+        fixture.processor.database.pending_count(),
+        0,
+        "stop() must drain pending_async_db_results before returning",
+    );
+    assert_eq!(
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed),
+        errors_before,
+        "drained Ok continuation must not bump the error counter",
+    );
+}
+
+/// Continuations chained by another continuation (callback inside callback) must
+/// also drain — matches the in-pass chained-drain semantics of
+/// `process_pending_async_db_results()` and the actor framework's drain-on-close
+/// guarantee in C++.
+#[test]
+fn test_stop_drains_chained_continuations() {
+    let mut fixture = TestFixture::new(4);
+    let outer = ManualAsyncResult::pending();
+    let chained = ManualAsyncResult::pending();
+    chained.complete_ok();
+    let chained_inner_cb = chained.clone();
+    let chained_called = Arc::new(AtomicBool::new(false));
+    let chained_called_for_cb = chained_called.clone();
+
+    fixture.processor.post_async_db_result(
+        "test_outer_for_stop",
+        outer.clone(),
+        Duration::from_secs(60),
+        move |processor, _res| {
+            let cb_marker = chained_called_for_cb.clone();
+            processor.post_async_db_result(
+                "test_chained_for_stop",
+                chained_inner_cb,
+                Duration::from_secs(60),
+                move |_p, _r| {
+                    cb_marker.store(true, Ordering::SeqCst);
+                },
+            );
+        },
+    );
+
+    // Outer becomes ready right before stop() is called. The drain loop must
+    // run the outer continuation (which schedules the chained one) and then
+    // run the chained continuation in the same shutdown pass.
+    outer.complete_ok();
+
+    fixture.processor.stop(false);
+
+    assert!(
+        chained_called.load(Ordering::SeqCst),
+        "chained continuation registered inside another continuation must drain on stop()",
+    );
+    assert_eq!(
+        fixture.processor.database.pending_count(),
+        0,
+        "registry must be empty after stop()",
+    );
+}
+
+// ============================================================================
+// Cert handlers cluster: async-DB-results registry migration
+// ============================================================================
+//
+// `handle_notarization_reached`, `handle_skip_certificate_reached`,
+// `handle_finalization_reached` previously blocked SXMAIN on `result.wait()`
+// to enforce wait-for-store-before-relay. They now register the persist
+// in `pending_async_db_results` and run the broadcast / cache / standstill
+// work from the registry continuation.
+//
+// C++ parity (`pool.cpp::handle_prospective_certificate`):
+//   co_await owning_bus().publish<SaveCertificate>(cert);
+//   handle_saved_certificate(*slot, cert);  // broadcast + cache
+// The persist still gates the broadcast — same as before this migration, just
+// non-blocking on SXMAIN.
+
+/// `handle_notarization_reached` must register a `pending_async_db_results` entry,
+/// defer the broadcast/cache to the continuation, and not bump the error counter
+/// on the happy path.
+#[test]
+fn test_handle_notarization_reached_registers_async_persist_and_defers_relay() {
+    let mut fixture = TestFixture::new(4);
+    let errors_before =
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+
+    let slot = crate::block::SlotIndex::new(20);
+    let block_hash = UInt256::rand();
+    let signatures = vec![
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(0), vec![1]),
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(1), vec![2]),
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(2), vec![3]),
+    ];
+    let vote = crate::simplex_state::NotarizeVote { slot, block_hash: block_hash.clone() };
+    let cert = Arc::new(crate::certificate::Certificate { vote, signatures });
+    let event =
+        crate::simplex_state::NotarizationReachedEvent { slot, block_hash, certificate: cert };
+
+    fixture.drain_receiver_actions();
+    fixture.processor.handle_notarization_reached(event);
+
+    let pending_entries: Vec<_> =
+        fixture.processor.database.pending_iter().map(|e| e.op_label).collect();
+    assert!(
+        pending_entries.contains(&"handle_notarization_reached"),
+        "notarization persist must be registered in the SXMAIN async-DB-results registry, \
+         got entries: {pending_entries:?}",
+    );
+
+    let actions_before_drain = fixture.drain_receiver_actions();
+    assert!(
+        !actions_before_drain.iter().any(|a| matches!(a, ReceiverAction::SendCertificate { .. })),
+        "broadcast must be deferred to the registry continuation (not synchronous), got actions: \
+         {actions_before_drain:?}",
+    );
+
+    fixture.drain_pending_async_db_results();
+
+    let actions = fixture.drain_receiver_actions();
+    assert!(
+        actions.iter().any(|a| matches!(a, ReceiverAction::SendCertificate { .. })),
+        "notar cert must be relayed once the registry continuation runs",
+    );
+    assert!(
+        actions.iter().any(|a| matches!(
+            a,
+            ReceiverAction::CacheStandstillCertificate {
+                kind: crate::receiver::StandstillCertificateType::Notar,
+                ..
+            }
+        )),
+        "notar cert standstill cache must be populated by the continuation",
+    );
+    assert!(
+        actions.iter().any(|a| matches!(a, ReceiverAction::CacheNotarizationCert { .. })),
+        "VoteSignatureSet cache must be populated by the continuation",
+    );
+    assert_eq!(
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed),
+        errors_before,
+        "successful notar persist must not bump the error counter",
+    );
+}
+
+/// Same parity check for `handle_skip_certificate_reached`.
+#[test]
+fn test_handle_skip_certificate_reached_registers_async_persist_and_defers_relay() {
+    let mut fixture = TestFixture::new(4);
+    let errors_before =
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+
+    let slot = crate::block::SlotIndex::new(21);
+    let signatures = vec![
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(0), vec![21]),
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(1), vec![22]),
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(2), vec![23]),
+    ];
+    let vote = crate::simplex_state::SkipVote { slot };
+    let cert = Arc::new(crate::certificate::Certificate { vote, signatures });
+    let event = crate::simplex_state::SkipCertificateReachedEvent { slot, certificate: cert };
+
+    fixture.drain_receiver_actions();
+    fixture.processor.handle_skip_certificate_reached(event);
+
+    let pending_entries: Vec<_> =
+        fixture.processor.database.pending_iter().map(|e| e.op_label).collect();
+    assert!(
+        pending_entries.contains(&"handle_skip_certificate_reached"),
+        "skip cert persist must be registered in the SXMAIN async-DB-results registry, \
+         got entries: {pending_entries:?}",
+    );
+
+    let actions_before_drain = fixture.drain_receiver_actions();
+    assert!(
+        !actions_before_drain.iter().any(|a| matches!(a, ReceiverAction::SendCertificate { .. })),
+        "broadcast must be deferred to the registry continuation (not synchronous)",
+    );
+
+    fixture.drain_pending_async_db_results();
+
+    let actions = fixture.drain_receiver_actions();
+    assert!(
+        actions.iter().any(|a| matches!(a, ReceiverAction::SendCertificate { .. })),
+        "skip cert must be relayed once the registry continuation runs",
+    );
+    assert!(
+        actions.iter().any(|a| matches!(
+            a,
+            ReceiverAction::CacheStandstillCertificate {
+                kind: crate::receiver::StandstillCertificateType::Skip,
+                ..
+            }
+        )),
+        "skip cert standstill cache must be populated by the continuation",
+    );
+    assert_eq!(
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed),
+        errors_before,
+        "successful skip persist must not bump the error counter",
+    );
+}
+
+/// Same parity check for `handle_finalization_reached`, which additionally caches
+/// the last-final cert and runs `update_standstill_after_final_cert` from the
+/// continuation.
+#[test]
+fn test_handle_finalization_reached_registers_async_persist_and_defers_relay() {
+    let mut fixture = TestFixture::new(4);
+    let errors_before =
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+
+    let slot = crate::block::SlotIndex::new(22);
+    let block_hash = UInt256::rand();
+    let signatures = vec![
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(0), vec![31]),
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(1), vec![32]),
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(2), vec![33]),
+    ];
+    let vote = crate::simplex_state::FinalizeVote { slot, block_hash: block_hash.clone() };
+    let cert = Arc::new(crate::certificate::Certificate { vote, signatures });
+    let event =
+        crate::simplex_state::FinalizationReachedEvent { slot, block_hash, certificate: cert };
+
+    fixture.drain_receiver_actions();
+    fixture.processor.handle_finalization_reached(event);
+
+    let pending_entries: Vec<_> =
+        fixture.processor.database.pending_iter().map(|e| e.op_label).collect();
+    assert!(
+        pending_entries.contains(&"handle_finalization_reached"),
+        "final cert persist must be registered in the SXMAIN async-DB-results registry, \
+         got entries: {pending_entries:?}",
+    );
+
+    let actions_before_drain = fixture.drain_receiver_actions();
+    assert!(
+        !actions_before_drain.iter().any(|a| matches!(a, ReceiverAction::SendCertificate { .. })),
+        "broadcast must be deferred to the registry continuation (not synchronous)",
+    );
+    assert!(
+        !actions_before_drain
+            .iter()
+            .any(|a| matches!(a, ReceiverAction::CacheLastFinalCertificate { .. })),
+        "last-final cache must be deferred to the registry continuation",
+    );
+
+    fixture.drain_pending_async_db_results();
+
+    let actions = fixture.drain_receiver_actions();
+    assert!(
+        actions.iter().any(|a| matches!(a, ReceiverAction::SendCertificate { .. })),
+        "final cert must be relayed once the registry continuation runs",
+    );
+    assert!(
+        actions.iter().any(|a| matches!(
+            a,
+            ReceiverAction::CacheStandstillCertificate {
+                kind: crate::receiver::StandstillCertificateType::Final,
+                ..
+            }
+        )),
+        "final cert standstill cache must be populated by the continuation",
+    );
+    assert!(
+        actions.iter().any(|a| matches!(a, ReceiverAction::CacheLastFinalCertificate { .. })),
+        "last-final cache must be populated by the continuation \
+         (matches C++ pool.cpp::handle_typed_saved_certificate(FinalCertRef))",
+    );
+    assert_eq!(
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed),
+        errors_before,
+        "successful final persist must not bump the error counter",
+    );
+}
+
+// ----------------------------------------------------------------------------
+// Redundant-FSM-re-emit classification for cert handlers
+// ----------------------------------------------------------------------------
+//
+// `handle_notarization_reached` / `handle_skip_certificate_reached` /
+// `handle_finalization_reached` all keep per-slot dedup maps
+// (`notar_cert_store_results`, `skip_cert_store_results`,
+// `final_cert_store_results`) so a single in-flight
+// `StorageAsyncResultPtr<()>` is reused across FSM re-emissions for the same
+// slot. Once the first registry continuation observed the storage outcome,
+// `consensus_common::StorageAsyncResultImpl::try_get()` transitions to
+// `AsyncResultState::Taken` and any subsequent poll returns
+// `Some(Err("StorageAsyncResult: result already taken"))`.
+//
+// That sentinel must be classified as a benign redundant wake:
+//   * NO `increment_error()` — the first callback reported the real outcome;
+//   * NO side-effects (broadcast / standstill cache / last-final cache) —
+//     the first callback already executed them; replaying them would
+//     double-count `certs_relayed_counter` and spam peers on every FSM re-emit.
+//
+// Regression for the 5x5 single-host mixed soak (Apr 25 2026, merged HEAD
+// 84d0b07eb) which showed ~200-290 spurious
+// "handle_notarization_reached: failed to store notar cert ... result already
+// taken" ERROR lines per Rust node over ~6 minutes and a matching bump in
+// `simplex_session_errors_total`.
+
+/// `handle_notarization_reached` must treat the "result already taken"
+/// sentinel as a benign redundant wake: no error-counter bump, no duplicate
+/// relay or cache updates.
+#[test]
+fn test_handle_notarization_reached_treats_result_already_taken_as_ok() {
+    let mut fixture = TestFixture::new(4);
+    let errors_before =
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+
+    let slot = crate::block::SlotIndex::new(120);
+    let block_hash = UInt256::rand();
+    let candidate_id = RawCandidateId { slot, hash: block_hash.clone() };
+
+    // Simulate the real dedup-map state after the first callback already
+    // consumed the persist outcome: inject the typed
+    // `consensus_common::StorageResultAlreadyTaken` sentinel — the same value
+    // `StorageAsyncResultImpl::{try_get, wait_timeout}` emit in production.
+    // This exercises the real `downcast_ref` detection path used by the
+    // cert callbacks (no string matching).
+    let taken = ManualAsyncResult::pending();
+    taken.complete_taken_sentinel();
+    fixture.processor.database.insert_notar_cert_store(candidate_id.clone(), taken);
+
+    let signatures = vec![
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(0), vec![1]),
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(1), vec![2]),
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(2), vec![3]),
+    ];
+    let vote = crate::simplex_state::NotarizeVote { slot, block_hash: block_hash.clone() };
+    let cert = Arc::new(crate::certificate::Certificate { vote, signatures });
+    let event =
+        crate::simplex_state::NotarizationReachedEvent { slot, block_hash, certificate: cert };
+
+    fixture.drain_receiver_actions();
+    fixture.processor.handle_notarization_reached(event);
+    fixture.drain_pending_async_db_results();
+
+    assert_eq!(
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed),
+        errors_before,
+        "redundant FSM re-emit (result already taken) must NOT bump the error counter",
+    );
+    let actions = fixture.drain_receiver_actions();
+    assert!(
+        !actions.iter().any(|a| matches!(a, ReceiverAction::SendCertificate { .. })),
+        "redundant emit must NOT re-broadcast the notar cert, got actions: {actions:?}",
+    );
+    assert!(
+        !actions.iter().any(|a| matches!(a, ReceiverAction::CacheNotarizationCert { .. })),
+        "redundant emit must NOT re-populate the VoteSignatureSet cache, got actions: \
+         {actions:?}",
+    );
+    assert!(
+        !actions.iter().any(|a| matches!(
+            a,
+            ReceiverAction::CacheStandstillCertificate {
+                kind: crate::receiver::StandstillCertificateType::Notar,
+                ..
+            }
+        )),
+        "redundant emit must NOT re-populate the standstill cache, got actions: {actions:?}",
+    );
+}
+
+/// Same regression for `handle_skip_certificate_reached`.
+#[test]
+fn test_handle_skip_certificate_reached_treats_result_already_taken_as_ok() {
+    let mut fixture = TestFixture::new(4);
+    let errors_before =
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+
+    let slot = crate::block::SlotIndex::new(121);
+
+    let taken = ManualAsyncResult::pending();
+    taken.complete_taken_sentinel();
+    fixture.processor.database.insert_skip_cert_store(slot, taken);
+
+    let signatures = vec![
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(0), vec![21]),
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(1), vec![22]),
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(2), vec![23]),
+    ];
+    let vote = crate::simplex_state::SkipVote { slot };
+    let cert = Arc::new(crate::certificate::Certificate { vote, signatures });
+    let event = crate::simplex_state::SkipCertificateReachedEvent { slot, certificate: cert };
+
+    fixture.drain_receiver_actions();
+    fixture.processor.handle_skip_certificate_reached(event);
+    fixture.drain_pending_async_db_results();
+
+    assert_eq!(
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed),
+        errors_before,
+        "redundant FSM re-emit (result already taken) must NOT bump the error counter",
+    );
+    let actions = fixture.drain_receiver_actions();
+    assert!(
+        !actions.iter().any(|a| matches!(a, ReceiverAction::SendCertificate { .. })),
+        "redundant emit must NOT re-broadcast the skip cert, got actions: {actions:?}",
+    );
+    assert!(
+        !actions.iter().any(|a| matches!(
+            a,
+            ReceiverAction::CacheStandstillCertificate {
+                kind: crate::receiver::StandstillCertificateType::Skip,
+                ..
+            }
+        )),
+        "redundant emit must NOT re-populate the standstill cache, got actions: {actions:?}",
+    );
+}
+
+/// Same regression for `handle_finalization_reached` — also verifies the
+/// last-final cache + `update_standstill_after_final_cert` side-effects are
+/// suppressed on the redundant wake.
+#[test]
+fn test_handle_finalization_reached_treats_result_already_taken_as_ok() {
+    let mut fixture = TestFixture::new(4);
+    let errors_before =
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+
+    let slot = crate::block::SlotIndex::new(122);
+    let block_hash = UInt256::rand();
+    let candidate_id = RawCandidateId { slot, hash: block_hash.clone() };
+
+    let taken = ManualAsyncResult::pending();
+    taken.complete_taken_sentinel();
+    fixture.processor.database.insert_final_cert_store(candidate_id.clone(), taken);
+
+    let signatures = vec![
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(0), vec![31]),
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(1), vec![32]),
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(2), vec![33]),
+    ];
+    let vote = crate::simplex_state::FinalizeVote { slot, block_hash: block_hash.clone() };
+    let cert = Arc::new(crate::certificate::Certificate { vote, signatures });
+    let event =
+        crate::simplex_state::FinalizationReachedEvent { slot, block_hash, certificate: cert };
+
+    fixture.drain_receiver_actions();
+    fixture.processor.handle_finalization_reached(event);
+    fixture.drain_pending_async_db_results();
+
+    assert_eq!(
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed),
+        errors_before,
+        "redundant FSM re-emit (result already taken) must NOT bump the error counter",
+    );
+    let actions = fixture.drain_receiver_actions();
+    assert!(
+        !actions.iter().any(|a| matches!(a, ReceiverAction::SendCertificate { .. })),
+        "redundant emit must NOT re-broadcast the final cert, got actions: {actions:?}",
+    );
+    assert!(
+        !actions.iter().any(|a| matches!(
+            a,
+            ReceiverAction::CacheStandstillCertificate {
+                kind: crate::receiver::StandstillCertificateType::Final,
+                ..
+            }
+        )),
+        "redundant emit must NOT re-populate the standstill cache, got actions: {actions:?}",
+    );
+    assert!(
+        !actions.iter().any(|a| matches!(a, ReceiverAction::CacheLastFinalCertificate { .. })),
+        "redundant emit must NOT re-populate the last-final cache, got actions: {actions:?}",
+    );
+}
+
+// ============================================================================
+// `ensure_candidate_info_stored` migration to async-DB-results registry
+// ============================================================================
+//
+// `process_received_notar_cert`, `process_validated_candidates`, and
+// `broadcast_vote` previously blocked SXMAIN on `wait_candidate_info_stored`
+// (which itself called `result.wait()`). They now use the callback-style
+// `ensure_candidate_info_stored(...)` and defer their post-persist work to the
+// SXMAIN async-DB-results registry continuation when a wait is still in flight.
+// Either way, the same caller callback runs (Ok branch on success, Err branch
+// on failure) — eliminating the inline-vs-deferred branching pattern callers
+// had with the previous status-enum API.
+//
+// C++ parity: `consensus.cpp::try_notarize` `co_await`s `store_candidate`
+// before publishing the vote; `candidate-resolver.cpp::store_candidate`
+// `co_await`s the db actor. Persist-before-FSM/relay invariant preserved.
+
+/// `broadcast_vote` (Notarize variant) must defer the network send to the
+/// registry continuation when candidateInfo persist is still pending.
+#[test]
+fn test_broadcast_vote_defers_send_when_candidate_info_pending() {
+    let mut fixture = TestFixture::new(4);
+    let slot = SlotIndex::new(80);
+    let block_hash = UInt256::rand();
+    let candidate_id = RawCandidateId { slot, hash: block_hash.clone() };
+
+    // Inject a manually-controlled pending result into the dedup map so the poll
+    // returns Pending instead of Ready/NotFound.
+    let pending = ManualAsyncResult::pending();
+    fixture.processor.database.insert_candidate_info_store(candidate_id.clone(), pending.clone());
+
+    let vote = crate::simplex_state::Vote::Notarize(crate::simplex_state::NotarizeVote {
+        slot,
+        block_hash,
+    });
+
+    fixture.drain_receiver_actions();
+    fixture.processor.broadcast_vote(vote);
+
+    let pending_entries: Vec<_> =
+        fixture.processor.database.pending_iter().map(|e| e.op_label).collect();
+    assert!(
+        pending_entries.contains(&"ensure_candidate_info_stored:candidate_info"),
+        "broadcast_vote(Notarize) must register a pending continuation when candidateInfo \
+         is in flight, got entries: {pending_entries:?}",
+    );
+
+    let actions_before = fixture.drain_receiver_actions();
+    assert!(
+        !actions_before.iter().any(|a| matches!(a, ReceiverAction::SendVote { .. })),
+        "vote send must be deferred to the continuation while persist is pending",
+    );
+
+    // Complete the persist; drain registry; verify vote is now sent.
+    pending.complete_ok();
+    fixture.processor.process_pending_async_db_results();
+
+    let actions_after = fixture.drain_receiver_actions();
+    assert!(
+        actions_after.iter().any(|a| matches!(a, ReceiverAction::SendVote { .. })),
+        "vote must be sent once the persist continuation runs",
+    );
+}
+
+/// `broadcast_vote` (Notarize variant) must abort with a persist-fail bump when
+/// the candidateInfo persist completes with a real error.
+#[test]
+fn test_broadcast_vote_aborts_when_pending_persist_completes_with_error() {
+    let mut fixture = TestFixture::new(4);
+    let slot = SlotIndex::new(81);
+    let block_hash = UInt256::rand();
+    let candidate_id = RawCandidateId { slot, hash: block_hash.clone() };
+
+    let pending = ManualAsyncResult::pending();
+    fixture.processor.database.insert_candidate_info_store(candidate_id.clone(), pending.clone());
+
+    let vote = crate::simplex_state::Vote::Notarize(crate::simplex_state::NotarizeVote {
+        slot,
+        block_hash,
+    });
+    let persist_fail_before = metrics_counter(&fixture.processor, "simplex_votes_out_persist_fail");
+
+    fixture.drain_receiver_actions();
+    fixture.processor.broadcast_vote(vote);
+
+    pending.complete_err("disk_unavailable");
+    fixture.processor.process_pending_async_db_results();
+
+    let actions_after = fixture.drain_receiver_actions();
+    assert!(
+        !actions_after.iter().any(|a| matches!(a, ReceiverAction::SendVote { .. })),
+        "vote must NOT be sent when the deferred persist completes with an error",
+    );
+    assert_eq!(
+        metrics_counter(&fixture.processor, "simplex_votes_out_persist_fail"),
+        persist_fail_before + 1,
+        "persist-fail counter must bump from the continuation's failure path",
+    );
+}
+
+/// `process_validated_candidates` must defer the FSM feed to the registry
+/// continuation when candidateInfo persist is still pending.
+#[test]
+fn test_process_validated_candidates_defers_feed_when_candidate_info_pending() {
+    let mut fixture = TestFixture::new(4);
+    let slot = SlotIndex::new(0);
+
+    let (leader_source, candidate_id, broadcast) =
+        make_signed_block_broadcast(&fixture, slot.value(), vec![5, 6, 7, 8]);
+    fixture.processor.on_candidate_received(leader_source, broadcast, None);
+
+    // Force the candidateInfo dedup-map entry to be Pending by overwriting the
+    // real RocksDB-backed one with our ManualAsyncResult.
+    let pending = ManualAsyncResult::pending();
+    fixture.processor.database.insert_candidate_info_store(candidate_id.clone(), pending.clone());
+
+    let now = fixture.description.get_time();
+    fixture.processor.candidate_decision_ok_internal(candidate_id.clone(), slot, now);
+
+    fixture.processor.process_validated_candidates();
+
+    // FSM feed must be deferred — no Notarize vote has been emitted yet.
+    let mut has_notarize_before = false;
+    fixture.processor.simplex_state.check_all(&fixture.description);
+    while let Some(event) = fixture.processor.simplex_state.pull_event() {
+        if let crate::simplex_state::SimplexEvent::BroadcastVote(
+            crate::simplex_state::Vote::Notarize(v),
+        ) = event
+        {
+            if v.slot == slot {
+                has_notarize_before = true;
+            }
+        }
+    }
+    assert!(
+        !has_notarize_before,
+        "FSM must not emit Notarize for this slot while candidateInfo persist is pending",
+    );
+
+    // Complete the persist; drain registry; verify the FSM is fed.
+    pending.complete_ok();
+    fixture.processor.process_pending_async_db_results();
+    fixture.processor.simplex_state.check_all(&fixture.description);
+
+    let mut has_notarize_after = false;
+    while let Some(event) = fixture.processor.simplex_state.pull_event() {
+        if let crate::simplex_state::SimplexEvent::BroadcastVote(
+            crate::simplex_state::Vote::Notarize(v),
+        ) = event
+        {
+            if v.slot == slot {
+                has_notarize_after = true;
+            }
+        }
+    }
+    assert!(
+        has_notarize_after,
+        "FSM must emit Notarize for this slot once the deferred candidate is fed by the \
+         registry continuation",
+    );
+}
+
+/// `process_received_notar_cert` must defer the FSM feed and the
+/// `retry_pending_recursive_finalization()` call to the registry continuation
+/// when the notar-cert persist is still pending.
+#[test]
+fn test_process_received_notar_cert_defers_fsm_feed_when_persist_pending() {
+    let mut fixture = TestFixture::new(4);
+    let slot = SlotIndex::new(85);
+    let block_hash = UInt256::rand();
+    let candidate_id = RawCandidateId { slot, hash: block_hash.clone() };
+
+    // Build a valid notar VoteSignatureSet payload + inject a pending dedup-map entry
+    // for the notar-cert wait so the poll returns Pending.
+    let notar_bytes = make_notar_vote_signature_set_bytes(
+        fixture.processor.session_id(),
+        &fixture.nodes,
+        slot,
+        block_hash.clone(),
+        &[0, 1, 2],
+    );
+    let pending = ManualAsyncResult::pending();
+    fixture.processor.database.insert_notar_cert_store(candidate_id.clone(), pending.clone());
+
+    fixture.processor.process_received_notar_cert(slot, &block_hash, &notar_bytes);
+
+    let pending_entries: Vec<_> =
+        fixture.processor.database.pending_iter().map(|e| e.op_label).collect();
+    assert!(
+        pending_entries.contains(&"ensure_candidate_info_stored:notar_cert"),
+        "process_received_notar_cert must register a pending continuation when notar-cert \
+         persist is in flight, got entries: {pending_entries:?}",
+    );
+
+    // FSM feed deferred → no notar-cert recorded yet for this (slot, hash).
+    assert!(
+        fixture.processor.simplex_state.get_notarize_certificate(slot, &block_hash).is_none(),
+        "FSM must not have the notar cert recorded while persist is pending",
+    );
+
+    pending.complete_ok();
+    fixture.processor.process_pending_async_db_results();
+
+    assert!(
+        fixture.processor.simplex_state.get_notarize_certificate(slot, &block_hash).is_some(),
+        "FSM must record the notar cert once the deferred continuation runs",
+    );
+}
+
+// ============================================================================
+// `maybe_apply_finalized_state` migration to async-DB-results registry
+// ============================================================================
+//
+// Pre-migration the masterchain branch blocked SXMAIN on
+// `save_finalized_block_async().wait()` to gate the local apply on durability.
+// It now hands the in-flight write to the SXMAIN async-DB-results registry via
+// `post_async_db_result(...)` and applies the local state immediately —
+// matching C++ `state-resolver.cpp::do_finalize_blocks` where `co_await
+// FinalizeBlock` (callback) runs before `co_await db->set(...)` (persist).
+//
+// Sync-Err registration (`save_finalized_block_async()` returns Err
+// synchronously) still returns `false` and leaves in-memory state untouched —
+// see `test_finalized_callback_not_emitted_when_finalized_record_persist_fails`
+// for that path.
+
+/// Masterchain `maybe_apply_finalized_state` must register an async-DB-results
+/// entry, apply local state inline, and return `true` so the recursive walk
+/// continues. The persist outcome is reported from the registry continuation.
+#[test]
+fn test_maybe_apply_finalized_state_registers_async_persist_on_masterchain() {
+    let mut fixture = TestFixture::new(4);
+    assert!(
+        fixture.description.get_shard().is_masterchain(),
+        "TestFixture must run on masterchain to exercise the async persist path",
+    );
+
+    let (_leader, candidate_id, broadcast) =
+        make_signed_block_broadcast(&fixture, 200, vec![0xaa, 0xbb, 0xcc]);
+    fixture.processor.on_candidate_received(_leader, broadcast, None);
+
+    let pending_before = fixture.processor.database.pending_count();
+    let errors_before =
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+
+    let applied = fixture.processor.maybe_apply_finalized_state(&candidate_id, true);
+    assert!(applied, "successful registration must return true");
+
+    let pending_entries: Vec<_> =
+        fixture.processor.database.pending_iter().map(|e| e.op_label).collect();
+    assert!(
+        pending_entries.contains(&"maybe_apply_finalized_state"),
+        "MC persist must be registered in the SXMAIN async-DB-results registry, \
+         got entries: {pending_entries:?}",
+    );
+    assert_eq!(
+        fixture.processor.database.pending_count(),
+        pending_before + 1,
+        "exactly one new registry entry must be added per call",
+    );
+    assert!(
+        fixture.processor.consensus.is_finalized_block(&candidate_id),
+        "in-memory state must be applied inline (matches C++ callback-before-persist)",
+    );
+    assert_eq!(
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed),
+        errors_before,
+        "happy-path registration must not bump the error counter",
+    );
+
+    fixture.drain_pending_async_db_results();
+    fixture.processor.database.db().sync(Some(Duration::from_secs(2))).expect("sync must succeed");
+
+    assert!(
+        fixture
+            .processor
+            .database
+            .db()
+            .load_finalized_blocks()
+            .expect("finalized records load must succeed")
+            .iter()
+            .any(|record| record.candidate_id == candidate_id),
+        "finalized record must be durable in DB after registry drain + db.sync",
+    );
+    assert_eq!(
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed),
+        errors_before,
+        "successful async persist must not bump the error counter from the continuation",
+    );
+}
+
+/// Async persist failure (continuation observes `Err`) must bump the session
+/// error counter. The in-memory state was already applied inline; the
+/// `finalized_blocks` dedup keeps the candidate from being retried.
+#[test]
+fn test_maybe_apply_finalized_state_async_persist_failure_increments_error_counter() {
+    let mut fixture = TestFixture::new(4);
+    let candidate_id = RawCandidateId { slot: SlotIndex::new(201), hash: UInt256::rand() };
+
+    // Pre-seed a `candidate_book` entry the function expects (slot/seqno
+    // bookkeeping) — minimal real candidate is enough; the test doesn't exercise
+    // the FSM, only the registry plumbing.
+    let (_leader, real_id, broadcast) =
+        make_signed_block_broadcast(&fixture, 201, vec![0x11, 0x22, 0x33]);
+    fixture.processor.on_candidate_received(_leader, broadcast, None);
+
+    let errors_before =
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+
+    let applied = fixture.processor.maybe_apply_finalized_state(&real_id, true);
+    assert!(applied, "registration must succeed (synchronous step)");
+    assert!(
+        fixture.processor.consensus.is_finalized_block(&real_id),
+        "in-memory state is applied inline regardless of eventual persist outcome",
+    );
+
+    // Swap the registered registry entry's `result` with a manually-failed one
+    // to simulate the storage thread reporting Err for this write — without
+    // having to inject a deterministic disk failure into RocksDB.
+    let real_entry_idx = fixture
+        .processor
+        .database
+        .pending_iter()
+        .position(|e| e.op_label == "maybe_apply_finalized_state")
+        .expect("the MC persist must be registered before we can simulate its failure");
+    let failed = ManualAsyncResult::pending();
+    failed.complete_err("simulated_disk_failure");
+    fixture
+        .processor
+        .database
+        .pending_iter_mut()
+        .nth(real_entry_idx)
+        .expect("entry must exist after position lookup")
+        .result = failed.clone();
+
+    fixture.processor.process_pending_async_db_results();
+
+    assert_eq!(
+        fixture
+            .processor
+            .database
+            .pending_iter()
+            .filter(|e| e.op_label == "maybe_apply_finalized_state")
+            .count(),
+        0,
+        "async-Err path must remove the entry from the registry",
+    );
+    let errors_after =
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        errors_after > errors_before,
+        "async persist failure must bump the session error counter from the continuation \
+         (matches `increment_error()` in the Ok/Err match arm)",
+    );
+    assert!(
+        fixture.processor.consensus.is_finalized_block(&real_id),
+        "in-memory state must NOT be rolled back on async-Err (matches the migration design)",
+    );
+
+    // Silence unused-variable warning on `candidate_id` — used here as a guard
+    // against accidental reuse of the same id across the two test cases above.
+    let _ = candidate_id;
+}
+
+// Snapshot builders for `SessionTelemetry`
+//
+// Each builder produces a neutral, owned snapshot that the telemetry aspect
+// will consume read-only in later commits. Tests assert that the builders
+// project the right `SessionProcessor` private state into snapshot fields.
+// ============================================================================
+
+#[test]
+fn build_health_check_snapshot_projects_dynamic_state() {
+    let mut fixture = TestFixture::new(3);
+    fixture.processor.runtime.force_active_weight(2);
+    fixture.processor.consensus.set_finalized_head_slot(Some(SlotIndex(11)));
+
+    let snapshot = fixture.processor.build_health_check_snapshot();
+
+    assert_eq!(snapshot.active_weight, 2);
+    assert_eq!(snapshot.finalized_head_slot, Some(SlotIndex(11)));
+    // No peer activity yet — every peer (except self) is "never seen".
+    let other_peers = fixture.processor.runtime.description().get_total_nodes() - 1;
+    assert_eq!(snapshot.peers_never_seen, other_peers);
+    // First-non-finalized/first-non-progressed default to slot 0 at session
+    // start (no FSM activity).
+    assert_eq!(snapshot.first_non_finalized, SlotIndex(0));
+    assert_eq!(snapshot.first_non_progressed, SlotIndex(0));
+}
+
+#[test]
+fn build_consensus_state_snapshot_carries_trigger_and_counts() {
+    let fixture = TestFixture::new(3);
+
+    let snapshot = fixture.processor.build_consensus_state_snapshot("check_all");
+
+    assert_eq!(snapshot.trigger, "check_all");
+    assert_eq!(snapshot.pending_validations_count, 0);
+    assert_eq!(snapshot.validated_count, 0);
+    assert!(!snapshot.generated);
+    assert!(!snapshot.pending_generate);
+}
+
+#[test]
+fn build_validation_inventory_snapshot_returns_empty_buckets_for_clean_session() {
+    let fixture = TestFixture::new(3);
+    let snapshot = fixture.processor.build_validation_inventory_snapshot(SystemTime::now());
+
+    assert_eq!(snapshot.totals.received_total, 0);
+    assert!(snapshot.received.is_empty());
+    assert!(snapshot.validated.is_empty());
+    assert!(snapshot.notarized.is_empty());
+    assert!(snapshot.finalized.is_empty());
+}
+
+#[test]
+fn build_dump_status_snapshot_uses_processor_clock() {
+    let mut fixture = TestFixture::new(3);
+    let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    fixture.processor.set_time(base_time);
+    fixture.processor.runtime.force_active_weight(3);
+    fixture.processor.consensus.set_finalized_head_seqno(Some(42));
+
+    let snapshot = fixture.processor.build_dump_status_snapshot();
+
+    assert_eq!(snapshot.observed_at, base_time);
+    assert_eq!(snapshot.active_weight, 3);
+    assert_eq!(snapshot.finalized_head_seqno, Some(42));
+}
+
+#[test]
+fn build_full_dump_snapshot_includes_all_scalar_heads() {
+    let mut fixture = TestFixture::new(3);
+    fixture.processor.consensus.set_finalized_head_seqno(Some(99));
+    fixture.processor.consensus.set_last_consensus_finalized_seqno(Some(98));
+    fixture.processor.consensus.set_accepted_normal_head_seqno(100);
+    fixture.processor.consensus.set_last_mc_finalized_seqno(Some(50));
+
+    let now = SystemTime::now();
+    let snapshot = fixture.processor.build_full_dump_snapshot(now, /* is_stalled */ false);
+
+    assert_eq!(snapshot.last_consensus_finalized_seqno, Some(98));
+    assert_eq!(snapshot.accepted_normal_head_seqno, 100);
+    assert_eq!(snapshot.last_mc_finalized_seqno, Some(50));
+    assert_eq!(snapshot.pending_validations_count, 0);
+    assert_eq!(snapshot.approved_count, 0);
+    assert_eq!(snapshot.rejected_count, 0);
+    assert_eq!(snapshot.precollated_count, 0);
+    assert_eq!(snapshot.generated_waiting_validation_count, 0);
+    // No stall ⇒ no standstill dump output.
+    assert!(snapshot.standstill_diagnostic_dump.is_none());
+}
+
+#[test]
+fn build_full_dump_snapshot_skips_standstill_dump_when_not_stalled() {
+    let fixture = TestFixture::new(3);
+    let snapshot =
+        fixture.processor.build_full_dump_snapshot(SystemTime::now(), /* is_stalled */ false);
+    assert!(snapshot.standstill_diagnostic_dump.is_none());
+}
+
+// ============================================================================
+// `SessionProcessor::stop()` — close()/destroy_db wiring
+// ============================================================================
+//
+// These tests assert the shutdown contract the migrated session paths rely on:
+//
+// * `stop(false)` flips `db.is_closed()` so any post-stop continuation that
+//   tries to enqueue a write fails fast with `DB_CLOSED_ERROR` (C++ parity:
+//   `bus_->db->close()` sets `key_value_ = {}` in `KeyValueAsync::close()`).
+// * `stop(true)` additionally calls `db.mark_for_destroy()` so the on-disk
+//   DB is removed when the last `Arc<SimplexDb>` drops (C++ parity:
+//   `td::RocksDb::destroy(db_path() + "/db/") + td::rmrf(db_path())`).
+// * `stop()` is idempotent — calling it a second time short-circuits with no
+//   new error-counter bumps.
+
+#[test]
+fn test_stop_flips_db_is_closed_gate() {
+    let mut fixture = TestFixture::new(4);
+    assert!(
+        !fixture.processor.database.db().is_closed(),
+        "pre-condition: db must be open at fixture creation"
+    );
+
+    fixture.processor.stop(false);
+
+    assert!(
+        fixture.processor.database.db().is_closed(),
+        "stop() must flip db.is_closed() so late continuations fail fast",
+    );
+}
+
+#[test]
+fn test_stop_without_destroy_does_not_mark_for_destroy() {
+    let mut fixture = TestFixture::new(4);
+    let db_path = fixture.processor.database.db().get_path().to_path_buf();
+    assert!(db_path.exists(), "DB directory must exist at fixture creation");
+
+    // Keep a clone so we can observe the path after SessionProcessor is consumed.
+    let db_clone = fixture.processor.database.db().clone();
+    fixture.processor.stop(false);
+
+    // Drop the SessionProcessor's Arc reference (simulates session tear-down).
+    drop(fixture);
+    // One Arc remains (db_clone) — path must still exist (no mark_for_destroy()).
+    assert!(db_path.exists(), "stop(destroy_db=false) must NOT remove the DB directory",);
+    drop(db_clone);
+
+    // After the last Arc drops, the DB thread's Drop still runs. Give that
+    // teardown a brief window; because mark_for_destroy was NOT called it must
+    // not remove the directory. A short fixed wait is enough to catch an
+    // erroneous async removal without padding the suite with a multi-second
+    // sleep.
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(db_path.exists(), "DB directory must persist across drop when destroy_db=false",);
+
+    // Cleanup so we don't leak temp DBs.
+    let _ = std::fs::remove_dir_all(&db_path);
+}
+
+#[test]
+fn test_stop_with_destroy_db_removes_directory() {
+    let mut fixture = TestFixture::new(4);
+    let db_path = fixture.processor.database.db().get_path().to_path_buf();
+    assert!(db_path.exists(), "pre-condition: DB directory must exist");
+
+    fixture.processor.stop(true);
+
+    // Drop the session processor — the DB thread runs its cleanup on the
+    // mark_for_destroy path.
+    drop(fixture);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if !db_path.exists() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "DB directory {} must be removed after stop(destroy_db=true)+drop",
+                db_path.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn test_stop_is_idempotent_and_does_not_double_increment_errors() {
+    let mut fixture = TestFixture::new(4);
+    let errors_before =
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+
+    fixture.processor.stop(false);
+    let errors_after_first =
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        errors_after_first, errors_before,
+        "first stop() on a quiescent processor must not bump the error counter",
+    );
+
+    // Second stop() must not panic and must short-circuit. `db.close()` is
+    // idempotent: the second call short-circuits to Ok(()) (it does NOT return
+    // DB_CLOSED_ERROR), so a clean double-stop should not record a new storage
+    // error. Assert the counter moved by AT MOST 1 to lock that contract while
+    // tolerating a single incidental teardown bump.
+    fixture.processor.stop(false);
+    let errors_after_second =
+        fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        errors_after_second <= errors_after_first + 1,
+        "double-stop must increment the error counter by at most 1 (observed {} -> {})",
+        errors_after_first,
+        errors_after_second,
+    );
+    assert!(
+        fixture.processor.database.db().is_closed(),
+        "db must remain closed across double-stop",
+    );
+}

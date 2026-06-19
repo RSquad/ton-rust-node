@@ -504,8 +504,12 @@ pub trait TransactionExecutor {
             fail!("can't sub funds: from acc_balance")
         }
 
+        // Seed VM-loaded cells as a storage-stat hint before the recalc in
+        // `check_account_size_limits` (cpp `add_hint(compute_phase->vm_loaded_cells)`).
+        let visited_cells = vm.take_visited_cells();
         let (new_data, out_actions) = vm.get_committed_state().unzip();
         *acc = result_acc;
+        acc.add_storage_stat_hint(&visited_cells);
         Ok((TrComputePhase::Vm(vm_phase), out_actions, new_data))
     }
 

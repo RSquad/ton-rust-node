@@ -260,7 +260,7 @@ impl EngineOperations for Engine {
         self.db().load_block_handle(id)
     }
 
-    async fn load_applied_block(&self, handle: &BlockHandle) -> Result<BlockStuff> {
+    async fn load_applied_block(&self, handle: &Arc<BlockHandle>) -> Result<BlockStuff> {
         // TODO make cache?
         if handle.is_applied() {
             self.load_block(handle).await
@@ -271,11 +271,11 @@ impl EngineOperations for Engine {
         }
     }
 
-    async fn load_block(&self, handle: &BlockHandle) -> Result<BlockStuff> {
+    async fn load_block(&self, handle: &Arc<BlockHandle>) -> Result<BlockStuff> {
         self.db().load_block_data(handle).await
     }
 
-    async fn load_block_raw(&self, handle: &BlockHandle) -> Result<Vec<u8>> {
+    async fn load_block_raw(&self, handle: &Arc<BlockHandle>) -> Result<Vec<u8>> {
         self.db().load_block_data_raw(handle).await
     }
 
@@ -680,7 +680,11 @@ impl EngineOperations for Engine {
         self.db().load_block_proof(handle, is_link).await
     }
 
-    async fn load_block_proof_raw(&self, handle: &BlockHandle, is_link: bool) -> Result<Vec<u8>> {
+    async fn load_block_proof_raw(
+        &self,
+        handle: &Arc<BlockHandle>,
+        is_link: bool,
+    ) -> Result<Vec<u8>> {
         self.db().load_block_proof_raw(handle, is_link).await
     }
 
@@ -1274,6 +1278,10 @@ impl EngineOperations for Engine {
 
     fn add_account_storage_dict(&self, dict: Cell, size: u64) {
         self.add_account_storage_dict(dict, size)
+    }
+
+    fn trace_collector(&self) -> Option<simplex::TraceCollector> {
+        self.get_trace_collector().cloned()
     }
 
     async fn update_custom_overlays(&self, configs: Option<&[CustomOverlay]>) -> Result<()> {

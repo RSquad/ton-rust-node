@@ -28,7 +28,8 @@ use ton_block::{base64_encode, error, fail, Ed25519KeyOption, ZeroizingBytes};
 
 const MAX_DEBUG_BYTES_LEN: usize = 4;
 const MAX_TL_BYTES_LEN: usize = 16 << 20; // 16 MB
-const MAX_TL_VECTOR_LEN: usize = 1 << 20; // 1,048,576
+const MAX_TL_VECTOR_LEN: i32 = 1 << 20; // 1,048,576
+const MAX_INITIAL_VECTOR_CAP: i32 = 1024;
 
 macro_rules! impl_byteslike {
     (@common $ty:ident) => {
@@ -220,11 +221,12 @@ pub trait Vectored<T> {
         Self: Sized,
     {
         let count = de.read_i32::<LittleEndian>()?;
-        if (count < 0) || ((count as usize) > MAX_TL_VECTOR_LEN) {
+        if count < 0 || count > MAX_TL_VECTOR_LEN {
             fail!("Invalid TL vector length {count}")
         }
         let mut ret = Vec::new();
-        ret.try_reserve_exact(count as usize)
+        // We reserve a small initial slice; the Vec grows organically as items are pushed.
+        ret.try_reserve_exact(count.min(MAX_INITIAL_VECTOR_CAP) as usize)
             .map_err(|e| error!("count {} is too big for {}: {}", count, type_name::<Self>(), e))?;
         for _ in 0..count {
             ret.push(op(de)?)

@@ -54,6 +54,13 @@ fn extract_signature_pairs(variant: &BlockSignaturesVariant) -> Result<Vec<Crypt
     Ok(pairs)
 }
 
+fn can_promote_to_top_shard_descr(signatures: &BlockSignaturesVariant) -> bool {
+    match signatures {
+        BlockSignaturesVariant::Ordinary(_) => true,
+        BlockSignaturesVariant::Simplex(simplex) => simplex.is_final(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn accept_block(
     id: BlockIdExt,
@@ -138,54 +145,65 @@ pub async fn accept_block(
         engine.clone().apply_block(&handle, &block, id.seq_no(), false).await?;
         log::debug!(target: "validator", "({}): acccept_block: Applied block", block_descr);
     } else {
-        let last_mc_state = choose_mc_state(&block, &engine).await?;
+        if can_promote_to_top_shard_descr(&signatures_out) {
+            let last_mc_state = choose_mc_state(&block, &engine).await?;
+            if let Some(tbd) = create_top_shard_block_description(
+                &block,
+                signatures_out.clone(), // Pass full BlockSignaturesVariant for proper verification
+                &last_mc_state,
+                prev,
+                engine.deref(),
+            )
+            .await?
+            {
+                // TopBlockDescrStuff now handles both Ordinary and Simplex signature verification
+                let tbd_stuff = Arc::new(TopBlockDescrStuff::new(
+                    tbd,
+                    block.id(),
+                    is_fake,
+                    send_block_broadcast,
+                )?);
+                tbd_stuff.validate(&last_mc_state)?;
 
-        if let Some(tbd) = create_top_shard_block_description(
-            &block,
-            signatures_out.clone(), // Pass full BlockSignaturesVariant for proper verification
-            &last_mc_state,
-            prev,
-            engine.deref(),
-        )
-        .await?
-        {
-            // TopBlockDescrStuff now handles both Ordinary and Simplex signature verification
-            let tbd_stuff =
-                Arc::new(TopBlockDescrStuff::new(tbd, block.id(), is_fake, send_block_broadcast)?);
-            tbd_stuff.validate(&last_mc_state)?;
+                let engine = engine.clone();
+                let cc_seqno = validator_set.catchain_seqno();
 
-            let engine = engine.clone();
-            let cc_seqno = validator_set.catchain_seqno();
+                // NOTE: `process_shard_block` is called from `send_top_shard_block_description`,
+                // so in case with a single collator we need to wait until this broadcast
+                // will be processed. Otherwise there are data races, which are acceptable
+                // for multiple collators per session.
+                #[cfg(feature = "xp25")]
+                macro_rules! spawn_resend(($expr:expr) => { $expr };);
+                #[cfg(not(feature = "xp25"))]
+                macro_rules! spawn_resend(($expr:expr) => { tokio::spawn(async move { $expr }); };);
 
-            // NOTE: `process_shard_block` is called from `send_top_shard_block_description`,
-            // so in case with a single collator we need to wait until this broadcast
-            // will be processed. Otherwise there are data races, which are acceptable
-            // for multiple collators per session.
-            #[cfg(feature = "xp25")]
-            macro_rules! spawn_resend(($expr:expr) => { $expr };);
-            #[cfg(not(feature = "xp25"))]
-            macro_rules! spawn_resend(($expr:expr) => { tokio::spawn(async move { $expr }); };);
-
-            let block_descr = block_descr.clone();
-            spawn_resend!({
-                log::trace!(target: "validator", "({}): accept_block: sending shard block description broadcast", block_descr);
-                if let Err(e) =
-                    engine.send_top_shard_block_description(tbd_stuff, cc_seqno, false).await
-                {
-                    log::warn!(
-                        target: "validator",
-                        "({}): accept_block: error while sending shard block description broadcast: {}",
-                        block_descr,
-                        e
-                    );
-                } else {
-                    log::trace!(
-                        target: "validator",
-                        "({}): accept_block: sent shard block description broadcast",
-                        block_descr,
-                    );
-                }
-            });
+                let block_descr = block_descr.clone();
+                spawn_resend!({
+                    log::trace!(target: "validator", "({}): accept_block: sending shard block description broadcast", block_descr);
+                    if let Err(e) =
+                        engine.send_top_shard_block_description(tbd_stuff, cc_seqno, false).await
+                    {
+                        log::warn!(
+                            target: "validator",
+                            "({}): accept_block: error while sending shard block description broadcast: {}",
+                            block_descr,
+                            e
+                        );
+                    } else {
+                        log::trace!(
+                            target: "validator",
+                            "({}): accept_block: sent shard block description broadcast",
+                            block_descr,
+                        );
+                    }
+                });
+            }
+        } else {
+            log::debug!(
+                target: "validator",
+                "({}): accept_block: skipping shard top block description for non-final Simplex signatures",
+                block_descr
+            );
         }
     }
 

@@ -66,16 +66,17 @@ pub(super) const ACCELERATED_CONSENSUS_BLOCK_CANDIDATE_SENDING_RETRY_ATTEMPTS: u
 pub use consensus_common::{
     serialize_tl_bare_object, serialize_tl_boxed_object,
     utils::{get_elapsed_time, get_hash, get_hash_from_block_payload},
-    AsyncRequest, AsyncRequestPtr, BlockCandidatePriority, BlockHash, BlockPayloadPtr,
-    BlockSignature, BlockSourceInfo, CandidateObservedFlags, CollationParentHint,
-    ConsensusCommonFactory, ConsensusNode, ConsensusOverlay, ConsensusOverlayListener,
-    ConsensusOverlayListenerPtr, ConsensusOverlayLogReplayListener,
-    ConsensusOverlayLogReplayListenerPtr, ConsensusOverlayManager, ConsensusOverlayManagerPtr,
-    ConsensusOverlayPtr, ConsensusReplayListener, ConsensusReplayListenerPtr,
-    EnsureCandidateAvailabilityOptions, LogPlayer, LogPlayerPtr, LogReplayOptions,
-    OverlayTransportType, PrivateKey, PublicKey, PublicKeyHash, RawBuffer, ResolverPurpose, Result,
-    Session, SessionId, SessionListener, SessionListenerPtr, SessionNode, SessionPtr, SessionStats,
-    ValidatorBlockCandidate, ValidatorBlockCandidateCallback,
+    AsyncCollationRequest, AsyncCollationRequestPtr, AsyncRequest, AsyncRequestPtr,
+    BlockCandidatePriority, BlockHash, BlockPayloadPtr, BlockSignature, BlockSourceInfo,
+    CandidateObservedFlags, CollationParentHint, ConsensusCommonFactory, ConsensusNode,
+    ConsensusOverlay, ConsensusOverlayListener, ConsensusOverlayListenerPtr,
+    ConsensusOverlayLogReplayListener, ConsensusOverlayLogReplayListenerPtr,
+    ConsensusOverlayManager, ConsensusOverlayManagerPtr, ConsensusOverlayPtr,
+    ConsensusReplayListener, ConsensusReplayListenerPtr, EmulatorLeaderRotation, EmulatorOptions,
+    EmulatorPtr, EmulatorSignerSubset, EnsureCandidateAvailabilityOptions, LogPlayer, LogPlayerPtr,
+    LogReplayOptions, OverlayTransportType, PrivateKey, PublicKey, PublicKeyHash, RawBuffer,
+    ResolverPurpose, Result, Session, SessionId, SessionListener, SessionListenerPtr, SessionNode,
+    SessionPtr, SessionStats, ValidatorBlockCandidate, ValidatorBlockCandidateCallback,
     ValidatorBlockCandidateDecisionCallback, ValidatorBlockCandidatePtr, ValidatorWeight,
 };
 
@@ -105,6 +106,89 @@ pub type SimplexSessionPtr = simplex::SessionPtr;
 /// Simplex session options
 pub type SimplexSessionOptions = simplex::SessionOptions;
 
+/// Test-only options for replacing a real Simplex session with the in-process
+/// consensus emulator while keeping ValidatorGroup in Simplex mode.
+#[cfg(test)]
+#[derive(Clone)]
+pub struct EmulatorConsensusOptions {
+    /// Simplex options consumed by ValidatorGroup for Simplex-specific
+    /// behaviour such as in-window collation context limits.
+    pub simplex_options: SimplexSessionOptions,
+    /// Emulator timing/leader/signing configuration. The session id and shard
+    /// are overwritten from the ValidatorGroup at creation time.
+    pub emulator_options: EmulatorOptions,
+    /// Private-key-bearing validator keys owned by the single test process.
+    pub validator_keys: Vec<PrivateKey>,
+}
+
+#[cfg(test)]
+impl EmulatorConsensusOptions {
+    pub fn fixed_local(validator_keys: Vec<PrivateKey>) -> Self {
+        let mut emulator_options = EmulatorOptions::default();
+        emulator_options.leader_rotation = EmulatorLeaderRotation::FixedLocal;
+        emulator_options.signer_subset = EmulatorSignerSubset::All;
+        Self { simplex_options: SimplexSessionOptions::default(), emulator_options, validator_keys }
+    }
+}
+
+#[cfg(test)]
+struct EmulatorSimplexSessionAdapter {
+    emulator: EmulatorPtr,
+}
+
+#[cfg(test)]
+impl Display for EmulatorSimplexSessionAdapter {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(self.emulator.as_ref(), f)
+    }
+}
+
+#[cfg(test)]
+impl Session for EmulatorSimplexSessionAdapter {
+    fn start(&self, prev_blocks: Vec<BlockIdExt>, min_masterchain_block_id: BlockIdExt) {
+        self.emulator.start(prev_blocks, min_masterchain_block_id);
+    }
+
+    fn stop(&self) {
+        self.emulator.stop();
+    }
+
+    fn stop_async(&self) {
+        self.emulator.stop_async();
+    }
+
+    fn destroy(&self) {
+        self.emulator.destroy();
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+#[cfg(test)]
+impl SimplexSession for EmulatorSimplexSessionAdapter {
+    fn notify_mc_finalized(&self, applied_top: BlockIdExt) {
+        self.emulator.notify_mc_finalized(applied_top);
+    }
+
+    fn ensure_candidate_available(
+        &self,
+        block_id: BlockIdExt,
+        opts: EnsureCandidateAvailabilityOptions,
+    ) {
+        self.emulator.ensure_candidate_available(block_id, opts);
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.emulator.is_stopped()
+    }
+
+    fn is_panicked(&self) -> bool {
+        self.emulator.is_panicked()
+    }
+}
+
 // =============================================================================
 // Consensus Options - Unified options enum for session creation
 // =============================================================================
@@ -120,6 +204,9 @@ pub enum ConsensusOptions {
     Catchain(CatchainSessionOptions),
     /// Simplex-based consensus options
     Simplex(SimplexSessionOptions),
+    /// Test-only Simplex-compatible session backed by ConsensusEmulator.
+    #[cfg(test)]
+    Emulator(EmulatorConsensusOptions),
 }
 
 impl ConsensusOptions {
@@ -128,6 +215,8 @@ impl ConsensusOptions {
         match self {
             ConsensusOptions::Catchain(_) => ConsensusType::Catchain,
             ConsensusOptions::Simplex(_) => ConsensusType::Simplex,
+            #[cfg(test)]
+            ConsensusOptions::Emulator(_) => ConsensusType::Simplex,
         }
     }
 
@@ -136,6 +225,8 @@ impl ConsensusOptions {
         match self {
             ConsensusOptions::Catchain(opts) => Some(opts),
             ConsensusOptions::Simplex(_) => None,
+            #[cfg(test)]
+            ConsensusOptions::Emulator(_) => None,
         }
     }
 
@@ -144,6 +235,8 @@ impl ConsensusOptions {
         match self {
             ConsensusOptions::Catchain(_) => None,
             ConsensusOptions::Simplex(opts) => Some(opts),
+            #[cfg(test)]
+            ConsensusOptions::Emulator(opts) => Some(&opts.simplex_options),
         }
     }
 
@@ -152,6 +245,8 @@ impl ConsensusOptions {
         match self {
             ConsensusOptions::Catchain(opts) => opts.accelerated_consensus_enabled,
             ConsensusOptions::Simplex(_) => false,
+            #[cfg(test)]
+            ConsensusOptions::Emulator(_) => false,
         }
     }
 
@@ -164,6 +259,8 @@ impl ConsensusOptions {
         match self {
             ConsensusOptions::Catchain(opts) => opts.accelerated_consensus_enabled,
             ConsensusOptions::Simplex(_) => false,
+            #[cfg(test)]
+            ConsensusOptions::Emulator(_) => false,
         }
     }
 }
@@ -181,6 +278,8 @@ impl Debug for ConsensusOptions {
                 write!(f, "ConsensusOptions::Catchain({:?})", opts)
             }
             ConsensusOptions::Simplex(_) => write!(f, "ConsensusOptions::Simplex(...)"),
+            #[cfg(test)]
+            ConsensusOptions::Emulator(_) => write!(f, "ConsensusOptions::Emulator(...)"),
         }
     }
 }
@@ -198,6 +297,9 @@ pub enum SessionInner {
     Catchain(CatchainSessionPtr),
     /// Simplex-based consensus session
     Simplex(SimplexSessionPtr),
+    /// Test-only Simplex-compatible emulator session
+    #[cfg(test)]
+    Emulator(EmulatorPtr),
 }
 
 impl SessionInner {
@@ -206,6 +308,8 @@ impl SessionInner {
         match self {
             SessionInner::Catchain(s) => s.as_ref() as &dyn consensus_common::Session,
             SessionInner::Simplex(s) => s.as_ref() as &dyn consensus_common::Session,
+            #[cfg(test)]
+            SessionInner::Emulator(s) => s.as_ref() as &dyn consensus_common::Session,
         }
     }
 
@@ -214,6 +318,8 @@ impl SessionInner {
         match self {
             SessionInner::Catchain(_) => ConsensusType::Catchain,
             SessionInner::Simplex(_) => ConsensusType::Simplex,
+            #[cfg(test)]
+            SessionInner::Emulator(_) => ConsensusType::Simplex,
         }
     }
 }
@@ -238,6 +344,12 @@ impl SessionHolder {
         SessionHolder { inner: SessionInner::Simplex(session) }
     }
 
+    /// Create a new test-only emulator session holder.
+    #[cfg(test)]
+    pub fn emulator(session: EmulatorPtr) -> Self {
+        SessionHolder { inner: SessionInner::Emulator(session) }
+    }
+
     /// Get the consensus type
     pub fn get_consensus_type(&self) -> ConsensusType {
         self.inner.get_consensus_type()
@@ -249,6 +361,8 @@ impl SessionHolder {
         match &self.inner {
             SessionInner::Catchain(s) => Some(s.clone()),
             SessionInner::Simplex(_) => None,
+            #[cfg(test)]
+            SessionInner::Emulator(_) => None,
         }
     }
 
@@ -258,6 +372,19 @@ impl SessionHolder {
         match &self.inner {
             SessionInner::Catchain(_) => None,
             SessionInner::Simplex(s) => Some(s.clone()),
+            #[cfg(test)]
+            SessionInner::Emulator(s) => {
+                Some(Arc::new(EmulatorSimplexSessionAdapter { emulator: s.clone() }))
+            }
+        }
+    }
+
+    /// Get emulator session pointer for test-only controls.
+    #[cfg(test)]
+    pub fn get_emulator_session(&self) -> Option<EmulatorPtr> {
+        match &self.inner {
+            SessionInner::Emulator(s) => Some(s.clone()),
+            SessionInner::Catchain(_) | SessionInner::Simplex(_) => None,
         }
     }
 
@@ -271,8 +398,11 @@ impl SessionHolder {
     /// # Arguments
     /// * `applied_top` - Current applied top for this session shard
     pub fn notify_mc_finalized(&self, applied_top: BlockIdExt) {
-        if let SessionInner::Simplex(s) = &self.inner {
-            s.notify_mc_finalized(applied_top);
+        match &self.inner {
+            SessionInner::Simplex(s) => s.notify_mc_finalized(applied_top),
+            #[cfg(test)]
+            SessionInner::Emulator(s) => s.notify_mc_finalized(applied_top),
+            SessionInner::Catchain(_) => {}
         }
     }
 }
@@ -306,6 +436,8 @@ impl Display for SessionHolder {
         match &self.inner {
             SessionInner::Catchain(s) => write!(f, "{}", s),
             SessionInner::Simplex(s) => write!(f, "{}", s),
+            #[cfg(test)]
+            SessionInner::Emulator(s) => write!(f, "{}", s),
         }
     }
 }
@@ -434,6 +566,7 @@ impl ConsensusFactory {
         catchain_seqno: u32,
         overlay_manager: ConsensusOverlayManagerPtr,
         listener: SessionListenerPtr,
+        trace_collector: Option<simplex::TraceCollector>,
     ) -> consensus_common::Result<SessionHolderPtr> {
         let mut options = options.clone();
         options.use_callback_thread = false;
@@ -449,9 +582,67 @@ impl ConsensusFactory {
             db_path,
             overlay_manager,
             listener,
+            trace_collector,
+            catchain_seqno,
         )?;
 
         Ok(Arc::new(SessionHolder::simplex(simplex_session)))
+    }
+
+    /// Create a test-only Simplex-compatible session backed by ConsensusEmulator.
+    #[cfg(test)]
+    pub fn create_emulator_based_session(
+        options: &EmulatorConsensusOptions,
+        session_id: &SessionId,
+        shard: &ShardIdent,
+        nodes: Vec<SessionNode>,
+        local_key: &PrivateKey,
+        listener: SessionListenerPtr,
+    ) -> consensus_common::Result<SessionHolderPtr> {
+        let local_key_id = local_key.id();
+        let local_idx = nodes
+            .iter()
+            .position(|node| node.public_key.id() == local_key_id)
+            .ok_or_else(|| {
+                ton_block::error!(
+                    "Consensus emulator session: local key {} is absent from validator set",
+                    hex::encode(local_key_id.data())
+                )
+            })?;
+
+        let mut signing_nodes = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            let node_key_id = node.public_key.id();
+            let signing_key = options
+                .validator_keys
+                .iter()
+                .find(|key| key.id() == node_key_id)
+                .cloned()
+                .ok_or_else(|| {
+                    ton_block::error!(
+                        "Consensus emulator session: missing signing key for validator {}",
+                        hex::encode(node_key_id.data())
+                    )
+                })?;
+            signing_nodes.push(SessionNode {
+                adnl_id: node.adnl_id,
+                public_key: signing_key,
+                weight: node.weight,
+            });
+        }
+
+        let mut emulator_options = options.emulator_options.clone();
+        emulator_options.session_id = session_id.clone();
+        emulator_options.shard = shard.clone();
+        emulator_options.leader_rotation = EmulatorLeaderRotation::FixedLocal;
+
+        let emulator = ConsensusCommonFactory::create_consensus_emulator(
+            emulator_options,
+            signing_nodes,
+            local_idx,
+            listener,
+        )?;
+        Ok(Arc::new(SessionHolder::emulator(emulator)))
     }
 
     /// Configure catchain-specific options for accelerated consensus
@@ -575,6 +766,8 @@ impl ConsensusFactory {
         db_path: String,
         overlay_manager: ConsensusOverlayManagerPtr,
         listener: SessionListenerPtr,
+        trace_collector: Option<simplex::TraceCollector>,
+        catchain_seqno: u32,
     ) -> consensus_common::Result<SimplexSessionPtr> {
         simplex::SessionFactory::create_session(
             options,
@@ -585,6 +778,8 @@ impl ConsensusFactory {
             db_path,
             overlay_manager,
             listener,
+            trace_collector,
+            catchain_seqno,
         )
     }
 }

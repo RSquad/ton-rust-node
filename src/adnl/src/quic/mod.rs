@@ -595,6 +595,9 @@ impl QuicNode {
             transport_errors: TransportErrors::new(),
             rate_limit_config: rate_limit_config.unwrap_or_default(),
         });
+        // Pre-register Prometheus counters so they appear in the exporter
+        // output before the first event
+        transport.transport_errors.register_metrics();
         // Spawn background task that processes key commands inside the Tokio runtime.
         let weak = Arc::downgrade(&transport);
         let token = cancellation_token.clone();
@@ -944,7 +947,7 @@ impl QuicNode {
                     return Ok(Some(data.len()));
                 }
                 Err(e) => {
-                    self.transport_errors.send_failed.fetch_add(1, Ordering::Relaxed);
+                    self.transport_errors.send_failed.inc();
                     log::warn!(
                         target: TARGET,
                         "QUIC direct send to {} failed: {e}, removing dead connection, \
@@ -952,7 +955,7 @@ impl QuicNode {
                         peers.other()
                     );
                     Self::remove_dead_connection(&state.outbound, addr, conn);
-                    self.transport_errors.dead_conn_removed.fetch_add(1, Ordering::Relaxed);
+                    self.transport_errors.dead_conn_removed.inc();
                 }
             }
         }
@@ -960,7 +963,7 @@ impl QuicNode {
         // Slow path: no connection (or it just died) — enqueue for the sender task
         // which will establish the connection and deliver
         if !outbound.send_queue.try_push(data) {
-            self.transport_errors.queue_full.fetch_add(1, Ordering::Relaxed);
+            self.transport_errors.queue_full.inc();
             fail!("QUIC send queue full for peer {}", peers.other());
         }
         self.msg_stats.record(tag, size, addr, true, MsgKind::Message);
@@ -1157,7 +1160,7 @@ impl QuicNode {
             }
             log::info!(target: TARGET, "Try new QUIC connection to {addr} in foreground");
             if let Err(e) = self.connect(peers, addr).await {
-                self.transport_errors.connect_failed.fetch_add(1, Ordering::Relaxed);
+                self.transport_errors.connect_failed.inc();
                 return Err(e);
             }
             log::info!(target: TARGET, "QUIC connected to {addr} in foreground");
@@ -1859,15 +1862,23 @@ impl QuicNode {
     /// connection and must enqueue data for later delivery. The task establishes
     /// the connection, sends all queued messages, and terminates.
     ///
-    /// On connect failure the task waits 1s and retries once. If the retry also
-    /// fails, all remaining queued messages are flushed (the peer is unreachable
-    /// and retrying each message individually would stall for the full handshake
-    /// timeout every time).
+    /// On connect failure the whole queue is flushed (the peer is unreachable
+    /// and retrying each message individually would stall for the full
+    /// handshake timeout every time). The flush is a best-effort drain of a
+    /// lock-free queue: messages pushed concurrently with the flush may be
+    /// observed and dropped. Anything pushed after the flush completes is
+    /// picked up by the next connect attempt.
     ///
     /// When previous connect attempts have failed (counter persists in
     /// `SenderState`), the task applies a stepped backoff before the first
-    /// attempt. Messages keep queuing during the backoff and are either
-    /// delivered on success or flushed on failure.
+    /// attempt of each drain cycle. Messages keep queuing during the backoff
+    /// and are either delivered on success or flushed on failure.
+    ///
+    /// Every exit goes through the deactivation epilogue below: `active` is
+    /// set back to `false` before the task terminates, so a later `message()`
+    /// can spawn a fresh sender task and retry the connect with backoff. Any
+    /// messages that survive a flush race show up in the epilogue re-check
+    /// and are handled in the next drain cycle instead of being stranded
     async fn run_sender_task(
         quic: Arc<Self>,
         peers: AdnlPeers,
@@ -1878,66 +1889,56 @@ impl QuicNode {
     ) {
         log::trace!(target: TARGET, "QUIC sender task started for {addr}");
 
-        // Stepped backoff based on previous failed attempts (2 attempts per cycle).
-        let prev_attempts = sender_state.connect_attempts.load(Ordering::Relaxed);
-        let backoff = Self::connect_backoff(prev_attempts);
-        if !backoff.is_zero() {
-            log::info!(
-                target: TARGET,
-                "QUIC sender to {addr}: backoff {backoff:?} before connect \
-                (previous attempts: {prev_attempts})"
-            );
-            tokio::time::sleep(backoff).await;
-        }
+        loop {
+            // Stepped backoff based on previous failed attempts (1 attempt per cycle).
+            let prev_attempts = sender_state.connect_attempts.load(Ordering::Relaxed);
+            let backoff = Self::connect_backoff(prev_attempts);
+            if !backoff.is_zero() {
+                log::info!(
+                    target: TARGET,
+                    "QUIC sender to {addr}: backoff {backoff:?} before connect \
+                    (previous attempts: {prev_attempts})"
+                );
+                tokio::time::sleep(backoff).await;
+            }
 
-        'outer: loop {
-            // Drain the queue
-            while let Some(data) = send_queue.pop() {
+            // Drain the queue. A fatal connect failure breaks out of the drain
+            // only, never out of the task: the deactivation epilogue below must
+            // run on every exit path so that `active` never stays `true` after
+            // the task terminates
+            'drain: while let Some(data) = send_queue.pop() {
                 match quic.send_message(&peers, addr, &outbound, &sender_state, &data).await {
                     Ok(()) => {}
                     Err(SendError::Temporary(e)) => {
                         log::warn!(target: TARGET, "QUIC sender to {addr} send error: {e}");
                     }
                     Err(SendError::Fatal(e)) => {
-                        log::warn!(target: TARGET, "QUIC sender to {addr} connect error: {e}");
-                        if send_queue.is_empty() {
-                            break 'outer;
+                        // Connect failed: drop the in-flight message and flush
+                        // the whole queue, then exit the drain. New messages
+                        // enqueued from now on are collected for the next
+                        // connect attempt (with stepped backoff)
+                        let mut queue_len = 1usize;
+                        while send_queue.pop().is_some() {
+                            queue_len += 1;
                         }
-                        // Retry once after 1s
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        match quic.send_message(&peers, addr, &outbound, &sender_state, &data).await
-                        {
-                            Ok(()) => {}
-                            Err(SendError::Temporary(e)) => {
-                                log::warn!(
-                                    target: TARGET,
-                                    "QUIC sender to {addr} send error on retry: {e}"
-                                );
-                            }
-                            Err(SendError::Fatal(e)) => {
-                                let mut flushed = 0usize;
-                                while send_queue.pop().is_some() {
-                                    flushed += 1;
-                                }
-                                log::warn!(
-                                    target: TARGET,
-                                    "QUIC sender to {addr} connect retry failed: {e}, \
-                                    flushed {flushed} queued messages"
-                                );
-                                break 'outer;
-                            }
-                        }
+                        let peer = peers.other();
+                        log::warn!(
+                            target: TARGET,
+                            "QUIC sender to {addr}: connect to peer {peer} failed: {e}, \
+                            {queue_len} messages dropped"
+                        );
+                        break 'drain;
                     }
                 }
             }
 
             // Mark inactive, then re-check: a new message may have been enqueued
-            // between the last pop() returning None and the store below.
+            // between the last pop() (or the flush above) and the store below.
             sender_state.active.store(false, Ordering::Release);
             if send_queue.is_empty() {
                 break;
             }
-            // Lost race — reactivate if no other task took over
+            // Lost race - reactivate if no other task took over
             if sender_state
                 .active
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1967,13 +1968,13 @@ impl QuicNode {
         match entry.conn {
             Some(ref conn) => {
                 if let Err(e) = Self::send_via_stream_nowait(conn, data).await {
-                    self.transport_errors.send_failed.fetch_add(1, Ordering::Relaxed);
+                    self.transport_errors.send_failed.inc();
                     log::warn!(
                         target: TARGET,
                         "QUIC send to {addr} failed: {e}, removing dead connection"
                     );
                     Self::remove_dead_connection(outbound, addr, conn);
-                    self.transport_errors.dead_conn_removed.fetch_add(1, Ordering::Relaxed);
+                    self.transport_errors.dead_conn_removed.inc();
                     return Err(SendError::Temporary(e));
                 }
             }
@@ -1988,7 +1989,7 @@ impl QuicNode {
                         sender_state.record_connect_success();
                     }
                     Ok(Err(e)) => {
-                        self.transport_errors.connect_failed.fetch_add(1, Ordering::Relaxed);
+                        self.transport_errors.connect_failed.inc();
                         log::warn!(
                             target: TARGET,
                             "QUIC connect to {addr} failed: {e} \
@@ -1998,7 +1999,7 @@ impl QuicNode {
                         return Err(SendError::Fatal(e));
                     }
                     Err(_) => {
-                        self.transport_errors.connect_failed.fetch_add(1, Ordering::Relaxed);
+                        self.transport_errors.connect_failed.inc();
                         let msg = format!(
                             "QUIC connect to {addr} timed out ({}s, \
                             attempt {attempt}, last alive: {})",
@@ -2042,17 +2043,17 @@ impl QuicNode {
                 match result {
                     Ok(Ok(response)) => return Ok(response),
                     Ok(Err(e)) => {
-                        self.transport_errors.send_failed.fetch_add(1, Ordering::Relaxed);
+                        self.transport_errors.send_failed.inc();
                         log::warn!(
                             target: TARGET,
                             "QUIC query to {} failed: {e}, removing dead connection and retrying",
                             peers.other()
                         );
                         Self::remove_dead_connection(&state.outbound, addr, conn);
-                        self.transport_errors.dead_conn_removed.fetch_add(1, Ordering::Relaxed);
+                        self.transport_errors.dead_conn_removed.inc();
                     }
                     Err(_) => {
-                        self.transport_errors.query_timeout.fetch_add(1, Ordering::Relaxed);
+                        self.transport_errors.query_timeout.inc();
                         log::warn!(
                             target: TARGET,
                             "QUIC query to {} timed out ({timeout_ms}ms), \
@@ -2060,7 +2061,7 @@ impl QuicNode {
                             peers.other()
                         );
                         Self::remove_dead_connection(&state.outbound, addr, conn);
-                        self.transport_errors.dead_conn_removed.fetch_add(1, Ordering::Relaxed);
+                        self.transport_errors.dead_conn_removed.inc();
                     }
                 }
             }
@@ -2221,7 +2222,7 @@ impl QuicNode {
                                         delayed_accept_count.load(Ordering::Relaxed),
                                         Self::MAX_DELAYED_ACCEPTS,
                                     );
-                                    transport_errors.delayed.fetch_add(1, Ordering::Relaxed);
+                                    transport_errors.delayed.inc();
                                     true
                                 }
                                 Err(reason) => {
@@ -2235,7 +2236,7 @@ impl QuicNode {
                                         target: TARGET,
                                         "Refusing QUIC accept from {addr}: {reason_str}"
                                     );
-                                    transport_errors.delayed_refused.fetch_add(1, Ordering::Relaxed);
+                                    transport_errors.delayed_refused.inc();
                                     incoming.refuse();
                                     continue;
                                 }
@@ -2244,7 +2245,7 @@ impl QuicNode {
                             false
                         };
 
-                        transport_errors.accepted.fetch_add(1, Ordering::Relaxed);
+                        transport_errors.accepted.inc();
                         let token = cancellation_token.clone();
                         let ai = active_identity.clone();
                         let rk = registered_keys.clone();
@@ -2325,10 +2326,7 @@ impl QuicNode {
                                     conn.close_reason()
                                 );
                                 Self::remove_dead_connection(outbound, addr, conn);
-                                transport
-                                    .transport_errors
-                                    .dead_conn_removed
-                                    .fetch_add(1, Ordering::Relaxed);
+                                transport.transport_errors.dead_conn_removed.inc();
                                 removed += 1;
                             } else {
                                 state.sender_state.touch_alive();
@@ -2381,7 +2379,8 @@ impl QuicNode {
                 };
 
                 let mut seen = HashSet::new();
-                let mut total = 0u32;
+                let mut outbound_total = 0u32;
+                let mut inbound_total = 0u32;
                 let mut dump = String::from("QUIC STATS dump:\n");
 
                 // Outbound connections
@@ -2393,7 +2392,7 @@ impl QuicNode {
                             let s = conn.stats();
                             let id = (conn.stable_id(), true);
                             seen.insert(id);
-                            total += 1;
+                            outbound_total += 1;
                             let since = prev
                                 .get(&id)
                                 .map(|p| p.connected_since)
@@ -2448,7 +2447,7 @@ impl QuicNode {
                         let s = conn.stats();
                         let id = (conn.stable_id(), false);
                         seen.insert(id);
-                        total += 1;
+                        inbound_total += 1;
                         let since =
                             prev.get(&id).map(|p| p.connected_since).unwrap_or_else(Instant::now);
                         let snap = ConnSnapshot::new(&s, since);
@@ -2535,10 +2534,21 @@ impl QuicNode {
                     ),
                 )
                 .ok();
-                Write::write_fmt(&mut dump, format_args!(
-                    "  total: {total} connections, {} msg entries",
-                    msg_entries.len(),
-                )).ok();
+                Write::write_fmt(
+                    &mut dump,
+                    format_args!(
+                        "  total: {} connections, in: {inbound_total}, out: {outbound_total}, {} msg entries",
+                        outbound_total + inbound_total,
+                        msg_entries.len(),
+                    ),
+                )
+                .ok();
+
+                // Export connection counts as Prometheus gauges. The error
+                // counters are exported instantly at their event sites via
+                // EventCounter::inc(), not from this dump cycle
+                metrics::gauge!("ton_node_quic_outbound_connections").set(outbound_total as f64);
+                metrics::gauge!("ton_node_quic_inbound_connections").set(inbound_total as f64);
 
                 log::info!(target: TARGET, "{dump}");
             }
@@ -2563,7 +2573,7 @@ fn rate_limit(
     // Layer 1: Stateless Retry — force address validation
     if config.stateless_retry && !incoming.remote_address_validated() && incoming.may_retry() {
         log::trace!(target: TARGET, "Sending QUIC Retry to unvalidated {addr} on {bind_addr}");
-        transport_errors.retry_sent.fetch_add(1, Ordering::Relaxed);
+        transport_errors.retry_sent.inc();
         if let Err(e) = incoming.retry() {
             log::warn!(target: TARGET, "QUIC retry failed for {addr}: {e}");
         }
@@ -2573,7 +2583,7 @@ fn rate_limit(
     // Layer 2: Per-IP rate limit
     if !conn_rate_limiters.take_new_connection(addr.ip()) {
         log::debug!(target: TARGET, "Per-IP rate limit for {} on {bind_addr}", addr.ip());
-        transport_errors.rate_limited_per_ip.fetch_add(1, Ordering::Relaxed);
+        transport_errors.rate_limited_per_ip.inc();
         incoming.refuse();
         return None;
     }
@@ -2585,7 +2595,7 @@ fn rate_limit(
     if let Some(ref mut gl) = global_rate_limiter {
         if !gl.take() {
             log::debug!(target: TARGET, "Global rate limit on {bind_addr}, refusing {addr}");
-            transport_errors.rate_limited_global.fetch_add(1, Ordering::Relaxed);
+            transport_errors.rate_limited_global.inc();
             incoming.refuse();
             return None;
         }

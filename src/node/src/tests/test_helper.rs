@@ -1034,7 +1034,7 @@ impl EngineOperations for TestEngine {
         self.db.load_shard_state_dynamic(block_id)
     }
 
-    async fn load_block(&self, handle: &BlockHandle) -> Result<BlockStuff> {
+    async fn load_block(&self, handle: &Arc<BlockHandle>) -> Result<BlockStuff> {
         self.db.load_block_data(handle).await
     }
 

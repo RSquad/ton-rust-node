@@ -93,9 +93,10 @@ use ton_api::{
 };
 use ton_block::{error, sha256_digest, BlockIdExt, Result, UInt256};
 
-// ============================================================================
+// ======================================================================
 // Constants
-// ============================================================================
+// ======================================================================
+// Log target and the default blocking-read sync timeout.
 
 /// Log target for database operations (matches simplex crate log target)
 const TARGET: &str = "simplex";
@@ -103,9 +104,11 @@ const TARGET: &str = "simplex";
 /// Default sync timeout for blocking reads
 const DEFAULT_SYNC_TIMEOUT: Duration = Duration::from_secs(5);
 
-// ============================================================================
-// TL Constructor IDs (for prefix scanning)
-// ============================================================================
+// ======================================================================
+// TL constructor IDs (for prefix scanning)
+// ======================================================================
+// Key-prefix accessors returning each record type's TL constructor tag,
+// used to range-scan the column family by record kind.
 
 /// Get key prefix for finalized blocks
 fn prefix_finalized_block() -> u32 {
@@ -135,9 +138,11 @@ fn prefix_candidate_payload() -> u32 {
     CandidatePayloadKey::constructor_const()
 }
 
-// ============================================================================
-// Record Types
-// ============================================================================
+// ======================================================================
+// Record types
+// ======================================================================
+// Owned record structs persisted to / loaded from the DB (finalized
+// blocks, candidate info, votes, certificates, pool state, payloads).
 
 /// Finalized block record loaded from DB
 #[derive(Debug, Clone)]
@@ -224,9 +229,11 @@ pub struct PoolStateRecord {
     pub first_nonannounced_window: WindowIndex,
 }
 
-// ============================================================================
-// Bootstrap Structures
-// ============================================================================
+// ======================================================================
+// Bootstrap structures
+// ======================================================================
+// Aggregated startup state (`Bootstrap`) assembled from persisted records
+// and `split()` into per-controller bootstrap views.
 
 /// Complete bootstrap data loaded from DB at session startup.
 ///
@@ -313,9 +320,11 @@ impl Bootstrap {
     }
 }
 
-// ============================================================================
-// TL Conversion Helpers
-// ============================================================================
+// ======================================================================
+// TL conversion helpers
+// ======================================================================
+// Conversions between domain record types and their TL key / value wire
+// representations.
 
 /// Convert RawCandidateId to TL CandidateId
 fn raw_candidate_id_to_tl(id: &RawCandidateId) -> CandidateId {
@@ -327,9 +336,11 @@ fn raw_candidate_id_from_tl(tl: CandidateId) -> RawCandidateId {
     RawCandidateId { slot: SlotIndex::new(tl.slot as u32), hash: tl.hash }
 }
 
-// ============================================================================
-// Serialization Functions
-// ============================================================================
+// ======================================================================
+// Serialization functions
+// ======================================================================
+// (De)serialization of records, keys, and certificates to / from TL
+// bytes for storage.
 
 fn serialize_finalized_block_key(candidate_id: &RawCandidateId) -> Result<Vec<u8>> {
     let key = FinalizedBlockKey { candidateId: raw_candidate_id_to_tl(candidate_id) };
@@ -582,9 +593,11 @@ fn filter_finalized_chain(mut records: Vec<FinalizedBlockRecord>) -> Vec<Finaliz
     filtered
 }
 
-// ============================================================================
+// ======================================================================
 // SimplexDb
-// ============================================================================
+// ======================================================================
+// The RocksDB-backed store: async fire-and-forget writes, blocking
+// startup reads, the vote-seqno counter, and the typed record APIs.
 
 /// Pointer to SimplexDb
 pub type SimplexDbPtr = Arc<SimplexDb>;
@@ -1712,8 +1725,46 @@ impl SimplexDb {
         self.storage.sync(timeout)
     }
 
+    /// Explicitly close the underlying async storage.
+    ///
+    /// Thin wrapper over `AsyncKeyValueStorage::close()` that:
+    /// 1. Drains queued writes under `timeout`.
+    /// 2. Flips the `is_closed` gate so later `set_*` / `get_*` calls fail
+    ///    fast with `DB_CLOSED_ERROR` instead of silently queueing tasks
+    ///    onto a thread that is about to exit.
+    /// 3. Is idempotent: a second `close()` is a cheap `Ok(())`.
+    ///
+    /// Called from `SessionProcessor::stop()` as part of the database
+    /// shutdown flow (C++ parity with
+    /// `td::KeyValueAsync::close()` / `bridge.cpp::destroy_inner()`).
+    ///
+    /// `Drop` keeps a safety-net `sync()` so an accidental drop without a
+    /// prior `close()` still flushes the WAL before rocksdb is torn down.
+    pub fn close(&self, timeout: Option<Duration>) -> Result<()> {
+        log::info!(
+            target: TARGET,
+            "SimplexDb {}: close (timeout={:?})",
+            self.storage_id,
+            timeout
+        );
+        self.storage.close(timeout)
+    }
+
+    /// Returns `true` once the underlying async storage has been closed.
+    pub fn is_closed(&self) -> bool {
+        self.storage.is_closed()
+    }
+
+    /// Returns the on-disk path of the underlying storage.
+    ///
+    /// Used by tests + shutdown logging to correlate a SimplexDb with its
+    /// `consensus.{wc}.{shard}.{cc_seqno}.{session}` directory.
+    #[allow(dead_code)] // Consumed by unit tests (test_database.rs / test_session_processor.rs).
+    pub fn get_path(&self) -> &Path {
+        self.storage.get_path()
+    }
+
     /// Mark database for destruction on drop.
-    #[allow(dead_code)] // Used by unit tests in `node/simplex/src/tests/test_database.rs`.
     pub fn mark_for_destroy(&self) {
         log::info!(
             target: TARGET,
@@ -1732,27 +1783,44 @@ impl Drop for SimplexDb {
             self.storage_id
         );
 
-        // Force sync to flush all pending writes before closing
-        if let Err(e) = self.sync(Some(DEFAULT_SYNC_TIMEOUT)) {
-            log::error!(
-                target: TARGET,
-                "SimplexDb {}: sync on drop failed: {}",
-                self.storage_id,
-                e
-            );
-        } else {
-            log::info!(
-                target: TARGET,
-                "SimplexDb {}: sync complete",
-                self.storage_id
-            );
+        // Safety-net drain: if `close()` was already called (the normal
+        // `SessionProcessor::stop()` path), `sync()` short-circuits with
+        // `DB_CLOSED_ERROR` and we log-and-continue. If nobody called
+        // `close()` (e.g. a panic tore the session down early), the
+        // `AsyncKeyValueStorage` Drop impl still runs its own safety-net
+        // drain before joining threads, so the WAL stays consistent.
+        match self.sync(Some(DEFAULT_SYNC_TIMEOUT)) {
+            Ok(()) => {
+                log::info!(
+                    target: TARGET,
+                    "SimplexDb {}: sync complete",
+                    self.storage_id
+                );
+            }
+            Err(e) if self.is_closed() => {
+                log::debug!(
+                    target: TARGET,
+                    "SimplexDb {}: Drop sync short-circuited by prior close(): {}",
+                    self.storage_id,
+                    e
+                );
+            }
+            Err(e) => {
+                log::error!(
+                    target: TARGET,
+                    "SimplexDb {}: sync on drop failed: {}",
+                    self.storage_id,
+                    e
+                );
+            }
         }
     }
 }
 
-// ============================================================================
+// ======================================================================
 // Tests
-// ============================================================================
+// ======================================================================
+// Unit tests for serialization round-trips and the DB record APIs.
 
 #[cfg(test)]
 #[path = "tests/test_database.rs"]

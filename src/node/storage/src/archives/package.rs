@@ -199,6 +199,8 @@ impl Package {
             )
         }
         let entry_size = entry.write_to(file).await?;
+        // Pack data must be durable before the offset gets committed in `after_append`.
+        file.sync_data().await?;
         let total_size = self.size.fetch_add(entry_size, Ordering::SeqCst) + entry_size;
         let actual_after = file.metadata().await?.len();
         if total_size != actual_after {

@@ -16,7 +16,11 @@
 //! `ReceiverListener`, etc.
 
 use crate::{
+    block::{SlotIndex, ValidatorIndex},
+    certificate::{Certificate as CertGeneric, NotarCert, VoteSignature as CertVoteSignature},
     receiver::{Receiver, ReceiverListener, ReceiverListenerPtr},
+    simplex_state::{NotarizeVote, Vote as FsmVote},
+    utils::sign_vote,
     ConsensusOverlayManagerPtr, PrivateKey, RawVoteData, SessionFactory, SessionId, SessionNode,
     ValidatorWeight,
 };
@@ -60,6 +64,31 @@ use ton_block::{
 };
 
 include!("../../../../common/src/info.rs");
+
+/// Build a TL-serialized `VoteSignatureSet` for a `NotarizeVote(slot, block_hash)`
+/// signed by `signing_keys` and serialized as the receiver expects.
+///
+/// Used by the resolver/repair tests below to seed a `requestCandidate`
+/// notar response that passes receiver-side validation (real signatures over
+/// the session-scoped vote bytes, no duplicates, quorum weight).
+fn build_valid_notar_bytes(
+    session_id: &SessionId,
+    slot: u32,
+    block_hash: &UInt256,
+    signing_keys: &[(u32, &PrivateKey)],
+) -> Vec<u8> {
+    let vote = NotarizeVote { slot: SlotIndex::new(slot), block_hash: block_hash.clone() };
+    let fsm_vote = FsmVote::Notarize(vote.clone());
+    let mut signatures = Vec::with_capacity(signing_keys.len());
+    for (idx, key) in signing_keys {
+        let signed = sign_vote(&fsm_vote, session_id, key).expect("sign_vote failed");
+        signatures
+            .push(CertVoteSignature::new(ValidatorIndex::new(*idx), signed.signature().to_vec()));
+    }
+    let cert: NotarCert = CertGeneric::new(vote, signatures);
+    let tl_set = cert.to_tl_vote_signature_set();
+    serialize_boxed(&tl_set).expect("serialize VoteSignatureSet")
+}
 
 /*
     Test configuration
@@ -813,8 +842,11 @@ fn test_receiver_candidate_resolver_forwards_candidate_before_notar() {
         Some(&collated_file_hash),
         None,
     );
-    let signature = crate::utils::sign_candidate_u32(&session_id, slot, &candidate_hash, &keys[0])
-        .expect("Failed to sign candidate");
+    let slots_per_leader_window = crate::SessionOptions::default().slots_per_leader_window;
+    let leader_idx = ((slot / slots_per_leader_window) % (keys.len() as u32)) as usize;
+    let signature =
+        crate::utils::sign_candidate_u32(&session_id, slot, &candidate_hash, &keys[leader_idx])
+            .expect("Failed to sign candidate");
     let candidate = CandidateData::Consensus_Block(CandidateDataBlock {
         slot: slot as i32,
         candidate: candidate_bytes.into(),
@@ -865,11 +897,19 @@ fn test_receiver_candidate_resolver_forwards_candidate_before_notar() {
     let notar_callbacks_before = stats1.candidate_notar_parts_received.load(Ordering::Relaxed);
 
     // Provide notar bytes later; requester should receive exactly one notar-only callback.
+    // The receiver validates notar bytes against the session validator set, so
+    // use a real quorum-signed NotarizeVote rather than opaque dummy bytes.
+    let valid_notar = build_valid_notar_bytes(
+        &session_id,
+        slot,
+        &candidate_hash,
+        &[(0u32, &keys[0]), (1u32, &keys[1])],
+    );
     listener0.set_query_fallback_payloads(
         slot,
         candidate_hash.clone(),
         serialized_candidate,
-        vec![0xAA, 0xBB, 0xCC],
+        valid_notar,
     );
     thread::sleep(Duration::from_secs(4));
 
@@ -996,8 +1036,11 @@ fn test_receiver_candidate_resolver() {
     );
 
     // Sign the candidate
-    let signature = crate::utils::sign_candidate_u32(&session_id, slot, &candidate_hash, &keys[0])
-        .expect("Failed to sign candidate");
+    let slots_per_leader_window = crate::SessionOptions::default().slots_per_leader_window;
+    let leader_idx = ((slot / slots_per_leader_window) % (keys.len() as u32)) as usize;
+    let signature =
+        crate::utils::sign_candidate_u32(&session_id, slot, &candidate_hash, &keys[leader_idx])
+            .expect("Failed to sign candidate");
 
     let broadcast = CandidateData::Consensus_Block(CandidateDataBlock {
         slot: slot as i32,
@@ -1008,9 +1051,18 @@ fn test_receiver_candidate_resolver() {
 
     // Send the broadcast (will be cached in receiver 0's resolver cache)
     receiver0.send_block_broadcast(slot, candidate_hash.clone(), broadcast);
-    // requestCandidate currently asks for both candidate+notar. Seed notar in
+    // requestCandidate asks for both candidate+notar. Seed notar in receiver 0's
     // resolver cache so late joiners can complete merged CandidateAndCert.
-    receiver0.cache_notarization_cert(slot, candidate_hash.clone(), vec![0xAA, 0xBB, 0xCC]);
+    // Notar bytes are validated against the session validator set before
+    // merging, so the cached notar must be a real quorum-signed VoteSignatureSet
+    // for the broadcast (slot, candidate_hash).
+    let cached_notar = build_valid_notar_bytes(
+        &session_id,
+        slot,
+        &candidate_hash,
+        &[(0u32, &keys[0]), (1u32, &keys[1]), (2u32, &keys[2])],
+    );
+    receiver0.cache_notarization_cert(slot, candidate_hash.clone(), cached_notar);
     log::info!(
         "Receiver 0 broadcast candidate for slot {} with hash {}",
         slot,
@@ -1207,8 +1259,11 @@ fn test_receiver_candidate_resolver_large_payload() {
         None,
     );
 
-    let signature = crate::utils::sign_candidate_u32(&session_id, slot, &candidate_hash, &keys[0])
-        .expect("Failed to sign candidate");
+    let slots_per_leader_window = crate::SessionOptions::default().slots_per_leader_window;
+    let leader_idx = ((slot / slots_per_leader_window) % (keys.len() as u32)) as usize;
+    let signature =
+        crate::utils::sign_candidate_u32(&session_id, slot, &candidate_hash, &keys[leader_idx])
+            .expect("Failed to sign candidate");
 
     let broadcast = CandidateData::Consensus_Block(CandidateDataBlock {
         slot: slot as i32,
@@ -1218,9 +1273,18 @@ fn test_receiver_candidate_resolver_large_payload() {
     });
 
     receiver0.send_block_broadcast(slot, candidate_hash.clone(), broadcast);
-    // requestCandidate currently asks for both candidate+notar. Seed notar in
+    // requestCandidate asks for both candidate+notar. Seed notar in receiver 0's
     // resolver cache so late joiners can complete merged CandidateAndCert.
-    receiver0.cache_notarization_cert(slot, candidate_hash.clone(), vec![0xAA, 0xBB, 0xCC]);
+    // Notar bytes are validated against the session validator set before
+    // merging, so the cached notar must be a real quorum-signed VoteSignatureSet
+    // for the broadcast (slot, candidate_hash).
+    let cached_notar = build_valid_notar_bytes(
+        &session_id,
+        slot,
+        &candidate_hash,
+        &[(0u32, &keys[0]), (1u32, &keys[1])],
+    );
+    receiver0.cache_notarization_cert(slot, candidate_hash.clone(), cached_notar);
     thread::sleep(Duration::from_millis(500));
 
     // === Step 2: Create receiver 1 (late joiner) ===

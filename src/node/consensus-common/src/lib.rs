@@ -16,6 +16,7 @@ mod activity_node;
 mod adnl_overlay;
 mod async_key_value_storage;
 mod block_payload;
+mod consensus_emulator;
 mod dummy_catchain_overlay;
 mod in_process_overlay;
 mod log_player;
@@ -123,6 +124,9 @@ pub type ValidatorBlockCandidateCallback =
 /// Pointer to async request
 pub type AsyncRequestPtr = Arc<dyn AsyncRequest + Send + Sync>;
 
+/// Pointer to an async collation request (carries the collation deadlines).
+pub type AsyncCollationRequestPtr = Arc<dyn AsyncCollationRequest + Send + Sync>;
+
 /// Pointer to SessionListener
 pub type SessionListenerPtr = Weak<dyn SessionListener + Send + Sync>;
 
@@ -203,6 +207,46 @@ impl Cancellable for Arc<AtomicBool> {
 // StorageAsyncResult - Async result trait for non-tokio environments
 // ============================================================================
 
+/// Typed sentinel error returned by [`StorageAsyncResult::try_get`] and
+/// [`StorageAsyncResult::wait_timeout`] once the inner [`Result`] has already
+/// been consumed by a prior caller (the implementation has transitioned to
+/// `AsyncResultState::Taken`).
+///
+/// This is an *already-consumed* signal: a previous caller took the inner
+/// storage result (`Ok` **or** `Err`). The sentinel itself carries no
+/// information about that earlier outcome.
+///
+/// Consumers that deduplicate by slot/candidate-id and may observe the same
+/// `StorageAsyncResultPtr` more than once should pair this sentinel with their
+/// own dedup/outcome bookkeeping to decide whether the redundant wake is
+/// benign. Do not assume "already taken" implies success.
+///
+/// Detection pattern (preferred over string matching):
+///
+/// ```ignore
+/// use consensus_common::StorageResultAlreadyTaken;
+/// if err.downcast_ref::<StorageResultAlreadyTaken>().is_some() {
+///     // benign redundant wake — skip side-effects, no error increment
+/// }
+/// ```
+///
+/// The struct is unit-like and intentionally cheap to construct:
+/// `StorageResultAlreadyTaken.into()` produces an `anyhow::Error` (= our
+/// `Result`'s error type via `ton_block::Error`).
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Default)]
+pub struct StorageResultAlreadyTaken;
+
+impl std::fmt::Display for StorageResultAlreadyTaken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Identical text to the legacy stringly-typed sentinel so log scrapers
+        // and human readers see the same message; downcast is the structured
+        // detection path.
+        f.write_str("StorageAsyncResult: result already taken")
+    }
+}
+
+impl std::error::Error for StorageResultAlreadyTaken {}
+
 /// Async result for storage operations.
 ///
 /// Similar to a Future but without requiring tokio.
@@ -240,7 +284,10 @@ pub trait StorageAsyncResult<T>: Send + Sync {
     /// Gets result if ready (non-blocking).
     ///
     /// Returns `None` if still pending.
-    /// Returns `Some(Err)` if already taken or error occurred.
+    /// Returns `Some(Err)` if an operation error occurred or the result has
+    /// already been consumed. In the "already consumed" case the inner
+    /// `anyhow::Error` downcasts to [`StorageResultAlreadyTaken`] — see
+    /// that type for the recommended detection pattern.
     fn try_get(&self) -> Option<Result<T>>;
 
     /// Waits for result with timeout (**BLOCKING**).
@@ -254,7 +301,9 @@ pub trait StorageAsyncResult<T>: Send + Sync {
     /// # Returns
     ///
     /// * `Some(Ok(value))` if operation completed successfully
-    /// * `Some(Err(e))` if operation failed or result already taken
+    /// * `Some(Err(e))` if operation failed or result already taken (see
+    ///   [`StorageResultAlreadyTaken`] for the typed sentinel emitted in the
+    ///   already-taken case)
     /// * `None` if timeout expired (result still pending)
     fn wait_timeout(&self, timeout: Duration) -> Option<Result<T>>;
 
@@ -263,7 +312,8 @@ pub trait StorageAsyncResult<T>: Send + Sync {
     /// # Returns
     ///
     /// * `Ok(value)` if operation completed successfully
-    /// * `Err(e)` if operation failed or result already taken
+    /// * `Err(e)` if operation failed or result already taken (see
+    ///   [`StorageResultAlreadyTaken`])
     fn wait(&self) -> Result<T> {
         // Wait in 1-second chunks to allow for spurious wakeups
         // This matches typical condvar usage patterns
@@ -486,6 +536,32 @@ pub trait AsyncKeyValueStorage: Send + Sync {
     // =========================================================================
     // Lifecycle
     // =========================================================================
+
+    /// Explicitly closes the storage.
+    ///
+    /// C++ parity: `td::KeyValueAsync::close()` (see PR #2237 / `bridge.cpp::destroy_inner()`).
+    ///
+    /// Semantics:
+    /// 1. Drains the in-flight task and callback queues (by running `sync(timeout)`).
+    /// 2. Flips an internal gate so that any subsequent
+    ///    `get` / `get_by_prefix` / `set` / `erase` / `sync` call
+    ///    returns an already-resolved `Err` without touching the DB thread.
+    /// 3. Is idempotent: repeated `close()` calls short-circuit to `Ok(())`.
+    ///
+    /// Rationale (see docs `docs/local-docs/features/simplex-consensus/plans/
+    /// alpenglow-implementation-plan.md` row `CONSENSUS-DB-CLEANUP-1`): shutting
+    /// down consensus via `SessionProcessor::stop()` needs an explicit close
+    /// step so that (a) lingering consumers cannot observe a half-destroyed
+    /// DB via the async registry, and (b) destroying the on-disk DB
+    /// (`mark_for_destroy` + `remove_dir_all`) runs *after* all in-flight
+    /// writes have actually landed.
+    ///
+    /// `Drop` continues to double-cover this path in case a caller forgets
+    /// to `close()` (e.g. a `panic!()` during shutdown).
+    fn close(&self, timeout: Option<Duration>) -> Result<()>;
+
+    /// Returns `true` once `close()` has marked the storage as closed.
+    fn is_closed(&self) -> bool;
 
     /// Marks database for destruction on drop.
     ///
@@ -1132,6 +1208,44 @@ impl ConsensusCommonFactory {
     ) -> Result<AsyncKeyValueStoragePtr> {
         async_key_value_storage::RocksDbAsyncKeyValueStorage::open(db_path, storage_id, options)
     }
+
+    /// Create an in-process consensus emulator.
+    ///
+    /// `validators` is the full N-validator set. Unlike a typical
+    /// [`SessionNode`] consumer, the emulator treats each node's
+    /// [`SessionNode::public_key`] field as a **full keypair** — i.e. an
+    /// [`Arc<dyn KeyOption>`](KeyOption) that is able to *sign*. Tests and
+    /// fixtures are expected to construct these via
+    /// [`Ed25519KeyOption::generate`](ton_block::Ed25519KeyOption::generate)
+    /// (or equivalent) and place the resulting private-key-bearing
+    /// [`KeyOption`] into the `public_key` slot.
+    ///
+    /// `local_idx` selects which validator the emulator treats as the local
+    /// node — the only one that ever receives `on_generate_slot`.
+    ///
+    /// `listener` is held via [`Weak`]; the caller must keep a strong
+    /// reference to its `Arc<dyn SessionListener>` for as long as the
+    /// emulator should drive callbacks.
+    ///
+    /// Returns an [`EmulatorPtr`] which, by virtue of [`Emulator: Session`],
+    /// satisfies the [`Session`] contract used by `ValidatorGroup`.
+    ///
+    /// # Errors
+    ///
+    /// * `validators` is empty
+    /// * `local_idx >= validators.len()`
+    /// * `signer_subset` references out-of-bounds indices, contains
+    ///   duplicates, is empty, or yields a weight below
+    ///   `threshold_66(total_weight)` (would otherwise panic at first
+    ///   finalize).
+    pub fn create_consensus_emulator(
+        opts: EmulatorOptions,
+        validators: Vec<SessionNode>,
+        local_idx: usize,
+        listener: SessionListenerPtr,
+    ) -> Result<EmulatorPtr> {
+        consensus_emulator::ConsensusEmulatorImpl::create(opts, validators, local_idx, listener)
+    }
 }
 
 // ============================================================================
@@ -1202,7 +1316,11 @@ pub struct ValidatorBlockCandidate {
 // Async Request
 // ============================================================================
 
-/// Async request tracking interface
+/// Async request tracking interface.
+///
+/// Shared by both the collation (`on_generate_slot`) and validation request paths,
+/// so it carries only the generic request lifecycle. Collation-specific deadlines
+/// live on the [`AsyncCollationRequest`] sub-trait.
 pub trait AsyncRequest: Send + Sync {
     /// Get unique request identifier
     fn get_request_id(&self) -> u32;
@@ -1215,6 +1333,44 @@ pub trait AsyncRequest: Send + Sync {
 
     /// Cancel the request
     fn cancel(&self);
+}
+
+/// Async request for a collation (`on_generate_slot`) attempt: an [`AsyncRequest`]
+/// extended with the absolute collation deadlines and budget anchor the collator
+/// honors. Kept separate from [`AsyncRequest`] so the shared validation path is not
+/// burdened with collation-only timing. Simplex supplies the deadlines; the defaults
+/// (`None`) keep Catchain and tests on the collator's static budgets.
+pub trait AsyncCollationRequest: AsyncRequest {
+    /// Absolute SOFT collation deadline for this generate-slot request (message-intake
+    /// cutoff). `None` means the collator falls back to its static `cutoff_timeout_ms`.
+    /// Simplex sets the per-slot deadline; the default keeps Catchain and tests on the
+    /// static budget. Absolute `SystemTime` (not a budget) so latency between the
+    /// simplex dispatch and the collator start cannot shift it.
+    fn get_collation_soft_deadline(&self) -> Option<std::time::SystemTime> {
+        None
+    }
+
+    /// Absolute HARD collation deadline for this generate-slot request (whole-collation
+    /// abort cap, the collation window end). `None` means the collator falls back to its
+    /// static `stop_timeout_ms`. Simplex sets this; the default keeps Catchain and tests
+    /// on the static budget.
+    fn get_collation_hard_deadline(&self) -> Option<std::time::SystemTime> {
+        None
+    }
+
+    /// Absolute start of the collation budget window for this request — the point the
+    /// collator's percentage-based message-intake sub-budgets are measured from (the
+    /// remaining soft window is `get_collation_soft_deadline - get_collation_budget_anchor`).
+    ///
+    /// This is the dispatch instant (C++ `block-producer.cpp` dispatches shardchains at
+    /// `slot_start - target_rate` and the masterchain at `slot_start`), which is distinct
+    /// from `get_creation_time()`: the latter stays the slot start (`min_gen_time`) used
+    /// for the block's `gen_utime` / `min_ts`, while this anchor predates it for shards so
+    /// the soft window does not collapse to zero. `None` means the collator falls back to
+    /// its static `cutoff_timeout_ms` (Catchain and tests).
+    fn get_collation_budget_anchor(&self) -> Option<std::time::SystemTime> {
+        None
+    }
 }
 
 // ============================================================================
@@ -1295,7 +1451,7 @@ pub trait SessionListener: Send + Sync {
     fn on_generate_slot(
         &self,
         source_info: BlockSourceInfo,
-        request: AsyncRequestPtr,
+        request: AsyncCollationRequestPtr,
         parent: CollationParentHint,
         callback: ValidatorBlockCandidateCallback,
     );
@@ -1639,3 +1795,324 @@ mod block_sync_overlay_params_tests {
         assert_eq!(p.slots_per_leader_window, 1);
     }
 }
+// ============================================================================
+// Consensus Emulator Configuration
+// ============================================================================
+
+/// One delay-and-skip pair for a single emulated callback.
+///
+/// `min_ms..=max_ms` defines a uniform random delay in milliseconds applied to
+/// the callback's invocation time. `skip_probability` is in `[0.0, 1.0]`; when
+/// a draw rolls below this threshold, the callback is dropped instead of
+/// scheduled.
+#[derive(Clone, Copy, Debug)]
+pub struct EmulatorDelaySpec {
+    /// Lower bound of the uniform random delay, in milliseconds.
+    /// `min_ms == max_ms == 0` means immediate (no delay).
+    pub min_ms: u64,
+
+    /// Upper bound (inclusive) of the uniform random delay, in milliseconds.
+    /// Must be `>= min_ms`. If equal to `min_ms`, the delay is fixed at that
+    /// value (no randomness).
+    pub max_ms: u64,
+
+    /// Probability in `[0.0, 1.0]` of dropping (skipping) the callback
+    /// instead of scheduling it. Each call samples a fresh `f64` from the
+    /// emulator RNG; if the sample is `< skip_probability` the callback is
+    /// dropped silently. `0.0` disables skipping; `1.0` always drops.
+    pub skip_probability: f64,
+}
+
+impl EmulatorDelaySpec {
+    /// No delay, no loss — passthrough behavior.
+    pub const ZERO: EmulatorDelaySpec =
+        EmulatorDelaySpec { min_ms: 0, max_ms: 0, skip_probability: 0.0 };
+
+    /// Construct an [`EmulatorDelaySpec`] without validation.
+    ///
+    /// `const` so the [`Self::ZERO`] constant and other `static`/`const`
+    /// test fixtures work. Construction never panics; instead, invalid
+    /// values (`max_ms < min_ms`, non-finite `skip_probability`, etc.) are
+    /// rejected at the API boundaries where the spec is *applied*:
+    ///
+    /// * [`ConsensusCommonFactory::create_consensus_emulator`] /
+    ///   [`Emulator::set_params`] both call [`EmulatorParams::validate`],
+    ///   which calls [`Self::validate`] for every contained spec.
+    ///
+    /// Direct callers that want to surface a configuration error early can
+    /// call `.validate("…")` immediately after `new()`.
+    pub const fn new(min_ms: u64, max_ms: u64, skip_probability: f64) -> Self {
+        Self { min_ms, max_ms, skip_probability }
+    }
+
+    /// Validate the timing and loss parameters.
+    ///
+    /// Invoked from [`EmulatorParams::validate`] (which itself is wired into
+    /// both [`ConsensusCommonFactory::create_consensus_emulator`] — for
+    /// [`EmulatorOptions::initial_params`] — and [`Emulator::set_params`]).
+    pub fn validate(&self, name: &str) -> Result<()> {
+        if self.max_ms < self.min_ms {
+            return Err(ton_block::error!(
+                "EmulatorDelaySpec::{name}: max_ms ({}) must be >= min_ms ({})",
+                self.max_ms,
+                self.min_ms
+            ));
+        }
+        if !self.skip_probability.is_finite() || !(0.0..=1.0).contains(&self.skip_probability) {
+            return Err(ton_block::error!(
+                "EmulatorDelaySpec::{name}: skip_probability ({}) must be finite and in [0, 1]",
+                self.skip_probability
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for EmulatorDelaySpec {
+    fn default() -> Self {
+        Self::ZERO
+    }
+}
+
+/// Per-callback timing parameters used by the [`Emulator`].
+///
+/// Read fresh on every scheduling decision; a runtime
+/// [`Emulator::set_params`] call takes effect on the next scheduled callback.
+/// Tasks already enqueued (delay computed, trigger time fixed) are not
+/// retroactively affected.
+#[derive(Clone, Debug, Default)]
+pub struct EmulatorParams {
+    /// Cadence between successive slot ticks. Each slot's leader is picked
+    /// according to [`EmulatorOptions::leader_rotation`]. The next slot's tick
+    /// is enqueued before the current slot's downstream callbacks fire, so
+    /// listener latency does not slip cadence.
+    pub slot_interval: EmulatorDelaySpec,
+
+    /// Remote-leader slots only: delay between synthesizing the candidate
+    /// (deterministic from `session_id`, `slot`, leader pubkey) and firing
+    /// `SessionListener::on_candidate` on the local listener. Ignored on
+    /// local-leader slots (where `on_generate_slot` fires immediately).
+    pub on_candidate_delay: EmulatorDelaySpec,
+
+    /// Delay between candidate generation/registration and the first
+    /// `SessionListener::on_candidate_observed` invocation, with
+    /// `parent_ready = false` (mirrors Simplex's notarization-pending
+    /// observation).
+    pub observed_body_delay: EmulatorDelaySpec,
+
+    /// Delay between candidate generation/registration and the second
+    /// `SessionListener::on_candidate_observed` invocation, with
+    /// `parent_ready = true` (mirrors Simplex's post-NotarCert observation).
+    pub observed_notar_delay: EmulatorDelaySpec,
+
+    /// Delay between candidate generation/registration and
+    /// `SessionListener::on_block_finalized`. The finalized callback carries
+    /// real Ed25519 signatures from the configured
+    /// [`EmulatorOptions::signer_subset`] and a [`BlockSignaturesVariant::Simplex`]
+    /// containing the canonical [`CandidateHashData`](ton_api::ton::consensus::CandidateHashData) cell tree.
+    pub finalized_delay: EmulatorDelaySpec,
+}
+
+impl EmulatorParams {
+    pub fn validate(&self) -> Result<()> {
+        self.slot_interval.validate("slot_interval")?;
+        // The slot tick is the *only* chain that schedules subsequent ticks,
+        // so a skipped tick would stop slot generation forever. Reject any
+        // non-zero `skip_probability` on `slot_interval` at the API boundary
+        // (model packet loss on the per-callback delay specs instead).
+        if self.slot_interval.skip_probability > 0.0 {
+            return Err(ton_block::error!(
+                "EmulatorParams::slot_interval: skip_probability must be 0 \
+                 (a skipped tick would permanently stall slot generation); got {}",
+                self.slot_interval.skip_probability,
+            ));
+        }
+        self.on_candidate_delay.validate("on_candidate_delay")?;
+        self.observed_body_delay.validate("observed_body_delay")?;
+        self.observed_notar_delay.validate("observed_notar_delay")?;
+        self.finalized_delay.validate("finalized_delay")?;
+        Ok(())
+    }
+}
+
+/// Leader rotation policy used when picking a leader for each slot.
+#[derive(Clone, Debug)]
+pub enum EmulatorLeaderRotation {
+    /// Round-robin across the validator set: leader for slot `s` is
+    /// `validators[(s as usize) % validators.len()]`. The local validator
+    /// leads roughly every `N`-th slot and `on_generate_slot` fires only
+    /// for those slots; remote-leader slots fire `on_candidate` instead.
+    RoundRobin,
+
+    /// Always use the local validator. Every slot fires `on_generate_slot`;
+    /// `on_candidate` never fires. Useful for stress-testing the local
+    /// collation path.
+    FixedLocal,
+
+    /// Always use the validator at the given index. The index must be
+    /// `< validators.len()`. If the index equals `local_idx` this behaves
+    /// like [`Self::FixedLocal`]; otherwise every slot fires `on_candidate`
+    /// (no `on_generate_slot`).
+    FixedIndex(usize),
+}
+
+/// Subset of validators that contributes signatures for `on_block_finalized`.
+///
+/// The configured subset must carry strictly more than 2/3 of the total
+/// validator weight, otherwise the emulator's
+/// [`BlockSignaturesVariant::Simplex`] construction would surface a panic at
+/// the first finalize. This invariant is checked once at construction by
+/// [`ConsensusCommonFactory::create_consensus_emulator`].
+#[derive(Clone, Debug)]
+pub enum EmulatorSignerSubset {
+    /// All validators sign every finalized block.
+    All,
+
+    /// The first `k` validators (by index in the `validators` vector) sign.
+    /// `k` must be in `1..=validators.len()` and the resulting weight must
+    /// exceed the 2/3 threshold.
+    First(usize),
+
+    /// The validators at the given indices sign. Indices must be unique,
+    /// in-bounds, and the resulting weight must exceed the 2/3 threshold.
+    ByIndex(Vec<usize>),
+}
+
+/// Construction-time emulator configuration.
+///
+/// Threading is fixed by design: the emulator always runs exactly two
+/// internal threads — one main loop (scheduled work, state mutation) and
+/// one callbacks loop (listener invocations) — communicating via crossbeam
+/// channels in the simplex `task_queue` style.
+#[derive(Clone, Debug)]
+pub struct EmulatorOptions {
+    /// 256-bit session identifier; included in every signature payload as
+    /// part of `consensus.dataToSign(session_id, ...)` so signatures are
+    /// scoped to this session.
+    pub session_id: SessionId,
+
+    /// Shard identifier used in the [`BlockIdExt`] of every emulated
+    /// candidate (both locally collated and remotely synthesized).
+    pub shard: ShardIdent,
+
+    /// `seq_no` of the first emulated slot's [`BlockIdExt`]. Slot `s` uses
+    /// `initial_seqno + s`. Useful when chaining multiple emulator runs in a
+    /// single test fixture.
+    pub initial_seqno: u32,
+
+    /// Initial value of the runtime-mutable [`EmulatorParams`]. Tests typically
+    /// override this and then call [`Emulator::set_params`] mid-run to
+    /// observe behavior changes.
+    pub initial_params: EmulatorParams,
+
+    /// Policy for picking the leader of each slot. See
+    /// [`EmulatorLeaderRotation`] variants.
+    pub leader_rotation: EmulatorLeaderRotation,
+
+    /// Subset of validators that sign every finalized block. Must satisfy
+    /// the 2/3 weight threshold; otherwise construction returns an error.
+    pub signer_subset: EmulatorSignerSubset,
+
+    /// Optional seed for the emulator RNG. `None` uses `rand::thread_rng()`,
+    /// giving non-reproducible delays and skip rolls. `Some(seed)` makes the
+    /// emulator deterministic for replay and CI flakiness reduction.
+    pub deterministic_seed: Option<u64>,
+
+    /// Optional safety net for misbehaving listeners. When a local-leader
+    /// `on_generate_slot` is invoked, the emulator schedules a deadline at
+    /// `now + local_collation_timeout`. If no candidate has been registered
+    /// by then, the request's [`AsyncRequest`] is marked cancelled and the
+    /// slot is dropped silently. `None` disables the safety net.
+    pub local_collation_timeout: Option<Duration>,
+
+    /// Number of consecutive slots owned by one leader before rotating to the
+    /// next validator. `1` matches normal round-robin. Values greater than one
+    /// let emulator tests exercise Simplex in-window candidate chaining:
+    /// the first accepted candidate in a leader window uses the previous
+    /// notarized/finalized candidate as parent, and later accepted candidates
+    /// in the same window chain to the previous accepted candidate in that
+    /// window.
+    pub slots_per_leader_window: u32,
+
+    /// Keep finalized candidates in the emulator's per-slot candidate cache.
+    /// `false` mirrors Simplex cleanup behavior and is the default. Set to
+    /// `true` only for diagnostics that need to inspect old cached candidates
+    /// after finalization.
+    pub retain_finalized_candidates: bool,
+}
+
+impl EmulatorOptions {
+    /// Sensible defaults for tests: round-robin leader rotation, all
+    /// validators sign, no seed, no collation timeout, all timing parameters
+    /// zero (callers should override `initial_params`).
+    pub fn defaults_for_test(session_id: SessionId, shard: ShardIdent) -> Self {
+        Self {
+            session_id,
+            shard,
+            initial_seqno: 1,
+            initial_params: EmulatorParams::default(),
+            leader_rotation: EmulatorLeaderRotation::RoundRobin,
+            signer_subset: EmulatorSignerSubset::All,
+            deterministic_seed: None,
+            local_collation_timeout: None,
+            slots_per_leader_window: 1,
+            retain_finalized_candidates: false,
+        }
+    }
+}
+
+impl Default for EmulatorOptions {
+    /// `Default::default()` is equivalent to
+    /// `EmulatorOptions::defaults_for_test(SessionId::default(), ShardIdent::default())`.
+    fn default() -> Self {
+        Self::defaults_for_test(SessionId::default(), ShardIdent::default())
+    }
+}
+
+// ============================================================================
+// Consensus Emulator Interface
+// ============================================================================
+
+/// In-process consensus emulator interface.
+///
+/// Extends [`Session`] with emulator-specific controls. The emulator drives
+/// [`SessionListener`] callbacks (`on_generate_slot`, `on_candidate`,
+/// `on_candidate_observed`, `on_block_finalized`) on a fixed two-thread
+/// runtime — one scheduler/state thread (`EMUMAIN`) and one listener-dispatch
+/// thread (`EMUCB`) — communicating via crossbeam channels. There is no
+/// worker pool: per-callback delays and skip probabilities are applied
+/// in-line on `EMUMAIN`'s timer wheel before each closure runs on `EMUCB`.
+/// It holds the full set of validator private keys so `on_block_finalized`
+/// can carry signatures from any subset of them.
+///
+/// Construct via [`ConsensusCommonFactory::create_consensus_emulator`].
+pub trait Emulator: Session {
+    /// Snapshot of the current timing/skip parameters.
+    fn get_params(&self) -> EmulatorParams;
+
+    /// Replace the current timing/skip parameters. The new values take effect
+    /// on the next scheduling decision; callbacks already in flight are
+    /// unaffected.
+    fn set_params(&self, params: EmulatorParams) -> Result<()>;
+
+    /// Notify the emulator that the validator manager has applied a top block
+    /// for this session shard.
+    fn notify_mc_finalized(&self, applied_top: BlockIdExt);
+
+    /// Simplex-compatible candidate-availability hook.
+    fn ensure_candidate_available(
+        &self,
+        block_id: BlockIdExt,
+        opts: EnsureCandidateAvailabilityOptions,
+    );
+
+    /// True once all emulator worker threads have stopped.
+    fn is_stopped(&self) -> bool;
+
+    /// Emulator panics are propagated on `stop()`, so there is no sticky panic
+    /// flag today. Kept for Simplex-session adapter parity.
+    fn is_panicked(&self) -> bool;
+}
+
+/// Pointer to a consensus emulator.
+pub type EmulatorPtr = Arc<dyn Emulator + Send + Sync>;

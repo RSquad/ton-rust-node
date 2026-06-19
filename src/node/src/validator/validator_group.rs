@@ -30,7 +30,7 @@ use crate::{
         mutex_wrapper::MutexWrapper,
         state_resolver_cache::{ResolverBackend, StateResolverCache},
         validator_utils::{
-            prevs_to_string, validator_query_candidate_to_validator_block_candidate,
+            get_adnl_id, prevs_to_string, validator_query_candidate_to_validator_block_candidate,
             validatordescr_to_session_node, ValidatorListHash,
         },
     },
@@ -107,6 +107,11 @@ const LEGACY_VALIDATION_TIMEOUT: Duration = Duration::from_secs(15);
 /// C++ parity: collation request deadline.
 /// Matches `validator-group.cpp` / `collation-manager.cpp`: `td::Timestamp::in(10.0)`.
 const COLLATION_TIMEOUT: Duration = Duration::from_secs(10);
+/// Extra wall-clock margin added above the Simplex window-end hard deadline for the
+/// outer collation guard, so the collator's internal `stop_flag` (the authoritative
+/// hard cap) fires first. Catchain/tests without a hard deadline keep the static
+/// `COLLATION_TIMEOUT`.
+const COLLATION_TIMEOUT_BACKSTOP: Duration = Duration::from_secs(2);
 
 /// Determines if block candidate should be broadcast publicly via FastSync overlay.
 /// Mirrors C++ `need_send_candidate_broadcast` logic from validator-group.cpp.
@@ -357,6 +362,88 @@ impl PipelineContext {
     }
 }
 
+/// Pre-built context for emitting `consensus.lifecycle.*` records for this
+/// session. Captured once at `ValidatorGroup::new` (where the validator set,
+/// local key, and trace collector are all in scope) so the stop / never_ran /
+/// aborted records can be emitted from `stop()` and `Drop` without the outer
+/// `ValidatorGroup`. The epoch is captured here so a never-ran future (which
+/// never reaches `start()`) still routes to the correct epoch file
+pub(crate) struct LifecycleStopCtx {
+    tc: simplex::TraceCollector,
+    workchain: i32,
+    shard_hex: String,
+    cc_seqno: u32,
+    session_id_hex: String,
+    our_idx: u32,
+    our_pubkey: String,
+    epoch_utime_since: u32,
+}
+
+impl LifecycleStopCtx {
+    fn emit_stopped(&self, final_status: simplex::LifecycleFinalStatus) {
+        self.tc.record_lifecycle_stopped(simplex::LifecycleStopped {
+            ts: 0.0,
+            workchain: self.workchain,
+            shard_hex: self.shard_hex.clone(),
+            cc_seqno: self.cc_seqno,
+            session_id: self.session_id_hex.clone(),
+            our_idx: self.our_idx,
+            our_pubkey: self.our_pubkey.clone(),
+            epoch_utime_since: self.epoch_utime_since,
+            final_status,
+        });
+    }
+}
+
+/// Build the lifecycle stop-context for a member session. Returns `None` when
+/// no trace collector is configured or the local key is not found in the set.
+///
+/// `epoch_utime_since` is the `utime_since` of the governing validator set
+/// (ConfigParam 34 cur/next). It MUST be passed explicitly: the per-session
+/// `validator_set` here is the calc_subset result built with `utime_since = 0`
+/// (zeroed to keep session_id/opts hashing matching C++), so reading
+/// `validator_set.utime_since()` would always yield 0
+fn build_lifecycle_ctx(
+    tc: simplex::TraceCollector,
+    shard: &ShardIdent,
+    cc_seqno: u32,
+    session_id: &SessionId,
+    local_key: &PrivateKey,
+    validator_set: &ValidatorSet,
+    epoch_utime_since: u32,
+) -> Option<LifecycleStopCtx> {
+    let our_pubkey = match local_key.pub_key() {
+        Ok(k) => hex::encode(k),
+        Err(e) => {
+            log::warn!(target: "validator", "lifecycle: cannot read local pubkey: {e}");
+            return None;
+        }
+    };
+    let local_id = local_key.id();
+    let our_idx = validator_set
+        .list()
+        .iter()
+        .position(|d| d.compute_node_id_short().as_slice() == local_id.data());
+    let our_idx = match our_idx {
+        Some(i) => i as u32,
+        None => {
+            log::warn!(target: "validator",
+                "lifecycle: local key not found in validator set for session {:x}", session_id);
+            return None;
+        }
+    };
+    Some(LifecycleStopCtx {
+        tc,
+        workchain: shard.workchain_id(),
+        shard_hex: format!("{:016x}", shard.shard_prefix_with_tag()),
+        cc_seqno,
+        session_id_hex: session_id.to_hex_string(),
+        our_idx,
+        our_pubkey,
+        epoch_utime_since,
+    })
+}
+
 pub struct ValidatorGroupImpl {
     local_id: PublicKeyHash,
     prev_block_ids: PrevBlockHistory, //Vec<BlockIdExt>,
@@ -392,6 +479,19 @@ pub struct ValidatorGroupImpl {
     /// Highest external MC-finalized notification seqno delivered via `notify_mc_finalized`.
     /// Used to suppress stale finalized block rebroadcasts (`block-accepter.cpp` parity).
     last_notified_mc_finalized_seqno: Option<u32>,
+
+    /// Lifecycle JSONL emission context (`None` when stats collection is off or
+    /// the local key is not in the set). The flags make `sessionStarted` /
+    /// `sessionStopped` emission idempotent across the multiple GC paths and the
+    /// `Drop` safety net.
+    lifecycle: Option<LifecycleStopCtx>,
+    /// Set once `start()` runs (session began validating). Decides `aborted`
+    /// (started) vs `never_ran` (never started) at `Drop`.
+    ever_started: bool,
+    /// `sessionStarted` already emitted (avoid duplicate started records).
+    started_emitted: bool,
+    /// A terminal `sessionStopped` record was already emitted.
+    stopped_emitted: bool,
 }
 
 impl Drop for ValidatorGroupImpl {
@@ -401,6 +501,21 @@ impl Drop for ValidatorGroupImpl {
             "SESSION_LIFECYCLE: dropped shard={} cc_seqno={} session_id={:x} final_status={} \
              has_engine={}",
             self.shard, self.cc_seqno, self.session_id, self.status, self.session.is_some());
+        // Lifecycle safety net: a member/future group can be dropped without a
+        // clean stop() (e.g. a pre-created future removed from the map, or live
+        // sessions at process shutdown). Emit the terminal record exactly once.
+        // never_ran if it never validated, otherwise aborted (trace incomplete).
+        if !self.stopped_emitted {
+            if let Some(ctx) = self.lifecycle.as_ref() {
+                let status = if self.ever_started {
+                    simplex::LifecycleFinalStatus::Aborted
+                } else {
+                    simplex::LifecycleFinalStatus::NeverRan
+                };
+                ctx.emit_stopped(status);
+            }
+            self.stopped_emitted = true;
+        }
     }
 }
 
@@ -505,6 +620,41 @@ impl ValidatorGroupImpl {
             "Validation queue spawned for shard={} cc_seqno={}, options={:?}",
             self.shard, self.cc_seqno, g.consensus_options);
 
+        // Lifecycle: emit sessionStarted at the -> Sync transition (the member
+        // session begins validating). Build the full validator set from the
+        // session's ValidatorSet. Idempotent per process via started_emitted.
+        if self.lifecycle.is_some() && !self.started_emitted {
+            if let Some(ctx) = self.lifecycle.as_ref() {
+                let validators = g
+                    .validator_set
+                    .list()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, d)| simplex::LifecycleValidator {
+                        idx: i as u32,
+                        pubkey: hex::encode(d.public_key.key_bytes()),
+                        adnl: Some(hex::encode(get_adnl_id(d).data())),
+                        weight: d.weight.to_string(),
+                    })
+                    .collect();
+                ctx.tc.record_lifecycle_started(simplex::LifecycleStarted {
+                    ts: 0.0,
+                    workchain: ctx.workchain,
+                    shard_hex: ctx.shard_hex.clone(),
+                    cc_seqno: ctx.cc_seqno,
+                    session_id: ctx.session_id_hex.clone(),
+                    our_idx: ctx.our_idx,
+                    our_pubkey: ctx.our_pubkey.clone(),
+                    epoch_utime_since: ctx.epoch_utime_since,
+                    validators,
+                });
+            }
+            self.started_emitted = true;
+        }
+        if self.lifecycle.is_some() {
+            self.ever_started = true;
+        }
+
         self.status = ValidatorGroupStatus::Sync;
         Ok(())
     }
@@ -573,18 +723,18 @@ impl ValidatorGroupImpl {
             .block_sync_overlay_params
             .clone()
             .map(|p| p.with_identity(g.shard.clone(), g.session_id.clone()));
-        let overlay_manager: ConsensusOverlayManagerPtr =
-            Arc::new(ConsensusOverlayManagerImpl::new(
-                g.engine.validator_network(),
-                g.validator_list_id.clone(),
-                block_sync_params_with_identity,
-            ));
 
         let db_root = format!("{}/catchains", g.engine.db_root_dir()?);
         let is_masterchain = g.shard.is_masterchain();
 
         match &g.consensus_options {
             ConsensusOptions::Catchain(catchain_options) => {
+                let overlay_manager: ConsensusOverlayManagerPtr =
+                    Arc::new(ConsensusOverlayManagerImpl::new(
+                        g.engine.validator_network(),
+                        g.validator_list_id.clone(),
+                        block_sync_params_with_identity,
+                    ));
                 ConsensusFactory::create_catchain_based_session(
                     catchain_options,
                     &g.session_id,
@@ -599,6 +749,12 @@ impl ValidatorGroupImpl {
                 )
             }
             ConsensusOptions::Simplex(simplex_options) => {
+                let overlay_manager: ConsensusOverlayManagerPtr =
+                    Arc::new(ConsensusOverlayManagerImpl::new(
+                        g.engine.validator_network(),
+                        g.validator_list_id.clone(),
+                        block_sync_params_with_identity,
+                    ));
                 ConsensusFactory::create_simplex_based_session(
                     simplex_options,
                     &g.session_id,
@@ -608,6 +764,18 @@ impl ValidatorGroupImpl {
                     db_root,
                     g.general_session_info.catchain_seqno,
                     overlay_manager,
+                    listener,
+                    g.engine.trace_collector(),
+                )
+            }
+            #[cfg(test)]
+            ConsensusOptions::Emulator(emulator_options) => {
+                ConsensusFactory::create_emulator_based_session(
+                    emulator_options,
+                    &g.session_id,
+                    &g.shard,
+                    nodes,
+                    &g.local_key,
                     listener,
                 )
             }
@@ -637,7 +805,7 @@ impl ValidatorGroupImpl {
     }
 
     // Initializes structure
-    pub fn new(
+    pub(crate) fn new(
         local_id: &PublicKeyHash,
         shard: ShardIdent,
         cc_seqno: u32,
@@ -645,6 +813,7 @@ impl ValidatorGroupImpl {
         is_accelerated_consensus_enabled: bool,
         is_pipeline_context_enabled: bool,
         consensus_type: ConsensusType,
+        lifecycle: Option<LifecycleStopCtx>,
     ) -> ValidatorGroupImpl {
         log::info!(target: "validator",
             "SESSION_LIFECYCLE: created shard={} cc_seqno={} session_id={:x} consensus={} local_id={}",
@@ -675,6 +844,10 @@ impl ValidatorGroupImpl {
             last_accepted_mc_seqno: None,
             last_accepted_mc_block_id: None,
             last_notified_mc_finalized_seqno: None,
+            lifecycle,
+            ever_started: false,
+            started_emitted: false,
+            stopped_emitted: false,
         }
     }
 
@@ -856,6 +1029,7 @@ impl ValidatorGroup {
         session_id: SessionId,
         validator_list_id: ValidatorListHash,
         validator_set: ValidatorSet,
+        epoch_utime_since: u32,
         consensus_options: ConsensusOptions,
         engine: Arc<dyn EngineOperations>,
         allow_unsafe_self_blocks_resync: bool,
@@ -865,6 +1039,20 @@ impl ValidatorGroup {
         let is_accelerated = consensus_options.is_accelerated_consensus_enabled();
         let is_pipeline_context_enabled = consensus_options.is_pipeline_context_enabled();
 
+        // Capture the lifecycle stop-context now (validator set, local key, and
+        // trace collector are all in scope). Carried into the impl so stop() /
+        // Drop can emit terminal records without the outer ValidatorGroup.
+        let lifecycle = engine.trace_collector().and_then(|tc| {
+            build_lifecycle_ctx(
+                tc,
+                &general_session_info.shard,
+                general_session_info.catchain_seqno,
+                &session_id,
+                &local_key,
+                &validator_set,
+                epoch_utime_since,
+            )
+        });
         let group_impl = ValidatorGroupImpl::new(
             local_key.id(),
             general_session_info.shard.clone(),
@@ -873,6 +1061,7 @@ impl ValidatorGroup {
             is_accelerated,
             is_pipeline_context_enabled,
             consensus_type,
+            lifecycle,
         );
         let id = format!("Val. group {} {:x}", general_session_info.shard, session_id);
         let (listener, receiver) = ValidatorSessionListener::create(
@@ -926,7 +1115,12 @@ impl ValidatorGroup {
     }
 
     pub fn is_simplex(&self) -> bool {
-        matches!(self.consensus_options, ConsensusOptions::Simplex(_))
+        match &self.consensus_options {
+            ConsensusOptions::Simplex(_) => true,
+            #[cfg(test)]
+            ConsensusOptions::Emulator(_) => true,
+            ConsensusOptions::Catchain(_) => false,
+        }
     }
 
     pub async fn snapshot(&self) -> SessionSnapshot {
@@ -1081,7 +1275,7 @@ impl ValidatorGroup {
                     .await,
             );
 
-            if matches!(self.consensus_options, ConsensusOptions::Simplex(_)) {
+            if self.is_simplex() {
                 // Bind cache backend only for simplex sessions.
                 // Catchain mode must not request non-finalized parents via simplex.
                 self.state_resolver_cache.lock().await.set_backend(
@@ -1130,6 +1324,31 @@ impl ValidatorGroup {
                 log::info!(target: "validator",
                     "SESSION_LIFECYCLE: stopped shard={} cc_seqno={} destroy_db={}",
                     shard, cc_seqno, destroy_database);
+
+                // Lifecycle: emit sessionStopped after the session is torn down.
+                // A pre-created future that never validated (e.g. a stale future
+                // culled via cull_stale_future / gc_future) is `never_ran`, NOT
+                // `stopped` -- the deterministic session_id may be reused by the
+                // real promoted session later, so mislabeling it `stopped`
+                // produces a spurious stop-before-start for that id. A session
+                // that did start gets `stopped`. The worker flushes the trace
+                // file before writing the stop line ("stop record present =>
+                // trace complete"). Idempotent via stopped_emitted.
+                group_impl
+                    .execute_sync(|gi| {
+                        if !gi.stopped_emitted {
+                            if let Some(ctx) = gi.lifecycle.as_ref() {
+                                let status = if gi.ever_started {
+                                    simplex::LifecycleFinalStatus::Stopped
+                                } else {
+                                    simplex::LifecycleFinalStatus::NeverRan
+                                };
+                                ctx.emit_stopped(status);
+                            }
+                            gi.stopped_emitted = true;
+                        }
+                    })
+                    .await;
             }
         });
         Ok(())
@@ -1238,7 +1457,7 @@ impl ValidatorGroup {
                             block_id
                         );
                     }
-                    block_stuff.block().ok().cloned()
+                    block_stuff.block().cloned().ok()
                 }
                 Err(e) => {
                     log::warn!(
@@ -1246,6 +1465,10 @@ impl ValidatorGroup {
                         "on_candidate_observed: deserialize_block failed for {}: {}",
                         block_id, e
                     );
+                    // Still record the observation (flags only, no body) so
+                    // later flag updates can OR-merge and a subsequent valid
+                    // body can overwrite the entry, rather than stranding
+                    // resolver waiters on a dropped observation.
                     None
                 }
             }
@@ -1265,12 +1488,23 @@ impl ValidatorGroup {
     pub async fn on_generate_slot(
         &self,
         source_info: validator_session::BlockSourceInfo,
-        request: validator_session::AsyncRequestPtr,
+        request: validator_session::AsyncCollationRequestPtr,
         parent: CollationParentHint,
         callback: ValidatorBlockCandidateCallback,
     ) {
         let round = source_info.priority.round;
         let request_id = request.get_request_id();
+        // Absolute collation deadlines + budget anchor for this slot, taken from the
+        // consensus engine's `AsyncCollationRequest`. Simplex sets a per-slot soft cutoff,
+        // a window-end hard cap, and the budget anchor (the dispatch instant the collator
+        // measures its soft sub-budgets from, distinct from `get_creation_time()`).
+        // Catchain/tests inherit the trait defaults (`None`) and the collator keeps its
+        // static cutoff/stop timeouts. Copied out here so the spawned collation task can
+        // forward them into `run_collate_query`. `get_creation_time()` (the slot start /
+        // `min_gen_time`) is still used for `min_ts` below.
+        let collation_budget_anchor = request.get_collation_budget_anchor();
+        let soft_deadline = request.get_collation_soft_deadline();
+        let hard_deadline = request.get_collation_hard_deadline();
 
         // Check if request is already cancelled
         if request.is_cancelled() {
@@ -1313,7 +1547,7 @@ impl ValidatorGroup {
             .await;
         let min_ts = min_ts.max(request.get_creation_time());
 
-        let is_simplex = matches!(self.consensus_options, ConsensusOptions::Simplex(_));
+        let is_simplex = self.is_simplex();
         if is_simplex {
             match &parent {
                 CollationParentHint::Implicit => {
@@ -1360,6 +1594,11 @@ impl ValidatorGroup {
             .is_err()
         {
             log::warn!(target: "validator", "Collation pipeline is already running. Skipping collation request.");
+            // Report the failure through the callback rather than dropping the request
+            // silently: under simplex the callback is the only signal back to the
+            // CollationController, and without it the controller's single-in-flight
+            // `block_generation_active` marker would never clear, wedging the pipeline.
+            callback(Err(error!("collation_pipeline_already_running")));
             return;
         }
 
@@ -1462,10 +1701,31 @@ impl ValidatorGroup {
             ConsensusOptions::Simplex(opts) => {
                 opts.slots_per_leader_window.saturating_sub(1) as usize
             }
+            #[cfg(test)]
+            ConsensusOptions::Emulator(opts) => {
+                opts.simplex_options.slots_per_leader_window.saturating_sub(1) as usize
+            }
         };
         let request_clone = request.clone();
         let cc_seqno = self.general_session_info.catchain_seqno;
         let is_masterchain = self.shard.is_masterchain();
+        // Whether the collator must compute a real (full) `MerkleUpdate`
+        // when finalizing the candidate. In production this is consulted
+        // under `#[cfg(not(test))]` in `Collator::create_merkle_update`
+        // and is hard-coded to `true`, so the value passed here is
+        // effectively only meaningful in test builds. In tests we only
+        // need a real `MerkleUpdate` on the emulator-backed real-engine
+        // path (`ConsensusOptions::Emulator`); pure Catchain / pure
+        // Simplex unit tests keep the historical empty-default fast
+        // path. Without this gating, every cfg(test) collation pays the
+        // full Merkle-update cost — the original review feedback noted
+        // it slowed the whole node test suite when the flag was
+        // unconditionally `true`.
+        #[cfg(test)]
+        let requires_real_state_update =
+            matches!(self.consensus_options, ConsensusOptions::Emulator(_));
+        #[cfg(not(test))]
+        let requires_real_state_update = true;
 
         let collation_task = tokio::spawn(async move {
             log::info!(
@@ -1506,6 +1766,10 @@ impl ValidatorGroup {
                                 validator_set.clone(),
                                 engine.clone(),
                                 is_simplex,
+                                requires_real_state_update,
+                                collation_budget_anchor,
+                                soft_deadline,
+                                hard_deadline,
                             )
                             .await
                             {
@@ -1613,8 +1877,20 @@ impl ValidatorGroup {
                 }
             };
 
+            // Outer wall-clock backstop. When Simplex supplies a window-end hard
+            // deadline the collator arms its own stop_flag at it; size the outer guard
+            // just above so the internal deadline fires first and keeps the empty /
+            // late-publish path in control. Catchain/tests keep the static
+            // COLLATION_TIMEOUT.
+            let outer_collation_timeout = match hard_deadline {
+                Some(hard) => COLLATION_TIMEOUT.max(
+                    hard.duration_since(SystemTime::now()).unwrap_or_default()
+                        + COLLATION_TIMEOUT_BACKSTOP,
+                ),
+                None => COLLATION_TIMEOUT,
+            };
             let (result, result_message) = match tokio::time::timeout(
-                COLLATION_TIMEOUT,
+                outer_collation_timeout,
                 collation_future,
             )
             .await
@@ -1622,7 +1898,7 @@ impl ValidatorGroup {
                 Ok(inner) => inner,
                 Err(_elapsed) => {
                     metrics::counter!("simplex_collation_timeout").increment(1);
-                    let msg = format!("Collation timed out after {:?}", COLLATION_TIMEOUT);
+                    let msg = format!("Collation timed out after {:?}", outer_collation_timeout);
                     log::warn!(
                         target: "validator",
                         "({next_block_descr}): ValidatorGroup::on_generate_slot: {round_info}, {msg}"
@@ -1708,7 +1984,7 @@ impl ValidatorGroup {
         let last_validation_time = self.last_validation_time.clone();
         let cc_seqno = self.general_session_info.catchain_seqno;
         let is_masterchain = self.shard.is_masterchain();
-        let is_simplex = matches!(self.consensus_options, ConsensusOptions::Simplex(_));
+        let is_simplex = self.is_simplex();
         let (expected_current_round, prev_block_ids, mc_block_id_opt, min_ts) = group_impl
             .execute_sync(|group_impl| {
                 (

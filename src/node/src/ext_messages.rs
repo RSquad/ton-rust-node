@@ -30,6 +30,10 @@ const MAX_EXTERNAL_MESSAGE_DEPTH: u16 = 512;
 pub const MAX_EXTERNAL_MESSAGE_SIZE: usize = 65535;
 const MESSAGE_LIFETIME: u32 = 600; // seconds
 const MESSAGE_MAX_GENERATIONS: u8 = 3;
+// home_seqno value before a keeper's order slot is published. u32::MAX is never
+// a real seqno (that would need 2^32 messages in one bucket), so a stale slot
+// can never match a keeper still in this state.
+const ORDER_SEQNO_UNSET: u32 = u32::MAX;
 
 pub const EXT_MESSAGES_TRACE_TARGET: &str = "ext_messages";
 
@@ -44,10 +48,20 @@ struct MessageKeeper {
     atomic_storage: Arc<AtomicU64>,
 
     hash_norm: UInt256,
+
+    // The keeper's canonical `order` slot is (home_ts, home_seqno): the bucket
+    // timestamp and the seqno within it. A remove+re-add leaves stale slots
+    // pointing at this id in other slots; MessagePoolIter yields only through
+    // the canonical slot (exact match), and clear_expired_messages evicts only
+    // when home_ts == the expiring bucket, so a re-added keeper isn't dropped
+    // early. home_seqno is filled in on admission (set before its slot is
+    // published); ORDER_SEQNO_UNSET until then so no stale slot can match it.
+    home_ts: u32,
+    home_seqno: Arc<AtomicU32>,
 }
 
 impl MessageKeeper {
-    fn new(message: Arc<Message>, addr_key: (i32, UInt256)) -> Result<Self> {
+    fn new(message: Arc<Message>, addr_key: (i32, UInt256), home_ts: u32) -> Result<Self> {
         let mut atomic_storage = 0;
         Self::set_active(&mut atomic_storage, true);
         let hash_norm = message.normalized_hash()?;
@@ -57,6 +71,8 @@ impl MessageKeeper {
             message,
             atomic_storage: Arc::new(AtomicU64::new(atomic_storage)),
             hash_norm,
+            home_ts,
+            home_seqno: Arc::new(AtomicU32::new(ORDER_SEQNO_UNSET)),
         })
     }
 
@@ -141,14 +157,18 @@ struct OrderMap {
 }
 
 impl OrderMap {
-    fn new(id: UInt256, workchain_id: i32, prefix: u64) -> Self {
+    // home_seqno is written before the slot is published so any iterator that
+    // can see the slot also sees the keeper's canonical seqno.
+    fn new(id: UInt256, workchain_id: i32, prefix: u64, home_seqno: &AtomicU32) -> Self {
         let seqno = Arc::new(AtomicU32::new(1));
         let map = Map::new();
+        home_seqno.store(0, Ordering::Relaxed);
         map.insert(0, MessageDescription { id, workchain_id, prefix });
         Self { seqno, map }
     }
-    fn insert(&self, id: UInt256, workchain_id: i32, prefix: u64) {
+    fn insert(&self, id: UInt256, workchain_id: i32, prefix: u64, home_seqno: &AtomicU32) {
         let seqno = self.seqno.fetch_add(1, Ordering::Relaxed);
+        home_seqno.store(seqno, Ordering::Relaxed);
         self.map.insert(seqno, MessageDescription { id, workchain_id, prefix });
     }
 }
@@ -319,8 +339,9 @@ impl MessagesPool {
         let prefix = account_slice.get_int(64)?;
 
         // Build the keeper before reserving any admission slot so a failure here
-        // (e.g. normalized_hash) can't leak a reserved counter.
-        let keeper = MessageKeeper::new(message, addr_key.clone())?;
+        // (e.g. normalized_hash) can't leak a reserved counter. home_ts = now,
+        // matching the `order` bucket this message is inserted into below.
+        let keeper = MessageKeeper::new(message, addr_key.clone(), now)?;
         let hash_norm = keeper.hash_norm.clone();
 
         // Reserve a global slot atomically. fetch_update guarantees we never go
@@ -385,10 +406,11 @@ impl MessagesPool {
 
         add_unbound_object_to_map_with_update(&self.order, now, |map| {
             if let Some(map) = map {
-                map.insert(id.clone(), workchain_id, prefix);
+                map.insert(id.clone(), workchain_id, prefix, &keeper.home_seqno);
                 Ok(None)
             } else {
-                let entry = Arc::new(OrderMap::new(id.clone(), workchain_id, prefix));
+                let entry =
+                    Arc::new(OrderMap::new(id.clone(), workchain_id, prefix, &keeper.home_seqno));
                 Ok(Some(entry))
             }
         })?;
@@ -548,8 +570,15 @@ impl MessagesPool {
                 self.order.insert(timestamp, order);
                 return false;
             }
-            if let Some(guard) = order.map.remove(&seqno) {
-                if let Some(guard) = self.messages.remove(&guard.val().id) {
+            if let Some(slot) = order.map.remove(&seqno) {
+                // Evict the live keeper only if this expiring bucket is its home
+                // bucket. A stale slot left by a remove+re-add points at a keeper
+                // that now lives in a newer bucket; removing by id alone would
+                // evict that re-added message early.
+                let removed = self
+                    .messages
+                    .remove_with(&slot.val().id, |(_, keeper)| keeper.home_ts == timestamp);
+                if let Some(guard) = removed {
                     metrics::counter!("ton_node_ext_messages_expired_total").increment(1);
                     log::debug!(
                         target: EXT_MESSAGES_TRACE_TARGET,
@@ -610,6 +639,20 @@ impl MessagePoolIter {
         let workchain_id = descr.val().workchain_id;
         let prefix = descr.val().prefix;
         if let Some(keeper) = self.pool.messages.get(&id) {
+            // Yield only through the keeper's canonical slot. A remove + re-add
+            // leaves stale slots pointing at this (now live again) id; matching
+            // (timestamp, seqno) against the keeper's own slot ignores them, so
+            // the message can't be yielded — and executed — twice in one pass.
+            if (self.timestamp, self.seqno)
+                != (keeper.val().home_ts, keeper.val().home_seqno.load(Ordering::Relaxed))
+            {
+                // Stale slot: drop it so later passes don't re-scan it. The
+                // keeper still yields through its canonical slot elsewhere.
+                drop(keeper);
+                drop(descr);
+                map.remove(&self.seqno);
+                return None;
+            }
             if self.shard.contains_prefix(workchain_id, prefix)
                 && keeper.val().check_active(self.now)
             {

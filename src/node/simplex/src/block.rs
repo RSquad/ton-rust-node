@@ -79,7 +79,6 @@ use crate::{PrivateKey, PublicKey, SessionId};
 use std::{
     fmt,
     ops::{Add, AddAssign, Mul, Rem, Sub},
-    sync::Arc,
 };
 use ton_api::{
     ton::{
@@ -95,11 +94,12 @@ use ton_api::{
 };
 use ton_block::{error, fail, BlockIdExt, Result, ShardIdent, UInt256};
 
-/*
-    Index Newtypes
-
-    These provide type safety to prevent parameter mixing bugs.
-*/
+// ======================================================================
+// Index newtypes
+// ======================================================================
+// Type-safe `u32` wrappers (`SlotIndex`, `WindowIndex`, `ValidatorIndex`)
+// with their arithmetic / conversion / formatting impls, preventing
+// parameter-mixing bugs.
 
 /// Consensus slot index
 ///
@@ -457,6 +457,12 @@ impl Rem<u32> for ValidatorIndex {
     }
 }
 
+// ======================================================================
+// Candidate identifiers
+// ======================================================================
+// Hash-based `RawCandidateId` and resolved `CandidateId` (plus the
+// `RawParentId` alias) keying candidates before / after parent resolution.
+
 /// Raw candidate ID (hash-based, before parent resolution)
 ///
 /// Reference: C++ `RawCandidateId` in `consensus-types.h`
@@ -518,18 +524,6 @@ impl RawCandidateId {
         );
         Self { slot, hash }
     }
-
-    /// Convert to CandidateParentInfo for FSM operations
-    #[allow(dead_code)]
-    pub fn as_parent_info(&self) -> CandidateParentInfo {
-        CandidateParentInfo { slot: self.slot, hash: self.hash.clone() }
-    }
-
-    /// Create from slot and hash directly (for deserialization)
-    #[allow(dead_code)]
-    pub fn from_parts(slot: SlotIndex, hash: UInt256) -> Self {
-        Self { slot, hash }
-    }
 }
 
 impl fmt::Debug for RawCandidateId {
@@ -577,12 +571,6 @@ impl CandidateId {
     pub fn to_raw(&self) -> RawCandidateId {
         RawCandidateId { slot: self.slot, hash: self.hash.clone() }
     }
-
-    /// Convert to CandidateParentInfo for FSM operations
-    #[allow(dead_code)]
-    pub fn as_parent_info(&self) -> CandidateParentInfo {
-        CandidateParentInfo { slot: self.slot, hash: self.hash.clone() }
-    }
 }
 
 impl From<CandidateId> for RawCandidateId {
@@ -621,9 +609,11 @@ impl fmt::Display for CandidateId {
     }
 }
 
-/// Type alias for optional resolved parent
-#[allow(dead_code)]
-pub type ParentId = Option<CandidateId>;
+// ======================================================================
+// Candidate data & bodies
+// ======================================================================
+// `BlockCandidate` (block body + collated data) and the
+// `CandidateBlockData` empty / non-empty content variant.
 
 /// Block candidate data
 ///
@@ -689,16 +679,13 @@ impl CandidateBlockData {
             CandidateBlockData::NonEmpty(block) => Some(block),
         }
     }
-
-    /// Get BlockIdExt if this is an empty block
-    #[allow(dead_code)]
-    pub fn as_empty(&self) -> Option<&BlockIdExt> {
-        match self {
-            CandidateBlockData::Empty(id) => Some(id),
-            CandidateBlockData::NonEmpty(_) => None,
-        }
-    }
 }
+
+// ======================================================================
+// Raw candidate
+// ======================================================================
+// `RawCandidate` as received from the network (parent possibly
+// unresolved): construction, signing, hashing, and TL (de)serialization.
 
 /// Raw candidate from network (parent may be unresolved)
 ///
@@ -1205,13 +1192,11 @@ impl RawCandidate {
     }
 }
 
-/// Pointer type for RawCandidate
-#[allow(dead_code)]
-pub type RawCandidatePtr = Arc<RawCandidate>;
-
-/// Pointer type for Candidate
-#[allow(dead_code)]
-pub type CandidatePtr = Arc<Candidate>;
+// ======================================================================
+// Validated candidate
+// ======================================================================
+// `Candidate`: a fully parent-resolved candidate with invariant-checked
+// construction.
 
 /// Resolved candidate with full parent information
 ///
@@ -1299,6 +1284,12 @@ impl Candidate {
         }
     }
 }
+
+// ======================================================================
+// Candidate parent info
+// ======================================================================
+// `CandidateParentInfo` (slot + hash) and the `CandidateParent` alias --
+// the lightweight parent reference used in FSM slot state.
 
 /// Lightweight parent info for FSM operations
 ///

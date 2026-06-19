@@ -462,10 +462,30 @@ fn test_async_result_try_get() {
     // Wait for result
     result.wait_timeout(Duration::from_secs(5)).expect("timeout").unwrap();
 
-    // try_get should return error (already taken)
+    // try_get must surface the typed `StorageResultAlreadyTaken` sentinel —
+    // consumers detect this via `downcast_ref` rather than string matching,
+    // so any future change to the wrapping must keep the type alive.
     let try_result = result.try_get();
-    assert!(try_result.is_some());
-    assert!(try_result.unwrap().is_err());
+    assert!(try_result.is_some(), "second try_get must return Some(Err)");
+    let err = try_result.unwrap().expect_err("second try_get must be Err");
+    assert!(
+        err.downcast_ref::<crate::StorageResultAlreadyTaken>().is_some(),
+        "Err must downcast to StorageResultAlreadyTaken (got: {err})",
+    );
+    // Display impl is part of the public contract — log scrapers and humans
+    // continue to see the legacy text.
+    assert_eq!(err.to_string(), "StorageAsyncResult: result already taken");
+
+    // Same contract on `wait_timeout` after `try_get` already drained the
+    // result — it must also surface the typed sentinel.
+    let wait_result = result
+        .wait_timeout(Duration::from_millis(50))
+        .expect("wait_timeout on Taken state must return Some, not None");
+    let wait_err = wait_result.expect_err("wait_timeout on Taken must be Err");
+    assert!(
+        wait_err.downcast_ref::<crate::StorageResultAlreadyTaken>().is_some(),
+        "wait_timeout Err must also downcast to StorageResultAlreadyTaken (got: {wait_err})",
+    );
 
     storage.mark_for_destroy();
 }
@@ -828,6 +848,295 @@ fn test_sync_waits_for_callbacks() {
 
     // Callback should have executed
     assert!(callback_executed.load(Ordering::SeqCst));
+
+    storage.mark_for_destroy();
+}
+
+// ============================================================================
+// Close / Destroy Regression Tests (CONSENSUS-DB-CLEANUP-1, TN-1035)
+// ============================================================================
+//
+// Covers the `close()` / `is_closed()` / `mark_for_destroy()` contract that
+// `SessionProcessor::stop()` relies on for C++ parity with
+// `validator/consensus/bridge.cpp::destroy_inner()`:
+//
+// 1. `close()` drains queued ops BEFORE flipping the gate, so a write posted
+//    "just before" shutdown still lands on disk.
+// 2. Post-close writes fail fast with `DB_CLOSED_ERROR` and never reach
+//    rocksdb.
+// 3. `close()` is idempotent.
+// 4. `close()` is a superset of `sync()` — no double-sync required.
+// 5. `close() + mark_for_destroy()` removes the on-disk DB when the storage
+//    is finally dropped.
+// 6. Dropping without `close()` still drains via the safety-net path in
+//    `RocksDbAsyncKeyValueStorage::Drop`, so no data loss on panic.
+
+fn read_back(storage: &crate::AsyncKeyValueStoragePtr, key: &[u8]) -> Option<Vec<u8>> {
+    storage
+        .get(key.to_vec(), None)
+        .wait_timeout(Duration::from_secs(5))
+        .expect("get timeout")
+        .expect("get err")
+}
+
+#[test]
+fn test_close_drains_pending_writes() {
+    let path = create_test_db_path("test_close_drains_pending_writes");
+    let storage = ConsensusCommonFactory::create_async_key_value_storage(
+        &path,
+        "close_drain",
+        create_test_options(),
+    )
+    .unwrap();
+
+    // Fire many writes fire-and-forget; close() must drain them all.
+    for i in 0..100u32 {
+        let _ =
+            storage.set(format!("k{:04}", i).into_bytes(), format!("v{:04}", i).into_bytes(), None);
+    }
+
+    assert!(!storage.is_closed(), "is_closed must be false before close()");
+    storage.close(Some(Duration::from_secs(5))).expect("close must drain");
+    assert!(storage.is_closed(), "is_closed must be true after close()");
+
+    // Reopen from the same path to confirm every write landed. `RocksDb::new`
+    // appends `storage_id` as a sub-directory, so reopen with the SAME
+    // storage_id — otherwise we'd be pointing at an empty sibling dir.
+    drop(storage);
+    let reopened = ConsensusCommonFactory::create_async_key_value_storage(
+        &path,
+        "close_drain",
+        create_test_options(),
+    )
+    .unwrap();
+
+    for i in 0..100u32 {
+        let got = read_back(&reopened, format!("k{:04}", i).as_bytes());
+        assert_eq!(got, Some(format!("v{:04}", i).into_bytes()), "missing write i={}", i);
+    }
+
+    reopened.mark_for_destroy();
+}
+
+#[test]
+fn test_close_rejects_new_ops_with_db_closed_error() {
+    let path = create_test_db_path("test_close_rejects_new_ops");
+    let storage = ConsensusCommonFactory::create_async_key_value_storage(
+        &path,
+        "close_reject",
+        create_test_options(),
+    )
+    .unwrap();
+
+    storage
+        .set(b"pre".to_vec(), b"ok".to_vec(), None)
+        .wait_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    storage.close(Some(Duration::from_secs(5))).unwrap();
+
+    let set_err = storage
+        .set(b"post".to_vec(), b"late".to_vec(), None)
+        .wait_timeout(Duration::from_secs(1))
+        .expect("set result must be immediately ready")
+        .expect_err("set after close must be Err");
+    assert!(
+        set_err.to_string().contains("db is closed"),
+        "expected DB_CLOSED_ERROR, got: {}",
+        set_err
+    );
+
+    let get_err = storage
+        .get(b"pre".to_vec(), None)
+        .wait_timeout(Duration::from_secs(1))
+        .expect("get result must be immediately ready")
+        .expect_err("get after close must be Err");
+    assert!(
+        get_err.to_string().contains("db is closed"),
+        "expected DB_CLOSED_ERROR, got: {}",
+        get_err
+    );
+
+    let erase_err = storage
+        .erase(b"pre".to_vec(), None)
+        .wait_timeout(Duration::from_secs(1))
+        .expect("erase result must be immediately ready")
+        .expect_err("erase after close must be Err");
+    assert!(
+        erase_err.to_string().contains("db is closed"),
+        "expected DB_CLOSED_ERROR, got: {}",
+        erase_err
+    );
+
+    let sync_err =
+        storage.sync(Some(Duration::from_secs(1))).expect_err("sync after close must be Err");
+    assert!(
+        sync_err.to_string().contains("db is closed"),
+        "expected DB_CLOSED_ERROR, got: {}",
+        sync_err
+    );
+
+    storage.mark_for_destroy();
+}
+
+#[test]
+fn test_close_is_idempotent() {
+    let path = create_test_db_path("test_close_is_idempotent");
+    let storage = ConsensusCommonFactory::create_async_key_value_storage(
+        &path,
+        "close_idempotent",
+        create_test_options(),
+    )
+    .unwrap();
+
+    storage.close(Some(Duration::from_secs(5))).expect("first close must succeed");
+    storage.close(Some(Duration::from_secs(5))).expect("second close must short-circuit Ok");
+    storage.close(None).expect("third close must short-circuit Ok");
+
+    assert!(storage.is_closed());
+
+    storage.mark_for_destroy();
+}
+
+#[test]
+fn test_close_rejects_pending_callback_results_without_blocking() {
+    // If `set()` callback variant is posted after close(), both the
+    // StorageAsyncResult and the on_complete callback must receive the
+    // DB_CLOSED_ERROR without reaching the DB thread.
+    let path = create_test_db_path("test_close_rejects_callbacks");
+    let storage = ConsensusCommonFactory::create_async_key_value_storage(
+        &path,
+        "close_cb_reject",
+        create_test_options(),
+    )
+    .unwrap();
+
+    storage.close(Some(Duration::from_secs(5))).unwrap();
+
+    let cb_err = Arc::new(AtomicBool::new(false));
+    let cb_err_clone = cb_err.clone();
+    let async_result = storage.set(
+        b"x".to_vec(),
+        b"y".to_vec(),
+        Some(Box::new(move |result| {
+            if let Err(e) = result {
+                if e.to_string().contains("db is closed") {
+                    cb_err_clone.store(true, Ordering::SeqCst);
+                }
+            }
+        })),
+    );
+
+    let err = async_result
+        .wait_timeout(Duration::from_millis(100))
+        .expect("async result must be immediate")
+        .expect_err("must be Err");
+    assert!(err.to_string().contains("db is closed"));
+    assert!(
+        cb_err.load(Ordering::SeqCst),
+        "on_complete callback must have fired with DB_CLOSED_ERROR"
+    );
+
+    storage.mark_for_destroy();
+}
+
+#[test]
+fn test_close_plus_destroy_removes_db_directory() {
+    let path = create_test_db_path("test_close_destroy");
+    let storage = ConsensusCommonFactory::create_async_key_value_storage(
+        &path,
+        "close_destroy",
+        create_test_options(),
+    )
+    .unwrap();
+
+    storage
+        .set(b"k".to_vec(), b"v".to_vec(), None)
+        .wait_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    storage.close(Some(Duration::from_secs(5))).unwrap();
+    storage.mark_for_destroy();
+
+    // Dropping the last Arc triggers the DB thread cleanup path:
+    // drop(db) + remove_dir_all(&path) — the directory must vanish.
+    drop(storage);
+
+    // The DB thread removes the directory asynchronously after stop_internal
+    // unwinds. Poll up to 5s for the directory to disappear.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if !path.exists() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("DB directory {} must be removed after mark_for_destroy()+drop", path.display());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn test_drop_without_close_runs_safety_net_drain() {
+    // If a caller forgets to close() (e.g. a panic unwinds the session),
+    // Drop must still drain pending writes so the next open() sees them.
+    let path = create_test_db_path("test_drop_safety_net");
+    let storage = ConsensusCommonFactory::create_async_key_value_storage(
+        &path,
+        "safety_net",
+        create_test_options(),
+    )
+    .unwrap();
+
+    for i in 0..50u32 {
+        let _ =
+            storage.set(format!("k{:04}", i).into_bytes(), format!("v{:04}", i).into_bytes(), None);
+    }
+
+    // Intentionally skip close() and drop immediately. Drop's safety-net
+    // drain (`sync_internal(STOP_WAIT_TIMEOUT)`) must finish every write.
+    drop(storage);
+
+    // `RocksDb::new` uses `{path}/{storage_id}` — reopen with the SAME id.
+    let reopened = ConsensusCommonFactory::create_async_key_value_storage(
+        &path,
+        "safety_net",
+        create_test_options(),
+    )
+    .unwrap();
+    for i in 0..50u32 {
+        let got = read_back(&reopened, format!("k{:04}", i).as_bytes());
+        assert_eq!(got, Some(format!("v{:04}", i).into_bytes()), "missing i={}", i);
+    }
+    reopened.mark_for_destroy();
+}
+
+#[test]
+fn test_close_no_callback_thread_variant() {
+    // Exercise the `use_callback_thread = false` branch so the `close()`
+    // short-circuit for "no callback queue" is covered.
+    let path = create_test_db_path("test_close_no_callback_thread");
+    let storage = ConsensusCommonFactory::create_async_key_value_storage(
+        &path,
+        "close_no_cb",
+        create_test_options_no_callback_thread(),
+    )
+    .unwrap();
+
+    storage
+        .set(b"k".to_vec(), b"v".to_vec(), None)
+        .wait_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    storage.close(Some(Duration::from_secs(5))).unwrap();
+    assert!(storage.is_closed());
+
+    let err = storage
+        .set(b"post".to_vec(), b"late".to_vec(), None)
+        .wait_timeout(Duration::from_secs(1))
+        .expect("immediate")
+        .expect_err("must be Err");
+    assert!(err.to_string().contains("db is closed"));
 
     storage.mark_for_destroy();
 }

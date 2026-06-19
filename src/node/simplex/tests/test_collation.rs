@@ -107,7 +107,7 @@ impl SessionListener for CollationTestListener {
     fn on_generate_slot(
         &self,
         source_info: simplex::BlockSourceInfo,
-        request: simplex::AsyncRequestPtr,
+        request: simplex::AsyncCollationRequestPtr,
         parent: consensus_common::CollationParentHint,
         callback: ValidatorBlockCandidateCallback,
     ) {
@@ -387,6 +387,8 @@ fn run_collation_test() {
         db_path,
         overlay_manager,
         Arc::downgrade(&session_listener),
+        None,
+        0,
     )
     .expect("Failed to create session");
     let (prev_blocks, min_masterchain_block_id) = session_start_args(&shard, initial_block_seqno);

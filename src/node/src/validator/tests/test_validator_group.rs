@@ -17,14 +17,24 @@ use std::{
     time::Duration,
 };
 use ton_block::{
-    signature::SigPubKey, validators::ValidatorDescr, Ed25519KeyOption, KeyId, ZeroizingBytes,
+    signature::SigPubKey, validators::ValidatorDescr, Ed25519KeyOption, KeyId, Serializable,
+    ZeroizingBytes,
 };
+use validator_session::AsyncRequest;
 
 #[derive(Default)]
 struct DummyEngine;
 
 #[async_trait::async_trait]
-impl EngineOperations for DummyEngine {}
+impl EngineOperations for DummyEngine {
+    // `on_candidate_observed` persists a valid candidate body
+    async fn store_block(
+        &self,
+        _block: &crate::block::BlockStuff,
+    ) -> Result<crate::internal_db::BlockResult> {
+        fail!("dummy engine does not persist blocks")
+    }
+}
 
 #[derive(Default)]
 struct MockSimplexSession {
@@ -87,6 +97,7 @@ fn make_group_impl_for_start_tests() -> ValidatorGroupImpl {
         false,
         false,
         ConsensusType::Catchain,
+        None,
     )
 }
 
@@ -116,6 +127,7 @@ fn make_simplex_group_for_resolver_tests() -> Arc<ValidatorGroup> {
         UInt256::rand(),
         UInt256::rand(),
         validator_set,
+        0,
         ConsensusOptions::Simplex(Default::default()),
         Arc::new(DummyEngine),
         false,
@@ -141,12 +153,19 @@ async fn test_resolver_cache_bridge_requests_simplex_candidate_availability() {
     let backend: Arc<dyn ResolverBackend> = group.clone();
     group.state_resolver_cache.lock().await.set_backend(Arc::downgrade(&backend));
 
+    // Feed a real, parseable block whose root hash matches the observed block
+    // id so the body-present success path stores the deserialized body and
+    // extracted parent ids.
+    let mut block = Block::default();
+    block.set_global_id(42);
+    let root_hash = block.serialize().expect("serialize block cell").repr_hash().clone();
+    let block_bytes = block.write_to_bytes().expect("serialize block bytes");
     let block_id =
-        BlockIdExt::with_params(ShardIdent::masterchain(), 77, UInt256::rand(), UInt256::rand());
+        BlockIdExt::with_params(ShardIdent::masterchain(), 77, root_hash, UInt256::rand());
     group
         .on_candidate_observed(
             block_id.clone(),
-            ConsensusCommonFactory::create_block_payload(vec![1, 2, 3]),
+            ConsensusCommonFactory::create_block_payload(block_bytes),
             ConsensusCommonFactory::create_block_payload(Vec::new()),
             CandidateObservedFlags {
                 body_present: true,
@@ -180,6 +199,137 @@ async fn test_resolver_cache_bridge_requests_simplex_candidate_availability() {
         assert!(attempts < 50, "timed out waiting for resolver bridge request");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+/// A candidate whose body fails to deserialize must still be recorded in the
+/// resolver cache (flags only, no body), so later flag updates can OR-merge and
+/// a subsequent valid body can overwrite the entry instead of stranding
+/// resolver waiters on a dropped observation.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_on_candidate_observed_caches_observation_when_body_deserialize_fails() {
+    let group = make_simplex_group_for_resolver_tests();
+
+    let block_id =
+        BlockIdExt::with_params(ShardIdent::masterchain(), 88, UInt256::rand(), UInt256::rand());
+    group
+        .on_candidate_observed(
+            block_id.clone(),
+            // Not a valid BOC, so both `deserialize_block` and the cache's
+            // fallback re-parse fail and no body is stored.
+            ConsensusCommonFactory::create_block_payload(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+            ConsensusCommonFactory::create_block_payload(Vec::new()),
+            CandidateObservedFlags {
+                body_present: true,
+                parent_ready: true,
+                local_collated: false,
+            },
+        )
+        .await;
+
+    let cache = group.state_resolver_cache.lock().await;
+    let entry = cache
+        .try_get_entry(&block_id)
+        .expect("observation must be cached even when the body fails to deserialize");
+    assert!(entry.data.is_none(), "invalid body must not be stored");
+    assert!(entry.flags.body_present, "body_present flag must be preserved");
+    assert!(entry.flags.parent_ready, "parent_ready flag must be preserved");
+}
+
+/// A catchain group so `on_generate_slot` reaches the shared `is_collating`
+/// compare-and-swap guard without taking the simplex parent-availability path
+/// (which a simplex group would require an `Explicit` parent and a wired resolver
+/// backend for). Construction mirrors [`make_simplex_group_for_resolver_tests`].
+fn make_catchain_group_for_cas_tests() -> Arc<ValidatorGroup> {
+    let local_key: PrivateKey =
+        Ed25519KeyOption::<ZeroizingBytes>::generate().expect("key must be generated");
+    let validator_descr = ValidatorDescr::with_params(
+        SigPubKey::from_bytes(local_key.pub_key().expect("pubkey bytes"))
+            .expect("valid sig pubkey"),
+        1,
+        None,
+    );
+    let validator_set =
+        ValidatorSet::with_cc_seqno(0, 0, 0, 1, vec![validator_descr]).expect("validator set");
+    let session_info = Arc::new(GeneralSessionInfo {
+        shard: ShardIdent::masterchain(),
+        opts_hash: UInt256::default(),
+        catchain_seqno: 1,
+        key_seqno: 0,
+        max_vertical_seqno: 0,
+    });
+    let group = ValidatorGroup::new(
+        session_info,
+        local_key,
+        UInt256::rand(),
+        UInt256::rand(),
+        validator_set,
+        0,
+        ConsensusOptions::Catchain(Default::default()),
+        Arc::new(DummyEngine),
+        false,
+        None,
+    );
+    Arc::new(group)
+}
+
+/// Non-cancelled [`AsyncCollationRequest`] mock: `on_generate_slot` only reads its id /
+/// cancelled flag / creation time before reaching the guard under test (collation
+/// deadlines inherit the trait defaults).
+struct CasDummyRequest;
+
+impl AsyncRequest for CasDummyRequest {
+    fn cancel(&self) {}
+    fn get_request_id(&self) -> u32 {
+        0
+    }
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+    fn get_creation_time(&self) -> SystemTime {
+        SystemTime::UNIX_EPOCH
+    }
+}
+
+impl validator_session::AsyncCollationRequest for CasDummyRequest {}
+
+/// `on_generate_slot` must not silently drop a collation request when the
+/// single-collation guard is already held. Under simplex the callback is the only
+/// signal back to the `CollationController`, so a dropped request would strand its
+/// `block_generation_active` marker and wedge the pipeline. When the `is_collating`
+/// CAS fails, the request is reported as failed through the callback and the guard
+/// belonging to the in-flight collation is left untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn on_generate_slot_reports_error_when_already_collating() {
+    let group = make_catchain_group_for_cas_tests();
+
+    // A collation pipeline is already running: the CAS check must fail.
+    group.is_collating.store(true, Ordering::Relaxed);
+
+    let source = Ed25519KeyOption::<ZeroizingBytes>::generate().expect("generate key");
+    let source_info = validator_session::BlockSourceInfo {
+        source,
+        priority: consensus_common::BlockCandidatePriority {
+            round: 0,
+            priority: 0,
+            first_block_round: 0,
+        },
+    };
+    let request: validator_session::AsyncCollationRequestPtr = Arc::new(CasDummyRequest);
+
+    let outcome = Arc::new(Mutex::new(None));
+    let sink = outcome.clone();
+    let callback: ValidatorBlockCandidateCallback = Box::new(move |res| {
+        *sink.lock().expect("callback sink poisoned") = Some(res.is_err());
+    });
+
+    group.on_generate_slot(source_info, request, CollationParentHint::Implicit, callback).await;
+
+    assert_eq!(
+        *outcome.lock().expect("callback sink poisoned"),
+        Some(true),
+        "a CAS failure must report the request as failed through the callback, not drop it"
+    );
+    assert!(group.is_collating(), "the CAS failure must not reset the in-flight collation's guard");
 }
 
 #[test]

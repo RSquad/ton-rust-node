@@ -30,7 +30,7 @@ pub mod validator_session_listener;
 pub mod validator_utils;
 
 use crate::shard_state::ShardStateStuff;
-use std::sync::Arc;
+use std::{sync::Arc, time::SystemTime};
 use ton_block::{
     error, BlkMasterInfo, BlockIdExt, ConfigParams, CurrencyCollection, ExtBlkRef, KeyExtBlkRef,
     Libraries, McStateExtra, Result, UInt256,
@@ -53,6 +53,16 @@ pub struct BlockCandidate {
     pub created_by: UInt256,
 }
 
+/// Serde default for [`CollatorSettings::requires_real_state_update`].
+///
+/// Production always requires a real state update (the `#[cfg(not(test))]`
+/// path in `ValidatorGroup` hard-codes `true`), so a deserialized config that
+/// omits the field must default to `true` rather than the cfg(test) fast-path
+/// value (`bool::default() == false`).
+fn default_requires_real_state_update() -> bool {
+    true
+}
+
 #[derive(Clone, Default, serde::Deserialize)]
 pub struct CollatorSettings {
     pub want_split: Option<bool>,
@@ -60,12 +70,31 @@ pub struct CollatorSettings {
     pub is_fake: bool,
     #[cfg(test)]
     pub is_bundle: bool,
+    #[serde(default = "default_requires_real_state_update")]
+    // Consumed only on the `#[cfg(test)]` collator path; production hard-codes the
+    // full-state-update decision (see `default_requires_real_state_update`), so the
+    // field is write-only in non-test builds.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub requires_real_state_update: bool,
     // produce blocks identical to cpp-node - mostly for tests
     pub lt_compatible: bool,
     // true when running under simplex consensus (passed from ValidatorGroup)
     pub is_simplex: bool,
     // when set, collator must not choose gen_utime_ms earlier than this value
     pub min_gen_utime_ms: Option<u64>,
+    // Absolute per-collation deadlines + budget anchor, set under simplex and carried on
+    // the AsyncCollationRequest. All three are `Some` together (simplex) or all `None`
+    // (catchain and tests), in which case the collator keeps its static
+    // `collator_config()` durations. Absolute `SystemTime` (not relative budgets) so the
+    // latency between the simplex dispatch and the collator start cannot shift them
+    // (matches the C++ `slot_start + X` deadlines in block-producer.cpp).
+    //   collation_budget_anchor -> start the soft sub-budgets are measured from (the
+    //       dispatch instant: shard `slot_start - target_rate`, MC `slot_start`)
+    //   soft_deadline -> cancel_ext (message-intake cutoff; C++ soft_timeout)
+    //   hard_deadline -> stop_flag   (whole-collation abort cap; C++ hard_timeout)
+    pub collation_budget_anchor: Option<SystemTime>,
+    pub soft_deadline: Option<SystemTime>,
+    pub hard_deadline: Option<SystemTime>,
 }
 
 impl CollatorSettings {

@@ -46,17 +46,17 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use ton_block::{
     error, fail, Account, AccountDispatchQueue, AccountId, AccountStorageDictProof, AddSub,
-    BlkPrevInfo, Block, BlockCreateStats, BlockExtra, BlockIdExt, BlockInfo, BocFlags, BocWriter,
-    Cell, ChildCell, Coins, CommonMsgInfo, ConfigParamEnum, ConfigParams, CreatorStats,
-    CurrencyCollection, Deserializable, Error, ExtBlkRef, FutureSplitMerge, GlobalCapabilities,
-    GlobalVersion, HashmapAugType, HashmapRemover, HashmapType, InMsg, InMsgDescr,
-    InternalMessageHeader, KeyExtBlkRef, KeyMaxLt, Libraries, McBlockExtra, McShardRecord,
-    McStateExtra, MerkleProof, MerkleUpdate, Message, MsgAddressInt, MsgMetadata, OutMsg,
-    OutMsgDescr, OutMsgQueueKey, ParamLimitIndex, ProcessedInfoKey, ProcessedUpto, Result,
+    Augmentation, BlkPrevInfo, Block, BlockCreateStats, BlockExtra, BlockIdExt, BlockInfo,
+    BocFlags, BocWriter, Cell, ChildCell, Coins, CommonMsgInfo, ConfigParamEnum, ConfigParams,
+    CreatorStats, CurrencyCollection, Deserializable, Error, ExtBlkRef, FutureSplitMerge,
+    GlobalCapabilities, GlobalVersion, HashmapAugType, HashmapRemover, HashmapType, InMsg,
+    InMsgDescr, InternalMessageHeader, KeyExtBlkRef, KeyMaxLt, Libraries, McBlockExtra,
+    McShardRecord, McStateExtra, MerkleProof, MerkleUpdate, Message, MsgAddressInt, MsgMetadata,
+    OutMsg, OutMsgDescr, OutMsgQueueKey, ParamLimitIndex, ProcessedInfoKey, ProcessedUpto, Result,
     Serializable, ShardAccount, ShardAccountBlocks, ShardAccounts, ShardDescr, ShardFees,
     ShardHashes, ShardIdent, ShardStateSplit, ShardStateUnsplit, SliceData, StorageStatDict,
     TopBlockDescrSet, Transaction, TransactionTickTock, UInt256, UsageTree, ValidatorSet,
@@ -75,6 +75,15 @@ pub const SPLIT_MERGE_DELAY: u32 = 100; // prepare (delay) split/merge for 100 s
 pub const SPLIT_MERGE_INTERVAL: u32 = 100; // split/merge is enabled during 60 second interval
 pub const MAX_ERROR_ATTEMPTS: u32 = 5;
 pub const PREV_STATE_WAIT_TIMEOUT_MS: u64 = 1_000;
+
+/// Overrides supplied by the hardfork crafter utility to the collator.
+#[derive(Clone, Default)]
+pub struct HardforkData {
+    /// New configuration parameters to merge into the masterchain config.
+    pub config: Option<ConfigParams>,
+    /// Accounts whose state must be replaced wholesale (without any transaction).
+    pub patched_accounts: Vec<(AccountId, Account)>,
+}
 
 pub struct CycleVec<'a, T> {
     items: Vec<Option<&'a T>>,
@@ -256,7 +265,7 @@ struct CollatorData {
     rejected_ext_messages: Vec<UInt256>,
     usage_tree: UsageTree,
     external_messages: Vec<(Arc<Message>, UInt256)>, // for bundle in case of error
-    imported_visited: ahash::AHashSet<UInt256>,
+    imported_visited: Option<Arc<ahash::AHashSet<UInt256>>>,
     last_dispatch_queue_emitted_lt: HashMap<AccountId, u64>,
     unprocessed_deferred_messages: HashMap<AccountId, usize>, // number of messages from dispatch queue in new_msgs
     sender_generated_messages_count: HashMap<AccountId, usize>,
@@ -337,7 +346,7 @@ impl CollatorData {
             rejected_ext_messages: Default::default(),
             usage_tree,
             external_messages: Vec::new(),
-            imported_visited: ahash::AHashSet::default(),
+            imported_visited: None,
             unprocessed_deferred_messages: HashMap::new(),
             sender_generated_messages_count: HashMap::new(),
             last_dispatch_queue_emitted_lt: HashMap::new(),
@@ -773,8 +782,10 @@ impl CollatorData {
 
 type MessageSender = tokio::sync::mpsc::UnboundedSender<(Arc<AsyncMessage>, Option<MsgMetadata>)>;
 struct ExecutionManager {
-    changed_accounts:
-        BTreeMap<AccountId, (MessageSender, tokio::task::JoinHandle<Result<ShardAccountStuff>>)>,
+    changed_accounts: BTreeMap<
+        AccountId,
+        (MessageSender, tokio::task::JoinHandle<Result<Option<ShardAccountStuff>>>),
+    >,
 
     receive_tr: tokio::sync::mpsc::UnboundedReceiver<
         Option<(Arc<AsyncMessage>, Option<MsgMetadata>, Result<Transaction>)>,
@@ -916,7 +927,7 @@ impl ExecutionManager {
         account_id: AccountId,
         shard_acc: ShardAccount,
         collator_data: &CollatorData,
-    ) -> Result<(MessageSender, tokio::task::JoinHandle<Result<ShardAccountStuff>>)> {
+    ) -> Result<(MessageSender, tokio::task::JoinHandle<Result<Option<ShardAccountStuff>>>)> {
         log::trace!("{}: start_account_job: {:x}", self.collated_block_descr, account_id);
 
         let lt = collator_data.last_dispatch_queue_emitted_lt(&account_id);
@@ -941,7 +952,9 @@ impl ExecutionManager {
         let handle = tokio::spawn(async move {
             let lt = lt.max(min_lt.load(Ordering::Relaxed));
             let full_collated_data = config.has_capability(GlobalCapabilities::CapFullCollatedData);
-            let init = tokio::task::spawn_blocking(move || {
+            let log_account_id = account_id.clone();
+            // init can be long in case of storage dict calculation
+            let mut init = tokio::task::spawn_blocking(move || {
                 ShardAccountStuff::init(
                     &engine,
                     account_id,
@@ -951,38 +964,68 @@ impl ExecutionManager {
                     lt_compatible,
                     dict_hash_min_cells,
                 )
-            })
-            .await
-            .map_err(|join_err| join_err.into())
-            .flatten();
-            let mut shard_acc = match init {
-                Ok(shard_acc) => shard_acc,
-                Err(err) => {
-                    receiver.close();
-                    // If initialization of shard account stuff failed, we should respond to all pending messages and exit.
-                    while receiver.recv().await.is_some() {
-                        wait_tr.respond(None);
-                    }
-                    return Err(err);
-                }
+            });
+            let mut account_stuff: Option<ShardAccountStuff> = None;
+            let log_cutoff_drop = |ext_msg_id: &UInt256, stage: &str| {
+                log::debug!(
+                    target: EXT_MESSAGES_TRACE_TARGET,
+                    "{}: account {:x} ext message {:x} cancelled by cutoff timeout {}",
+                    collated_block_descr, log_account_id, ext_msg_id, stage,
+                );
             };
             while let Some((new_msg, msg_metadata)) = receiver.recv().await {
+                let ext_msg_id = if let AsyncMessage::Ext(_, _, id) = &*new_msg {
+                    Some(id.clone())
+                } else {
+                    None
+                };
+
+                // External messages are dropped once the cutoff fires, so we
+                // don't wait for init to discard them; internal messages must be processed
+                let shard_acc = if let Some(stuff) = account_stuff.as_mut() {
+                    stuff
+                } else {
+                    let init_res = if let Some(ext_msg_id) = &ext_msg_id {
+                        tokio::select! {
+                            res = &mut init => res,
+                            _ = cancel_ext.cancelled() => {
+                                log_cutoff_drop(ext_msg_id, "while init");
+                                wait_tr.respond(None);
+                                continue;
+                            }
+                        }
+                    } else {
+                        (&mut init).await
+                    };
+                    match init_res.map_err(|join_err| join_err.into()).flatten() {
+                        Ok(acc) => {
+                            account_stuff = Some(acc);
+                            account_stuff.as_mut().unwrap()
+                        }
+                        Err(err) => {
+                            wait_tr.respond(None);
+                            receiver.close();
+                            while receiver.recv().await.is_some() {
+                                wait_tr.respond(None);
+                            }
+                            return Err(err);
+                        }
+                    }
+                };
+
+                if let Some(ext_msg_id) = &ext_msg_id {
+                    if cancel_ext.is_cancelled() {
+                        log_cutoff_drop(ext_msg_id, "before exec");
+                        wait_tr.respond(None);
+                        continue;
+                    }
+                }
+
                 log::trace!(
                     "{}: new message for {:x}",
                     collated_block_descr,
                     shard_acc.account_id()
                 );
-                if cancel_ext.is_cancelled() {
-                    if let AsyncMessage::Ext(_, _, msg_id) = &*new_msg {
-                        log::debug!(
-                            target: EXT_MESSAGES_TRACE_TARGET,
-                            "{}: account {:x} ext message {:x} cancelled by cutoff timeout before exec",
-                            collated_block_descr, shard_acc.account_id(), msg_id,
-                        );
-                        wait_tr.respond(None);
-                        continue;
-                    }
-                }
 
                 let config = config.clone(); // TODO: use Arc
 
@@ -1013,18 +1056,12 @@ impl ExecutionManager {
                     )
                 });
 
-                let ext_msg_id =
-                    if let AsyncMessage::Ext(_, _, id) = &*new_msg { Some(id) } else { None };
-
-                let (mut transaction_res, account, duration) = if let Some(msg_id) = ext_msg_id {
+                let (mut transaction_res, account, duration) = if let Some(ext_msg_id) = &ext_msg_id
+                {
                     tokio::select! {
                         res = task => res?,
                         _ = cancel_ext.cancelled() => {
-                            log::debug!(
-                                target: EXT_MESSAGES_TRACE_TARGET,
-                                "{}: account {:x} ext message {:x} cancelled by cutoff timeout in-flight",
-                                collated_block_descr, shard_acc.account_id(), msg_id,
-                            );
+                            log_cutoff_drop(ext_msg_id, "in-flight");
                             wait_tr.respond(None);
                             continue;
                         }
@@ -1051,7 +1088,7 @@ impl ExecutionManager {
                 max_lt.fetch_max(shard_acc.lt(), Ordering::Relaxed);
                 wait_tr.respond(Some((new_msg, msg_metadata, transaction_res)));
             }
-            Ok(shard_acc)
+            Ok(account_stuff)
         });
         Ok((sender, handle))
     }
@@ -1838,7 +1875,7 @@ impl Collator {
             // delete delivered messages from output queue for a limited time
             let now = Instant::now();
             let cc = self.engine.collator_config();
-            let clean_timeout_nanos = (cc.cutoff_timeout_ms as i128)
+            let clean_timeout_nanos = (self.effective_cutoff_timeout_ms() as i128)
                 * 1_000_000
                 * (cc.clean_timeout_percentage_points as i128)
                 / 1000;
@@ -2529,7 +2566,8 @@ impl Collator {
             prev_chain,
             collator_data.config.has_capability(GlobalCapabilities::CapFullCollatedData),
         )?;
-        MsgQueueManager::init(
+        let mut imported_visited = ahash::AHashSet::new();
+        let msg_queue_manager = MsgQueueManager::init(
             &self.engine,
             mc_data.state(),
             self.shard.clone(),
@@ -2541,11 +2579,14 @@ impl Collator {
             self.after_split,
             Some(&self.stop_flag),
             Some(&collator_data.usage_tree),
-            Some(&mut collator_data.imported_visited),
+            Some(&mut imported_visited),
             Some(self.collated_block_descr.clone()),
             states_manager,
         )
-        .await
+        .await?;
+        collator_data.imported_visited = Some(Arc::new(imported_visited));
+
+        Ok(msg_queue_manager)
     }
 
     fn adjust_shard_config(
@@ -3365,7 +3406,7 @@ impl Collator {
                     log::warn!(
                         "{}: TIMEOUT ({}ms) is elapsed, stop processing internal messages",
                         self.collated_block_descr,
-                        self.engine.collator_config().cutoff_timeout_ms
+                        self.effective_cutoff_timeout_ms()
                     );
                     collator_data.register_dispatch_queue_op(true)?;
                     break;
@@ -3616,7 +3657,7 @@ impl Collator {
                 log::warn!(
                     "{}: TIMEOUT ({}ms) is elapsed, stop processing internal messages",
                     self.collated_block_descr,
-                    self.engine.collator_config().cutoff_timeout_ms
+                    self.effective_cutoff_timeout_ms()
                 );
                 break;
             }
@@ -4091,12 +4132,17 @@ impl Collator {
         let mut new_config_opt = None;
         for (account_id, (sender, handle)) in mem::take(&mut exec_manager.changed_accounts) {
             mem::drop(sender);
-            let mut shard_acc = tokio::select! {
+            let shard_acc = tokio::select! {
                 biased;
                 _ = self.stop_flag.cancelled() => fail!("Stop flag was set on account {account_id:x}"),
                 res = handle => res.map_err(|err| {
                     error!("account {:x} thread didn't finish: {}", account_id, err)
                 })??,
+            };
+            // `None` means the account was never initialized: the cutoff dropped all its
+            // (external) messages before init finished, so it is simply not part of this block.
+            let Some(mut shard_acc) = shard_acc else {
+                continue;
             };
             if let Some(addr) = &config_addr {
                 if addr == &account_id {
@@ -4124,11 +4170,17 @@ impl Collator {
             }
         }
 
-        if let Some(hardfork_config) = self.engine.get_config_for_hardfork() {
-            let mut new_config =
-                new_config_opt.unwrap_or_else(|| collator_data.config.raw_config().clone());
-            self.apply_hardfork_config(&hardfork_config, &mut new_config)?;
-            new_config_opt = Some(new_config);
+        let hardfork_data = self.engine.get_hardfork_data();
+        if let Some(hardfork_data) = &hardfork_data {
+            if let Some(hardfork_config) = &hardfork_data.config {
+                let mut new_config =
+                    new_config_opt.unwrap_or_else(|| collator_data.config.raw_config().clone());
+                self.apply_hardfork_config(hardfork_config, &mut new_config)?;
+                new_config_opt = Some(new_config);
+            }
+            for (account_id, new_account) in &hardfork_data.patched_accounts {
+                self.apply_hardfork_patched_account(account_id, new_account, &mut new_accounts)?;
+            }
         }
 
         log::debug!("{}: finalize_block: calc value flow", self.collated_block_descr);
@@ -4232,7 +4284,7 @@ impl Collator {
                 self.update_public_libraries(exec_manager.libraries.clone(), &changed_accounts)?;
         }
         new_state.write_custom(mc_state_extra.as_ref())?;
-        if self.engine.get_config_for_hardfork().is_some() {
+        if hardfork_data.as_ref().and_then(|d| d.config.as_ref()).is_some() {
             new_state.update_config_smc()?;
         }
 
@@ -4282,8 +4334,10 @@ impl Collator {
         // Self::_check_visited_integrity(&prev_data.state_root, &visited, &mut visited_from_root);
         // assert_eq!(visited.len(), visited_from_root.len());
 
-        let state_update =
-            self.create_merkle_update(prev_data, collator_data, &new_ss_root).inspect_err(|e| {
+        let state_update = self
+            .create_merkle_update(prev_data, collator_data, &new_ss_root)
+            .await
+            .inspect_err(|e| {
                 log::error!("{}: create_merkle_update {:?}", self.collated_block_descr, e);
             })?;
 
@@ -4439,7 +4493,46 @@ impl Collator {
         Ok(())
     }
 
-    fn create_merkle_update(
+    /// Replace an account in the shard accounts dictionary with the supplied
+    /// patched copy, preserving the existing `last_trans_hash` and
+    /// `last_trans_lt`. No `AccountBlock`/transaction is produced - this is
+    /// intentional and only valid inside a trusted hardfork block.
+    fn apply_hardfork_patched_account(
+        &self,
+        account_id: &AccountId,
+        new_account: &Account,
+        new_accounts: &mut ShardAccounts,
+    ) -> Result<()> {
+        match new_account.get_id() {
+            Some(new_acc_id) if *new_acc_id == *account_id => {}
+            Some(new_acc_id) => fail!(
+                "hardfork patch: account_id mismatch: expected {:x}, got {:x} from patched account",
+                account_id,
+                new_acc_id,
+            ),
+            None => fail!("hardfork patch: patched account for {:x} has no address", account_id),
+        }
+        let current = new_accounts.account(account_id)?.ok_or_else(|| {
+            error!("hardfork patch: account {:x} is not present in shard accounts", account_id)
+        })?;
+        let last_trans_hash = current.last_trans_hash().clone();
+        let last_trans_lt = current.last_trans_lt();
+        let new_shard_acc =
+            ShardAccount::with_params(new_account, last_trans_hash.clone(), last_trans_lt)?;
+        let value = new_shard_acc.write_to_new_cell()?;
+        let aug = new_account.aug()?;
+        new_accounts.set_builder_serialized(account_id.clone(), &value, &aug)?;
+        log::info!(
+            "{}: hardfork patch: replaced account {:x} (last_trans_lt = {}, last_trans_hash = {:x})",
+            self.collated_block_descr,
+            account_id,
+            last_trans_lt,
+            last_trans_hash,
+        );
+        Ok(())
+    }
+
+    async fn create_merkle_update(
         &self,
         prev_data: &PrevData,
         collator_data: &CollatorData,
@@ -4452,26 +4545,33 @@ impl Collator {
         // assert_eq!(visited.len(), visited_from_root.len());
 
         #[cfg(test)]
-        let need_full_state_update = self.collator_settings.is_bundle;
+        let need_full_state_update =
+            self.collator_settings.is_bundle || self.collator_settings.requires_real_state_update;
         #[cfg(not(test))]
         let need_full_state_update = true;
-        let state_update;
-        if need_full_state_update {
+        if !need_full_state_update {
+            return Ok(MerkleUpdate::default());
+        }
+
+        let prev_state_root = prev_data.state_root.clone();
+        let new_ss_root = new_ss_root.clone();
+        let usage_tree = collator_data.usage_tree.clone();
+        let imported_visited = collator_data.imported_visited.clone();
+        let collated_block_descr = self.collated_block_descr.clone();
+        let state_update = tokio::task::spawn_blocking(move || -> Result<MerkleUpdate> {
             let now = Instant::now();
-            state_update = MerkleUpdate::create_fast(&prev_data.state_root, new_ss_root, |h| {
-                collator_data.usage_tree.contains(h) || collator_data.imported_visited.contains(h)
+            let state_update = MerkleUpdate::create_fast(&prev_state_root, &new_ss_root, |h| {
+                usage_tree.contains(h) || imported_visited.as_ref().is_some_and(|v| v.contains(h))
             })?;
             log::trace!(
                 "{}: TIME: merkle update creating {}ms;",
-                self.collated_block_descr,
+                collated_block_descr,
                 now.elapsed().as_millis()
             );
-        } else {
-            state_update = MerkleUpdate::default();
-        }
-
-        // let new_root2 = state_update.apply_for(&prev_data.state_root)?;
-        // assert_eq!(new_root2.repr_hash(), new_ss_root.repr_hash());
+            Ok(state_update)
+        })
+        .await
+        .map_err(|e| error!("create_merkle_update join error: {}", e))??;
 
         Ok(state_update)
     }
@@ -5007,21 +5107,40 @@ impl Collator {
 
     fn init_timeout(&mut self) {
         self.started = Instant::now();
+        let cc = self.engine.collator_config();
+        let now = self.now_system();
 
-        let stop_deadline = Instant::now()
-            + Duration::from_millis(self.engine.collator_config().stop_timeout_ms as u64);
-        let stop_flag = self.stop_flag.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep_until(stop_deadline.into()).await;
-            stop_flag.cancel();
-        });
-
-        let cutoff_deadline = Instant::now()
-            + Duration::from_millis(self.engine.collator_config().cutoff_timeout_ms as u64);
+        // SOFT cutoff -> cancel_ext: stop message intake, let the collation finalize
+        // (C++ `soft_timeout`). Fire at `min(budget_anchor + cutoff_timeout_ms,
+        // soft_deadline)` (see `effective_soft_cutoff`): the static cutoff bounds intake to
+        // ~one slot so it never stretches to the window end, while the absolute simplex
+        // soft deadline pulls it in earlier when the window boundary is close. Absolute, so
+        // collator-init latency and a pinned restart of the same slot cannot shift when it
+        // fires.
+        let cutoff_delay = match effective_soft_cutoff(
+            self.collator_settings.soft_deadline,
+            self.collator_settings.collation_budget_anchor,
+            cc.cutoff_timeout_ms as u64,
+        ) {
+            Some(cutoff_at) => cutoff_at.duration_since(now).unwrap_or_default(),
+            None => Duration::from_millis(cc.cutoff_timeout_ms as u64),
+        };
         let cancel_ext = self.cancel_ext.clone();
         tokio::spawn(async move {
-            tokio::time::sleep_until(cutoff_deadline.into()).await;
+            tokio::time::sleep(cutoff_delay).await;
             cancel_ext.cancel();
+        });
+
+        // HARD cap -> stop_flag: `check_stop_flag()` then fails the whole collation
+        // (C++ `hard_timeout` -> `alarm()` -> `fatal_error`).
+        let stop_delay = match self.collator_settings.hard_deadline {
+            Some(hard) => hard.duration_since(now).unwrap_or_default(),
+            None => Duration::from_millis(cc.stop_timeout_ms as u64),
+        };
+        let stop_flag = self.stop_flag.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(stop_delay).await;
+            stop_flag.cancel();
         });
     }
 
@@ -5029,27 +5148,76 @@ impl Collator {
         self.cancel_ext.is_cancelled()
     }
 
+    /// Engine wall-clock `now` as `SystemTime`, matching the clock of the absolute
+    /// deadlines and `AsyncRequest::get_creation_time()`.
+    fn now_system(&self) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_millis(self.engine.now_ms())
+    }
+
+    /// Total SOFT (message-intake) budget in ms used to size the percentage-based
+    /// sub-budgets (out-queue clean, external-message intake): `min(cutoff_timeout_ms,
+    /// soft_deadline - budget_anchor)` (see `effective_soft_cutoff`). Measured from the
+    /// budget anchor (the dispatch instant), NOT the slot start, so for shardchains —
+    /// where the soft deadline equals the slot start — the window is the early-dispatch
+    /// lead (`target_rate`) rather than zero. Falls back to the static `cutoff_timeout_ms`
+    /// without a simplex budget anchor (catchain/tests).
+    fn effective_cutoff_timeout_ms(&self) -> u64 {
+        effective_cutoff_budget_ms(
+            self.collator_settings.soft_deadline,
+            self.collator_settings.collation_budget_anchor,
+            self.engine.collator_config().cutoff_timeout_ms as u64,
+        )
+    }
+
     fn get_remaining_cutoff_time_limit_nanos(&self) -> i128 {
-        let cutoff_timeout_nanos =
-            self.engine.collator_config().cutoff_timeout_ms as i128 * 1_000_000;
-        let elapsed_nanos = self.started.elapsed().as_nanos() as i128;
-        cutoff_timeout_nanos - elapsed_nanos
+        let cc = self.engine.collator_config();
+        match effective_soft_cutoff(
+            self.collator_settings.soft_deadline,
+            self.collator_settings.collation_budget_anchor,
+            cc.cutoff_timeout_ms as u64,
+        ) {
+            // Time left until the effective soft cutoff (negative once it is exceeded).
+            Some(cutoff_at) => match cutoff_at.duration_since(self.now_system()) {
+                Ok(remaining) => remaining.as_nanos() as i128,
+                Err(overshoot) => -(overshoot.duration().as_nanos() as i128),
+            },
+            // Catchain/tests: static budget minus monotonic elapsed since start.
+            None => {
+                let cutoff_timeout_nanos = cc.cutoff_timeout_ms as i128 * 1_000_000;
+                cutoff_timeout_nanos - self.started.elapsed().as_nanos() as i128
+            }
+        }
     }
 
     fn get_remaining_clean_time_limit_nanos(&self) -> i128 {
         let remaining_cutoff_timeout_nanos = self.get_remaining_cutoff_time_limit_nanos();
         let cc = self.engine.collator_config();
-        let max_secondary_clean_timeout_nanos = (cc.cutoff_timeout_ms as i128)
+        let max_secondary_clean_timeout_nanos = (self.effective_cutoff_timeout_ms() as i128)
             * 1_000_000
             * (cc.max_secondary_clean_timeout_percentage_points as i128)
             / 1000;
         remaining_cutoff_timeout_nanos.min(max_secondary_clean_timeout_nanos)
     }
 
+    /// Absolute effective soft cutoff as engine unix-ms, or `None` without a simplex
+    /// budget anchor (catchain/tests). Same instant `cancel_ext` is armed for.
+    fn effective_soft_cutoff_ms(&self) -> Option<u64> {
+        effective_soft_cutoff(
+            self.collator_settings.soft_deadline,
+            self.collator_settings.collation_budget_anchor,
+            self.engine.collator_config().cutoff_timeout_ms as u64,
+        )
+        .map(|t| t.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis() as u64)
+    }
+
     fn get_external_messages_finish_time_micros(&self) -> u64 {
-        let now = self.engine.now_ms();
         let cc = self.engine.collator_config();
-        now + (cc.cutoff_timeout_ms * cc.external_messages_timeout_percentage_points / 1000) as u64
+        external_messages_finish_ms(
+            self.engine.now_ms(),
+            self.effective_cutoff_timeout_ms(),
+            cc.external_messages_timeout_percentage_points as u64,
+            self.effective_soft_cutoff_ms(),
+        )
     }
 
     fn check_stop_flag(&self) -> Result<()> {
@@ -5217,7 +5385,11 @@ impl Collator {
                             account_stuff.account_id(),
                         );
                     }
-                } else if account_stuff.has_root_change() {
+                } else if account_stuff.has_root_change() || account_stuff.storage_dict().is_some()
+                {
+                    // Root changed, or a dict was built from scratch (backfill: `storage_dict` set
+                    // but nothing imported). The validator rebuilds it from the state, so the full
+                    // state must be in the proof.
                     log::debug!("Added full account state {:x} ", account_stuff.account_id());
                     roots_to_include.insert(account_stuff.original_root().repr_hash());
                 }
@@ -5227,7 +5399,13 @@ impl Collator {
             for state in prev_states {
                 let proof = MerkleProof::create_with_subtrees(
                     &state,
-                    |hash| stat.is_loaded(hash) || collator_data.imported_visited.contains(hash),
+                    |hash| {
+                        stat.is_loaded(hash)
+                            || collator_data
+                                .imported_visited
+                                .as_ref()
+                                .is_some_and(|v| v.contains(hash))
+                    },
                     |hash| roots_to_include.contains(hash),
                 )?;
                 roots.push(proof.serialize()?);
@@ -5270,6 +5448,77 @@ fn test_count_bits_u64() {
             "test case: {}",
             test_case
         );
+    }
+}
+
+/// Effective absolute SOFT cutoff instant for message intake: the earlier of
+/// `budget_anchor + cutoff_timeout_ms` and the simplex `soft` deadline
+/// (`min(cutoff, deadline)`).
+///
+/// Bounding by the static `cutoff_timeout_ms` keeps intake to roughly one slot (C++
+/// `soft_timeout = slot_start + target_rate` in block-producer.cpp) so it can never
+/// stretch to the whole leader window; the window's remaining time is left for
+/// notarization/finalization. C++ does not subtract a margin from a window-end deadline:
+/// it keeps the expensive collation running past the slot up to a generous `hard_timeout`
+/// (`slot_start + max(3*target_rate, 60s)`) and fills the intervening slots with empty
+/// blocks. `budget_anchor` is the dispatch instant (shardchains dispatch `target_rate`
+/// before the slot start, the masterchain at the slot start); anchoring here — not at the
+/// slot start — keeps the intake window non-zero for shardchains and lets a pinned restart
+/// of the same slot share one absolute cutoff. Returns `None` without a `budget_anchor`
+/// (catchain/tests), where the caller falls back to a monotonic `cutoff_timeout_ms`
+/// budget.
+fn effective_soft_cutoff(
+    soft: Option<SystemTime>,
+    budget_anchor: Option<SystemTime>,
+    cutoff_timeout_ms: u64,
+) -> Option<SystemTime> {
+    let budget_anchor = budget_anchor?;
+    let by_cutoff = budget_anchor + Duration::from_millis(cutoff_timeout_ms);
+    Some(match soft {
+        Some(soft) => by_cutoff.min(soft),
+        None => by_cutoff,
+    })
+}
+
+/// Soft-window budget magnitude (ms) that scales the collator's percentage-based
+/// message-intake sub-budgets: the span from the `budget_anchor` to
+/// [`effective_soft_cutoff`], i.e. `min(cutoff_timeout_ms, soft_deadline - budget_anchor)`.
+///
+/// Measuring from the dispatch instant (the `budget_anchor`) rather than the slot start is
+/// what keeps this nonzero for shardchains, whose soft deadline *is* the slot start: the
+/// budget becomes the early-dispatch lead (`target_rate`) instead of collapsing to zero.
+/// Falls back to the static `cutoff_timeout_ms` with no `budget_anchor` (catchain/tests).
+/// Mirrors the C++ `soft_timeout - now` window that sizes the fractions in collator.cpp.
+fn effective_cutoff_budget_ms(
+    soft: Option<SystemTime>,
+    budget_anchor: Option<SystemTime>,
+    cutoff_timeout_ms: u64,
+) -> u64 {
+    match (effective_soft_cutoff(soft, budget_anchor, cutoff_timeout_ms), budget_anchor) {
+        (Some(cutoff_at), Some(anchor)) => {
+            cutoff_at.duration_since(anchor).unwrap_or_default().as_millis() as u64
+        }
+        _ => cutoff_timeout_ms,
+    }
+}
+
+/// External-message intake finish time (engine unix-ms): `now + budget * pct / 1000`,
+/// clamped to the absolute soft cutoff when one is known.
+///
+/// The fractional budget is added to the *current* `now`, so a late collation start could
+/// otherwise push this sub-phase past the soft cutoff (where `cancel_ext` stops intake
+/// anyway). C++ bounds it the same way by construction:
+/// `external_msg_timeout_ = now + 0.75 * (soft_timeout - now) <= soft_timeout` (collator.cpp).
+fn external_messages_finish_ms(
+    now_ms: u64,
+    budget_ms: u64,
+    pct_points: u64,
+    soft_cutoff_ms: Option<u64>,
+) -> u64 {
+    let finish = now_ms + budget_ms * pct_points / 1000;
+    match soft_cutoff_ms {
+        Some(soft_ms) => finish.min(soft_ms),
+        None => finish,
     }
 }
 

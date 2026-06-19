@@ -22,7 +22,9 @@ const CONSENSUS_EXTRA_DATA_TAG: u32 = 0x638eb292;
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct StorageStatCellInfo {
-    pub ref_count: u32,
+    // `None` = cell exists but refcount unknown here (hint entry, pruned dict path). Never flushed
+    // to the dict (net diff is always 0); serializing None is rejected.
+    pub ref_count: Option<u32>,
     pub max_merkle_depth: u8,
     // not serialized
     pub ref_count_diff: i32,
@@ -30,14 +32,17 @@ pub struct StorageStatCellInfo {
 
 impl Serializable for StorageStatCellInfo {
     fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
-        cell.append_u32(self.ref_count)?;
+        let ref_count = self
+            .ref_count
+            .ok_or_else(|| error!("cannot serialize StorageStatCellInfo with unknown ref_count"))?;
+        cell.append_u32(ref_count)?;
         cell.append_bits(self.max_merkle_depth as usize, 2)?;
         Ok(())
     }
 }
 impl Deserializable for StorageStatCellInfo {
     fn read_from(&mut self, cell: &mut SliceData) -> Result<()> {
-        self.ref_count = cell.get_next_u32()?;
+        self.ref_count = Some(cell.get_next_u32()?);
         self.max_merkle_depth = cell.get_next_int(2)? as u8;
         self.ref_count_diff = 0;
         Ok(())
@@ -80,6 +85,22 @@ pub struct AccountStorageStat {
     total_bits: u64,
     cache: ahash::AHashMap<UInt256, StorageStatCellInfo>,
     dict_updated: bool,
+    // Hashes of cells that existed in the previous state — lets the incremental recalc survive a
+    // pruned (collated-data) proof of that state.
+    //
+    // A subtree may be full in the new state but a pruned stub in the old: `add_cell` would walk
+    // the new one and count its cells as new, while `remove_cell` can't recurse the old stub to
+    // cancel them (double-count), and the changed keys then hit a pruned dict branch (CellUnderflow).
+    //
+    // `add_hint(vm_loaded_cells)` (called before the recalc) walks the OLD roots, recursing only
+    // into VM-loaded cells, and records their hashes. `replace_roots` consumes the hint for one
+    // diff: in `add_cell` a hinted cell that misses both cache and dict is pre-existing → inserted
+    // with `ref_count = None`, not recursed, totals untouched; `remove_cell` keeps it `None`.
+    //
+    // Such a cell never changed refcount (else its dict path wouldn't be pruned), so its net diff
+    // is 0 → filtered from the multiset, never serialized (`write_to` rejects `None`). Applies only
+    // with a non-empty (proof) dict; otherwise the stat is rebuilt from scratch and the hint is off.
+    hint: ahash::AHashSet<UInt256>,
 }
 
 impl std::fmt::Debug for AccountStorageStat {
@@ -114,6 +135,7 @@ impl AccountStorageStat {
             total_bits,
             cache: Default::default(),
             dict_updated: false,
+            hint: Default::default(),
         }
     }
 
@@ -125,6 +147,7 @@ impl AccountStorageStat {
             total_bits: 0,
             cache: Default::default(),
             dict_updated: true,
+            hint: Default::default(),
         }
     }
 
@@ -148,14 +171,47 @@ impl AccountStorageStat {
             total_bits,
             cache: Default::default(),
             dict_updated: false,
+            hint: Default::default(),
         })
+    }
+
+    /// Build the `hint` for the next `replace_roots` from the VM-loaded cells. See the `hint` field.
+    pub fn add_hint(&mut self, loaded: &std::collections::HashSet<UInt256>) {
+        // clear unconditionally so a stale hint can't leak; no dict → nothing to hint
+        self.hint.clear();
+        if loaded.is_empty() || self.dict.is_empty() {
+            return;
+        }
+        fn dfs(
+            cell: &Cell,
+            loaded: &std::collections::HashSet<UInt256>,
+            hint: &mut ahash::AHashSet<UInt256>,
+        ) {
+            let hash = cell.repr_hash().clone();
+            if !hint.insert(hash.clone()) {
+                return;
+            }
+            if loaded.contains(&hash) {
+                for i in 0..cell.references_count() {
+                    if let Ok(child) = cell.reference_without_usage(i) {
+                        dfs(&child, loaded, hint);
+                    }
+                }
+            }
+        }
+        let mut hint = std::mem::take(&mut self.hint);
+        for root in self.roots.clone() {
+            dfs(&root, loaded, &mut hint);
+        }
+        self.hint = hint;
     }
 
     fn fill_cache_from_roots(&mut self) -> Result<()> {
         let saved_cells = std::mem::replace(&mut self.total_cells, 0);
         let saved_bits = std::mem::replace(&mut self.total_bits, 0);
+        let no_hint = ahash::AHashSet::new();
         for root in self.roots.clone() {
-            self.add_cell(&root)?;
+            self.add_cell(&root, &no_hint)?;
         }
         self.total_cells = saved_cells;
         self.total_bits = saved_bits;
@@ -174,7 +230,7 @@ impl AccountStorageStat {
             ) -> (FixedBitsKey<'a>, Option<SliceData>) {
                 data.ref_count_diff = 0;
                 let key = FixedBitsKey::new(hash.as_slice());
-                if data.ref_count == 0 {
+                if data.ref_count == Some(0) {
                     (key, None)
                 } else {
                     (key, data.write_to_bitstring().ok())
@@ -230,6 +286,8 @@ impl AccountStorageStat {
     }
 
     fn replace_roots(&mut self, roots: StorageRoots) -> Result<()> {
+        // consume the hint — valid for this one diff only (see the `hint` field)
+        let hint = std::mem::take(&mut self.hint);
         if roots == self.roots {
             return Ok(());
         }
@@ -245,9 +303,11 @@ impl AccountStorageStat {
         }
 
         self.dict_updated = false;
+        // hint applies only with a (proof) dict; empty dict → rebuilt from scratch, count everything
+        let hint = if self.dict.is_empty() { ahash::AHashSet::new() } else { hint };
         for root in &roots {
             if !self.roots.contains(root) {
-                self.add_cell(root)?;
+                self.add_cell(root, &hint)?;
             }
         }
         for root in &std::mem::take(&mut self.roots) {
@@ -259,17 +319,18 @@ impl AccountStorageStat {
         Ok(())
     }
 
-    fn add_cell(&mut self, cell: &Cell) -> Result<u8> {
+    fn add_cell(&mut self, cell: &Cell, hint: &ahash::AHashSet<UInt256>) -> Result<u8> {
         let hash = cell.repr_hash().clone();
         let mut max_merkle_depth = 0;
         if let Some(data) = self.cache.get_mut(&hash) {
-            data.ref_count += 1;
+            // known count +1; unknown (hint) stays unknown
+            data.ref_count = data.ref_count.map(|c| c + 1);
             data.ref_count_diff += 1;
             max_merkle_depth = data.max_merkle_depth;
 
-            if data.ref_count == 1 {
+            if data.ref_count == Some(1) {
                 for i in 0..cell.references_count() {
-                    self.add_cell(&cell.reference_without_usage(i)?)?;
+                    self.add_cell(&cell.reference_without_usage(i)?, hint)?;
                 }
                 self.total_cells += 1;
                 self.total_bits += cell.bit_length() as u64;
@@ -279,14 +340,21 @@ impl AccountStorageStat {
             self.cache.insert(
                 hash,
                 StorageStatCellInfo {
-                    ref_count: data.ref_count + 1,
+                    ref_count: data.ref_count.map(|c| c + 1),
                     max_merkle_depth,
                     ref_count_diff: 1,
                 },
             );
+        } else if hint.contains(&hash) {
+            // pre-existing cell, pruned dict path: count unknown (`None`), don't recurse, don't
+            // touch totals (see the `hint` field)
+            self.cache.insert(
+                hash,
+                StorageStatCellInfo { ref_count: None, max_merkle_depth: 0, ref_count_diff: 1 },
+            );
         } else {
             for i in 0..cell.references_count() {
-                let child_depth = self.add_cell(&cell.reference_without_usage(i)?)?;
+                let child_depth = self.add_cell(&cell.reference_without_usage(i)?, hint)?;
                 max_merkle_depth = max_merkle_depth.max(child_depth);
             }
             if cell.is_merkle() {
@@ -294,7 +362,8 @@ impl AccountStorageStat {
             }
             self.total_cells += 1;
             self.total_bits += cell.bit_length() as u64;
-            let data = StorageStatCellInfo { ref_count: 1, max_merkle_depth, ref_count_diff: 1 };
+            let data =
+                StorageStatCellInfo { ref_count: Some(1), max_merkle_depth, ref_count_diff: 1 };
             self.cache.insert(hash, data);
         }
         Ok(max_merkle_depth)
@@ -303,9 +372,10 @@ impl AccountStorageStat {
     fn remove_cell(&mut self, cell: &Cell) -> Result<()> {
         let hash = cell.repr_hash().clone();
         let removed = if let Some(data) = self.cache.get_mut(&hash) {
-            data.ref_count -= 1;
+            // known count decreased; unknown (hint) stays unknown, never "removed" → no double-count
+            data.ref_count = data.ref_count.map(|c| c - 1);
             data.ref_count_diff -= 1;
-            data.ref_count == 0
+            data.ref_count == Some(0)
         } else {
             let data = self.dict.get(&hash)?.ok_or_else(|| {
                 error!("Cell with hash {} not found in storage stat dictionary", hash)
@@ -313,17 +383,21 @@ impl AccountStorageStat {
             self.cache.insert(
                 hash,
                 StorageStatCellInfo {
-                    ref_count: data.ref_count - 1,
+                    ref_count: data.ref_count.map(|c| c - 1),
                     max_merkle_depth: data.max_merkle_depth,
                     ref_count_diff: -1,
                 },
             );
-            data.ref_count == 1
+            data.ref_count == Some(1)
         };
 
         if removed {
+            // Use `reference` (not `reference_without_usage`) so that removed cells are marked as
+            // visited in the `UsageTree` and therefore included in the resulting proof.
+            // This path is only hit for incremental removals (the initial full dict build uses
+            // `add_cell`), so we avoid traversing the full build with usage tracking.
             for i in 0..cell.references_count() {
-                self.remove_cell(&cell.reference_without_usage(i)?)?;
+                self.remove_cell(&cell.reference(i)?)?;
             }
             self.total_cells -= 1;
             self.total_bits -= cell.bit_length() as u64;

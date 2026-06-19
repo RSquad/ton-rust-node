@@ -479,6 +479,8 @@ pub struct TonNodeConfig {
     #[serde(default)]
     accelerated_consensus_disabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    session_logs_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     archival_mode: Option<ArchivalModeConfig>,
     #[serde(skip)]
     custom_overlays: CustomOverlaysConfigBoxed,
@@ -514,6 +516,78 @@ pub struct ValidatorKeysJson {
     pub validator_key_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub validator_adnl_key_id: Option<String>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub struct TestEmulatorConsensusConfig {
+    pub validator_keys: Vec<Arc<dyn KeyOption>>,
+    pub slot_interval_min_ms: u64,
+    pub slot_interval_max_ms: u64,
+    pub slot_interval_reliability: f64,
+}
+
+#[cfg(test)]
+impl TestEmulatorConsensusConfig {
+    pub fn fixed_local(validator_keys: Vec<Arc<dyn KeyOption>>) -> Self {
+        Self {
+            validator_keys,
+            slot_interval_min_ms: Self::default_slot_interval_min_ms(),
+            slot_interval_max_ms: Self::default_slot_interval_max_ms(),
+            slot_interval_reliability: 0.0,
+        }
+    }
+
+    fn default_slot_interval_min_ms() -> u64 {
+        100
+    }
+
+    fn default_slot_interval_max_ms() -> u64 {
+        100
+    }
+}
+
+#[cfg(test)]
+#[derive(serde::Deserialize, serde::Serialize, Clone)]
+struct TestEmulatorConsensusConfigJson {
+    pub validator_keys: Vec<KeyOptionJson>,
+    #[serde(default = "TestEmulatorConsensusConfig::default_slot_interval_min_ms")]
+    pub slot_interval_min_ms: u64,
+    #[serde(default = "TestEmulatorConsensusConfig::default_slot_interval_max_ms")]
+    pub slot_interval_max_ms: u64,
+    #[serde(default)]
+    pub slot_interval_reliability: f64,
+}
+
+#[cfg(test)]
+impl TryFrom<TestEmulatorConsensusConfigJson> for TestEmulatorConsensusConfig {
+    type Error = ton_block::Error;
+
+    fn try_from(config: TestEmulatorConsensusConfigJson) -> Result<Self> {
+        // `slot_interval_reliability` is applied as the slot tick's
+        // `EmulatorDelaySpec::skip_probability`. `EmulatorParams::validate()`
+        // forbids a non-zero skip there because a dropped slot tick would
+        // permanently stall slot generation, so reject it here at the config
+        // boundary instead of failing later during emulator setup.
+        if config.slot_interval_reliability != 0.0 {
+            fail!(
+                "TestEmulatorConsensusConfig: slot_interval_reliability ({}) must be 0.0 \
+                 (it sets the slot tick skip probability, and a skipped tick would \
+                 permanently stall slot generation)",
+                config.slot_interval_reliability,
+            );
+        }
+        Ok(Self {
+            validator_keys: config
+                .validator_keys
+                .iter()
+                .map(Ed25519KeyOption::<ZeroizingBytes>::from_private_key_json)
+                .collect::<Result<Vec<_>>>()?,
+            slot_interval_min_ms: config.slot_interval_min_ms,
+            slot_interval_max_ms: config.slot_interval_max_ms,
+            slot_interval_reliability: config.slot_interval_reliability,
+        })
+    }
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Default, Debug, Clone)]
@@ -752,6 +826,7 @@ impl TonNodeConfig {
     pub fn test_bundles_config(&self) -> &CollatorTestBundlesGeneralConfig {
         &self.test_bundles_config
     }
+
     pub fn extensions(&self) -> &NodeExtensions {
         &self.extensions
     }
@@ -773,6 +848,10 @@ impl TonNodeConfig {
 
     pub fn is_accelerated_consensus_disabled(&self) -> bool {
         self.accelerated_consensus_disabled
+    }
+
+    pub fn session_logs_file(&self) -> Option<String> {
+        self.session_logs_file.clone()
     }
 
     pub fn quic_address(&self) -> Option<SocketAddr> {
@@ -1341,7 +1420,7 @@ impl NodeConfigHandler {
     }
 
     pub fn get_validator_status(&self) -> bool {
-        self.validator_keys.is_empty()
+        !self.validator_keys.is_empty()
     }
 
     pub async fn add_validator_key(
@@ -1434,7 +1513,7 @@ impl NodeConfigHandler {
     }
 
     pub fn get_actual_validator_key_ids(&self) -> Result<Vec<Arc<KeyId>>> {
-        self.get_actual_key_ids(|| self.validator_keys.get_validator_key_ids())
+        self.get_actual_key_ids_sorted(|| self.validator_keys.get_validator_key_ids())
     }
 
     pub fn get_actual_validator_keys(&self) -> Result<Vec<ValidatorKeysJson>> {
@@ -1551,6 +1630,20 @@ impl NodeConfigHandler {
             result.push(KeyId::from_data(id[..].try_into()?));
         }
         Ok(result)
+    }
+
+    fn get_actual_key_ids_sorted(&self, src: impl Fn() -> Vec<String>) -> Result<Vec<Arc<KeyId>>> {
+        let mut ids = Vec::new();
+        for key_id in src().iter() {
+            let id = base64_decode(key_id)?;
+            let key_bytes: [u8; 32] = id[..].try_into()?;
+            ids.push((key_bytes, KeyId::from_data(key_bytes)));
+        }
+
+        ids.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        ids.dedup_by(|(left, _), (right, _)| left == right);
+
+        Ok(ids.into_iter().map(|(_, key_id)| key_id).collect())
     }
 
     // generates a new key and saves it to config
@@ -2274,6 +2367,8 @@ pub struct ValidatorManagerConfig {
     pub unsafe_catchain_rotates: HashMap<u32, (u32, u32)>,
     pub no_countdown_for_zerostate: bool,
     pub accelerated_consensus_disabled: bool,
+    #[cfg(test)]
+    pub test_emulator_consensus: Option<TestEmulatorConsensusConfig>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -2283,10 +2378,15 @@ struct UnsafeCatchainRotation {
     unsafe_rotation_id: u32,
 }
 
-#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(Default, serde::Deserialize, serde::Serialize)]
 struct ValidatorManagerConfigImpl {
+    #[serde(default)]
     unsafe_resync_catchains: Vec<u32>,
+    #[serde(default)]
     unsafe_catchain_rotates: Vec<UnsafeCatchainRotation>,
+    #[cfg(test)]
+    #[serde(default)]
+    test_emulator_consensus: Option<TestEmulatorConsensusConfigJson>,
 }
 
 impl Display for ValidatorManagerConfig {
@@ -2354,6 +2454,18 @@ impl ValidatorManagerConfig {
                         (rotate.block_seqno, rotate.unsafe_rotation_id),
                     );
                 }
+
+                #[cfg(test)]
+                if let Some(emulator_config) = config.test_emulator_consensus {
+                    match TestEmulatorConsensusConfig::try_from(emulator_config) {
+                        Ok(emulator_config) => {
+                            validator_config.test_emulator_consensus = Some(emulator_config);
+                        }
+                        Err(e) => {
+                            log::warn!("Invalid test_emulator_consensus in {}: {}", one_config, e);
+                        }
+                    }
+                }
             }
         }
 
@@ -2388,6 +2500,8 @@ impl Default for ValidatorManagerConfig {
             unsafe_catchain_rotates: HashMap::new(),
             no_countdown_for_zerostate: false,
             accelerated_consensus_disabled: false,
+            #[cfg(test)]
+            test_emulator_consensus: None,
         }
     }
 }
@@ -2408,7 +2522,7 @@ impl ValidatorKeys {
     }
 
     fn is_empty(&self) -> bool {
-        self.first.load(atomic::Ordering::Relaxed) > 0
+        self.first.load(atomic::Ordering::Relaxed) == 0
     }
 
     fn add(&self, key: ValidatorKeysJson) -> Result<()> {

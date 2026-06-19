@@ -595,12 +595,12 @@ impl EngineOperations for LiteServerTestEngine {
         Ok(Some(Arc::new(self.last_mc_block_id.clone())))
     }
 
-    async fn load_block_raw(&self, handle: &BlockHandle) -> Result<Vec<u8>> {
+    async fn load_block_raw(&self, handle: &Arc<BlockHandle>) -> Result<Vec<u8>> {
         let id = handle.id();
         self.mock_blocks.get(id).cloned().ok_or_else(|| error!("Block data not found for {id}"))
     }
 
-    async fn load_block(&self, handle: &BlockHandle) -> Result<BlockStuff> {
+    async fn load_block(&self, handle: &Arc<BlockHandle>) -> Result<BlockStuff> {
         let data = self.load_block_raw(handle).await?;
         let stuff = BlockStuff::deserialize_block(handle.id().clone(), Arc::new(data))?;
         Ok(stuff)
@@ -1051,7 +1051,7 @@ async fn test_lookup_block() -> Result<()> {
 
     // Lookup block with proof
     let query = LookupBlockWithProof {
-        mode: LOOKUP_BY_SEQNO,
+        mode: LookupBlockMode::BY_SEQNO.bits(),
         id: block_id.clone(),
         mc_block_id: real_id.clone(),
         lt: None,
@@ -1065,6 +1065,21 @@ async fn test_lookup_block() -> Result<()> {
     assert_eq!(reply.id(), &real_id);
 
     Ok(())
+}
+
+#[test]
+fn test_lookup_block_mode_include_prev_is_not_selector() {
+    for selector in [LookupBlockMode::BY_SEQNO, LookupBlockMode::BY_LT, LookupBlockMode::BY_UTIME] {
+        assert!(lkp_check(selector).is_ok());
+        assert!(lkp_check(selector | LookupBlockMode::INCLUDE_PREV).is_ok());
+    }
+
+    assert!(lkp_check(LookupBlockMode::INCLUDE_PREV).is_err());
+    assert!(lkp_check(LookupBlockMode::BY_SEQNO | LookupBlockMode::BY_LT).is_err());
+    assert!(lkp_check(
+        LookupBlockMode::BY_SEQNO | LookupBlockMode::BY_LT | LookupBlockMode::INCLUDE_PREV
+    )
+    .is_err());
 }
 
 #[tokio::test]
@@ -1876,7 +1891,7 @@ async fn test_get_all_config_params_zerostate() -> Result<()> {
 
     let result = LiteServerQuerySubscriber::get_config_params(
         &(engine.clone() as Arc<dyn EngineOperations>),
-        CFG_VISIT_ROOT,
+        ConfigMode::VISIT_ROOT.bits(),
         engine.state_id.clone(),
         Vec::new(),
     )
@@ -1932,7 +1947,7 @@ fn create_key_block_with_config(
     )
 }
 
-/// Test CFG_FROM_PREV_KEY_BLOCK flag with a real (non-zerostate) chain:
+/// Test ConfigMode::FROM_PREV_KEY_BLOCK with a real (non-zerostate) chain:
 /// state at seqno 20 has prev_blocks referencing key block at seqno 5.
 /// Blocks after key block resolve to it; blocks before it fail.
 #[tokio::test]
@@ -1992,7 +2007,7 @@ async fn test_get_config_params_from_prev_key_block() -> Result<()> {
         async move {
             LiteServerQuerySubscriber::get_config_params(
                 &engine,
-                CFG_FROM_PREV_KEY_BLOCK | CFG_VISIT_ROOT,
+                (ConfigMode::FROM_PREV_KEY_BLOCK | ConfigMode::VISIT_ROOT).bits(),
                 id,
                 Vec::new(),
             )
@@ -2047,7 +2062,7 @@ async fn test_get_config_params_from_prev_key_block() -> Result<()> {
     assert_eq!(result.id.root_hash, key_block_id.root_hash);
     assert!(result.state_proof.is_empty());
     assert!(!result.config_proof.is_empty());
-    assert_eq!(result.mode, CFG_FROM_PREV_KEY_BLOCK);
+    assert_eq!(result.mode, ConfigMode::FROM_PREV_KEY_BLOCK.bits());
 
     // Last known block → the same
     let result = get_cfg(&engine, state_id).await?;
@@ -2201,7 +2216,7 @@ impl EngineOperations for WaitRegistryTestEngine {
         Ok(self.handles.get(id).cloned())
     }
 
-    async fn load_block(&self, handle: &BlockHandle) -> Result<BlockStuff> {
+    async fn load_block(&self, handle: &Arc<BlockHandle>) -> Result<BlockStuff> {
         let id = handle.id();
         let data = self.blocks.get(id).ok_or_else(|| error!("block not found: {id}"))?;
         BlockStuff::deserialize_block(id.clone(), Arc::new(data.clone()))

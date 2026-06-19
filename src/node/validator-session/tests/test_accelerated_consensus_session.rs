@@ -261,7 +261,7 @@ impl SessionListener for SessionInstance {
     fn on_generate_slot(
         &self,
         source_info: validator_session::BlockSourceInfo,
-        request: validator_session::AsyncRequestPtr,
+        request: validator_session::AsyncCollationRequestPtr,
         parent: validator_session::CollationParentHint,
         callback: ValidatorBlockCandidateCallback,
     ) {
@@ -457,7 +457,7 @@ impl SessionListener for SessionInstanceListener {
     fn on_generate_slot(
         &self,
         source_info: validator_session::BlockSourceInfo,
-        request: validator_session::AsyncRequestPtr,
+        request: validator_session::AsyncCollationRequestPtr,
         parent: validator_session::CollationParentHint,
         callback: ValidatorBlockCandidateCallback,
     ) {

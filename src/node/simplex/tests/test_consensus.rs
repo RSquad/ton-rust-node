@@ -580,7 +580,7 @@ impl SessionListener for SessionInstance {
     fn on_generate_slot(
         &self,
         source_info: simplex::BlockSourceInfo,
-        request: simplex::AsyncRequestPtr,
+        request: simplex::AsyncCollationRequestPtr,
         parent: consensus_common::CollationParentHint,
         callback: ValidatorBlockCandidateCallback,
     ) {
@@ -796,7 +796,7 @@ impl SessionListener for SessionInstanceListener {
     fn on_generate_slot(
         &self,
         source_info: simplex::BlockSourceInfo,
-        request: simplex::AsyncRequestPtr,
+        request: simplex::AsyncCollationRequestPtr,
         parent: consensus_common::CollationParentHint,
         callback: ValidatorBlockCandidateCallback,
     ) {
@@ -1189,6 +1189,8 @@ where
             db_path,
             overlay_manager,
             Arc::downgrade(&session_listener),
+            None,
+            0,
         )
         .unwrap();
         let (prev_blocks, min_masterchain_block_id) =
@@ -1527,6 +1529,8 @@ where
                             ctx.db_path.clone(),
                             ctx.overlay_manager.clone(),
                             Arc::downgrade(&session_listener),
+                            None,
+                            0,
                         );
 
                         match new_session {
@@ -2494,6 +2498,8 @@ fn test_simplex_start_gate() {
             db_path,
             overlay_manager.clone(),
             Arc::downgrade(&session_listener),
+            None,
+            0,
         )
         .expect("Failed to create session");
         let simplex_session = session.clone() as Arc<dyn SimplexSession + Send + Sync>;

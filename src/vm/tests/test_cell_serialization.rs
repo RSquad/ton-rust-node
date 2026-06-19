@@ -5119,6 +5119,34 @@ mod cell_depth {
         expect_exception("PUSHCONT {} CDEPTH", ExceptionCode::TypeCheckError);
         expect_exception("PUSHSLICE x0_ CDEPTH", ExceptionCode::TypeCheckError);
     }
+
+    /// CDEPTH on a Merkle-proof pruned-branch cell must report the represented
+    /// depth (the depth of the cell it stands in for), not 0.
+    #[test]
+    fn test_cell_depth_pruned_branch() {
+        // root -> child(depth 2) -> c1 -> c0; prune `child` in a Merkle proof.
+        let c0 = BuilderData::with_raw(vec![0x00], 8).unwrap().into_cell().unwrap();
+        let c1 =
+            BuilderData::with_raw_and_refs(vec![0x01], 8, vec![c0]).unwrap().into_cell().unwrap();
+        let child =
+            BuilderData::with_raw_and_refs(vec![0x02], 8, vec![c1]).unwrap().into_cell().unwrap();
+        let root = BuilderData::with_raw_and_refs(vec![0x03], 8, vec![child.clone()])
+            .unwrap()
+            .into_cell()
+            .unwrap();
+        assert_eq!(child.repr_depth(), 2);
+
+        // Keep only the root: after virtualization its reference to `child` is a pruned branch
+        // that has no refs but represents a subtree of depth 2.
+        let root_hash = root.repr_hash().clone();
+        let proof = ton_block::MerkleProof::create(&root, |h| h == &root_hash).unwrap();
+        let pruned_child = proof.proof.virtualize(1).reference(0).unwrap();
+        assert_eq!(pruned_child.references_count(), 0);
+
+        let mut stack = Stack::new();
+        stack.push(StackItem::Cell(pruned_child));
+        test_case("CDEPTH").with_stack(stack).expect_item(int!(2));
+    }
 }
 
 mod slice_depth {

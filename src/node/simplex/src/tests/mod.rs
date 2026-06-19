@@ -14,7 +14,6 @@
 //! - `test_crypto` - Threshold calculations, signature tests, hash computation
 //! - `test_block` - Block candidate types and resolution
 //! - `test_certificate` - Certificate types and TL serialization
-//! - `test_restart` - Startup recovery, restart recommit strategies
 //! - `test_simplex_state` - SimplexState FSM tests (included directly from `simplex_state.rs`
 //!   via `#[path]` attribute to access private fields without pub(crate))
 //! - `test_candidate_resolver` - CandidateResolverCache tests (included directly from `receiver.rs`
@@ -31,7 +30,6 @@
 //! ```bash
 //! cargo test -p simplex tests::test_crypto::
 //! cargo test -p simplex tests::test_block::
-//! cargo test -p simplex tests::test_restart::
 //! cargo test -p simplex simplex_state::tests::
 //! cargo test -p simplex receiver::tests::
 //! ```
@@ -44,7 +42,5 @@ mod test_certificate;
 mod test_crypto;
 #[cfg(test)]
 mod test_receiver;
-#[cfg(test)]
-mod test_restart;
 #[cfg(test)]
 mod test_session_description;

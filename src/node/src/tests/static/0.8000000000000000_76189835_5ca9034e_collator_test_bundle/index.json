@@ -1,0 +1,25 @@
+{
+  "id": "(0:8000000000000000, 76189835, rh 5ca9034ead92ee9dd60274f64e1c76dfb379bf231347ff6c47c35f68c6e5e9a7, fh 32f3c5eed4e413fe9c74dcf3e9b44e94346cb4e48ff2969c960f07768ae2fd32)",
+  "top_shard_blocks": [],
+  "external_messages": [
+    "022c4aa79fc0750f482b4729d1d5b9d515151a871d7c33665c3670cef097c760",
+    "0d362cbe88ccd230ccc254fc32316524b432ac021d77a5801b5ef37e87eb7e79",
+    "4cec67a05820198ba643ee414c34cbbab9102247e727e66ff156feedb76e0705",
+    "badac492936c1960797e51be2a6094deab43ce8568c94f8f9efab3bb2552a3bb"
+  ],
+  "last_mc_state": "(-1:8000000000000000, 71363326, rh f99bf57bb38f7b9876cc876eb3cefbd4d754ab91b6b6230f6b690cb33a151fd4, fh 9c603d53c922d3c4646754256f2a01890a71b4b352695ac0b40b91ecfe567a2d)",
+  "min_ref_mc_seqno": 71363322,
+  "mc_states": [
+    "(-1:8000000000000000, 71363326, rh f99bf57bb38f7b9876cc876eb3cefbd4d754ab91b6b6230f6b690cb33a151fd4, fh 9c603d53c922d3c4646754256f2a01890a71b4b352695ac0b40b91ecfe567a2d)",
+    "(-1:8000000000000000, 71363322, rh 3c8fd1448738311338eff52b98b7aa0f29fac9ce80dcc5b6c13cb5819e63316c, fh 141031eb4f1d36607166d4c93a184a3ad7275515a02059d8bcf3d7ceaee6d7ab)",
+    "(-1:8000000000000000, 71363325, rh b98d4e6f61976e1f16f63e07ffe3fefbf1d8b2d6e164d31569be2e9ba73a448a, fh 9339bc4d70bb14862f0b72e2c48fca8a7985e7fd07078afd252e64eb48cc5122)"
+  ],
+  "neighbors": [],
+  "prev_blocks": [],
+  "created_by": "773e6b21cc07fa45bf9ee92f4d8e529da8cb31ee70b426322ccd95472e3659f9",
+  "rand_seed": "0000000000000000000000000000000000000000000000000000000000000000",
+  "now": 1780658693,
+  "contains_ethalon": false,
+  "contains_candidate": true,
+  "notes": "=====> node/src/validator/validate_query.rs:5731 at least one Transaction of account ced9754b94caf8e7a1bb4e90a276200d0f6eb5b99edbac8815b089f703d6c1c2 is invalid : cell underflow, code 9, not enough references to drain, block/src/cell/slice.rs:562"
+}

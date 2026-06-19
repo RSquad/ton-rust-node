@@ -18,14 +18,14 @@ use crate::{
         create_completion_handler, post_callback_closure, post_closure, CompletionHandler,
         CompletionHandlerId, CompletionHandlerPtr, TaskPtr,
     },
-    ton, Any, AsyncRequest, BlockCandidateSignatureVectorPtr, BlockHash, BlockId, BlockPayloadPtr,
-    BlockSignature, CallbackTaskQueuePtr, CompletionHandlerProcessor, HashType, Merge,
-    MovablePoolObject, PrivateKey, PublicKey, PublicKeyHash, SentBlockPtr, SentBlockWrapper,
-    SessionDescription, SessionFactory, SessionId, SessionListenerPtr, SessionNode, SessionOptions,
-    SessionProcessor, SessionProcessorPtr, SessionStatePtr, SessionStateWrapper, TaskQueuePtr,
-    ValidatorBlockCandidateCallback, ValidatorBlockCandidateDecisionCallback,
-    ValidatorBlockCandidatePtr, SKIP_ROUND_CANDIDATE_BLOCKID,
-    TELEGRAM_NODE_COMPATIBILITY_HASHES_BUG,
+    ton, Any, AsyncCollationRequest, AsyncRequest, BlockCandidateSignatureVectorPtr, BlockHash,
+    BlockId, BlockPayloadPtr, BlockSignature, CallbackTaskQueuePtr, CompletionHandlerProcessor,
+    HashType, Merge, MovablePoolObject, PrivateKey, PublicKey, PublicKeyHash, SentBlockPtr,
+    SentBlockWrapper, SessionDescription, SessionFactory, SessionId, SessionListenerPtr,
+    SessionNode, SessionOptions, SessionProcessor, SessionProcessorPtr, SessionStatePtr,
+    SessionStateWrapper, TaskQueuePtr, ValidatorBlockCandidateCallback,
+    ValidatorBlockCandidateDecisionCallback, ValidatorBlockCandidatePtr,
+    SKIP_ROUND_CANDIDATE_BLOCKID, TELEGRAM_NODE_COMPATIBILITY_HASHES_BUG,
 };
 use catchain::{
     check_execution_time, instrument, profiling::ResultStatusCounter, serialize_tl_boxed_object,
@@ -125,6 +125,10 @@ impl AsyncRequest for AsyncRequestImpl {
         self.cancelled.store(true, Ordering::Relaxed);
     }
 }
+
+// Catchain collation requests carry no per-slot deadlines; the collator falls back to
+// its static budgets via the `AsyncCollationRequest` defaults.
+impl AsyncCollationRequest for AsyncRequestImpl {}
 
 impl Drop for AsyncRequestImpl {
     fn drop(&mut self) {
@@ -4022,7 +4026,7 @@ impl SessionProcessorImpl {
 
                 listener.on_generate_slot(
                     source_info_clone,
-                    request as crate::AsyncRequestPtr,
+                    request as crate::AsyncCollationRequestPtr,
                     crate::CollationParentHint::Implicit,
                     callback,
                 );

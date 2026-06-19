@@ -12,7 +12,12 @@ use adnl::{
     node::{AdnlNode, IpAddress},
     DhtNode, OverlayNode, QuicNode, QuicRateLimitConfig,
 };
-use std::{collections::HashSet, net::Ipv4Addr, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    net::{Ipv4Addr, UdpSocket},
+    sync::Arc,
+    time::Duration,
+};
 use tokio_util::sync::CancellationToken;
 use ton_api::{
     deserialize_boxed, serialize_boxed,
@@ -1964,6 +1969,126 @@ fn test_quic_single_sender_invariant() {
         client_token.cancel();
         srv_token.cancel();
         drain_handle.abort();
+    });
+}
+
+/// Regression test: a sender task that exits through the connect-failure path
+/// must release its `active` flag so a later `message()` can spawn a fresh
+/// sender task and reconnect. With the flag stuck, the peer's outbound entry
+/// becomes a blackhole: messages keep queuing but no connect is ever retried
+/// and nothing is delivered even after the peer comes back.
+///
+/// Scenario:
+/// 1. The server port is a blackhole (a bound UDP socket that never answers),
+///    so the client's connect attempt times out and the sender task exits
+///    through the fatal path
+/// 2. The real server then starts on that port with the expected identity
+/// 3. New messages from the client must reach the server via a respawned
+///    sender task
+#[test]
+fn test_quic_message_reconnect_after_connect_failure() {
+    init_test_log();
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        const CLIENT_PORT: u16 = 8400;
+        const SERVER_PORT: u16 = 8401;
+        const RECOVERY_TIMEOUT: Duration = Duration::from_secs(20);
+
+        let client_bind: SocketAddr = format!("127.0.0.1:{CLIENT_PORT}").parse().unwrap();
+        let server_bind: SocketAddr = format!("127.0.0.1:{SERVER_PORT}").parse().unwrap();
+
+        // --- client ---
+        let client_token = CancellationToken::new();
+        let client_key = ed25519_generate_private_key().unwrap().to_bytes();
+        let (_, client_cfg) = AdnlNodeConfig::from_ip_address_and_private_keys(
+            &format!("127.0.0.1:{CLIENT_PORT}"),
+            vec![(client_key, KEY_TAG)],
+        )
+        .unwrap();
+        let client_key_id = client_cfg.key_by_tag(KEY_TAG).unwrap().id().clone();
+
+        let (cli_tx, _cli_rx) = tokio::sync::mpsc::unbounded_channel();
+        let client_sub = Arc::new(TestSubscriber { key_id: client_key_id.clone(), msg_tx: cli_tx })
+            as Arc<dyn Subscriber>;
+        let client = QuicNode::new(
+            vec![client_sub],
+            client_token.clone(),
+            tokio::runtime::Handle::current(),
+            Some(QuicRateLimitConfig::disabled()),
+        );
+        client.add_key(&client_key, &client_key_id, client_bind).unwrap();
+
+        // --- server identity (key created now, server started later) ---
+        let server_key = ed25519_generate_private_key().unwrap().to_bytes();
+        let (_, server_cfg) = AdnlNodeConfig::from_ip_address_and_private_keys(
+            &format!("127.0.0.1:{SERVER_PORT}"),
+            vec![(server_key, KEY_TAG)],
+        )
+        .unwrap();
+        let server_key_id = server_cfg.key_by_tag(KEY_TAG).unwrap().id().clone();
+
+        client.add_peer_key(server_key_id.clone(), server_bind).unwrap();
+        let peers = AdnlPeers::with_keys(client_key_id.clone(), server_key_id.clone());
+
+        // --- Phase A: server port is a blackhole, connect must fail ---
+        // The socket swallows handshake packets without answering, so the
+        // client's connect attempt hits CONNECT_TIMEOUT instead of an ICMP
+        // port-unreachable race
+        let blackhole = UdpSocket::bind(server_bind).unwrap();
+
+        let queued = client.message(b"phase-a".to_vec(), None, &peers).await.unwrap();
+        assert!(queued.is_none(), "expected queued send (no live connection)");
+        println!("Phase A: message queued, waiting for connect failure cycle");
+
+        // Connect attempt times out after CONNECT_TIMEOUT (5s); give the
+        // sender task time to finish its failure cycle and exit
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        println!("Phase A: sender task failure cycle finished");
+
+        // --- Phase B: real server appears on the same port ---
+        drop(blackhole);
+        let srv_token = CancellationToken::new();
+        let (srv_tx, mut srv_rx) = tokio::sync::mpsc::unbounded_channel();
+        let srv_sub = Arc::new(TestSubscriber { key_id: server_key_id.clone(), msg_tx: srv_tx })
+            as Arc<dyn Subscriber>;
+        let server = QuicNode::new(
+            vec![srv_sub],
+            srv_token.clone(),
+            tokio::runtime::Handle::current(),
+            Some(QuicRateLimitConfig::disabled()),
+        );
+        server.add_key(&server_key, &server_key_id, server_bind).unwrap();
+        server.add_peer_key(client_key_id.clone(), client_bind).unwrap();
+        println!("Phase B: server started on previously dead port");
+
+        // Send messages until one is delivered: each message must be able to
+        // respawn the sender task, which reconnects (with stepped backoff)
+        let deadline = tokio::time::Instant::now() + RECOVERY_TIMEOUT;
+        let mut delivered = None;
+        let mut sent = 0usize;
+        while tokio::time::Instant::now() < deadline {
+            let payload = format!("phase-b-{sent}").into_bytes();
+            client.message(payload, None, &peers).await.unwrap();
+            sent += 1;
+            if let Ok(Some(data)) =
+                tokio::time::timeout(Duration::from_millis(500), srv_rx.recv()).await
+            {
+                delivered = Some(data);
+                break;
+            }
+        }
+
+        println!("Phase B: sent {sent} messages, delivered={}", delivered.is_some());
+        let delivered = delivered.expect(
+            "no message delivered after peer recovery - sender task was not \
+             respawned (active flag stuck after connect failure)",
+        );
+        assert!(delivered.starts_with(b"phase-b-"), "delivered payload is not a phase B message");
+
+        client.shutdown();
+        server.shutdown();
+        client_token.cancel();
+        srv_token.cancel();
     });
 }
 

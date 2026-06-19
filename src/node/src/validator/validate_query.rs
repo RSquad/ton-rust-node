@@ -56,14 +56,14 @@ use ton_block::{
     AccountStatus, AccountStorageDictProof, AddSub, Augmentation, Block, BlockCreateStats,
     BlockError, BlockExtra, BlockIdExt, BlockInfo, BlockLimits, Cell, CellType, Coins,
     ConfigParamEnum, ConfigParams, ConsensusExtraData, Counters, CreatorStats, CurrencyCollection,
-    DepthBalanceInfo, Deserializable, EnqueuedMsg, FundamentalSmcAddresses, GlobalCapabilities,
-    HashmapAugType, HashmapType, InMsg, InMsgDescr, KeyExtBlkRef, KeyMaxLt, LibDescr, Libraries,
-    McBlockExtra, McShardRecord, McStateExtra, MerkleProof, MerkleUpdate, Message, MsgAddressInt,
-    MsgEnvelope, MsgMetadata, OutMsg, OutMsgDescr, OutMsgQueueKey, Result, Serializable,
-    ShardAccount, ShardAccountBlocks, ShardAccounts, ShardFeeCreated, ShardHashes, ShardIdent,
-    ShardStateUnsplit, SizeLimitsConfig, SliceData, StateInitLib, TopBlockDescrSet, TrComputePhase,
-    Transaction, TransactionDescr, UInt15, UInt256, ValidatorSet, ValueFlow, WorkchainDescr,
-    INVALID_WORKCHAIN_ID, MASTERCHAIN_ID, MAX_SPLIT_DEPTH,
+    DepthBalanceInfo, Deserializable, EnqueuedMsg, ExceptionCode, FundamentalSmcAddresses,
+    GlobalCapabilities, HashmapAugType, HashmapType, InMsg, InMsgDescr, KeyExtBlkRef, KeyMaxLt,
+    LibDescr, Libraries, McBlockExtra, McShardRecord, McStateExtra, MerkleProof, MerkleUpdate,
+    Message, MsgAddressInt, MsgEnvelope, MsgMetadata, OutMsg, OutMsgDescr, OutMsgQueueKey, Result,
+    Serializable, ShardAccount, ShardAccountBlocks, ShardAccounts, ShardFeeCreated, ShardHashes,
+    ShardIdent, ShardStateUnsplit, SizeLimitsConfig, SliceData, StateInitLib, TopBlockDescrSet,
+    TrComputePhase, Transaction, TransactionDescr, UInt15, UInt256, ValidatorSet, ValueFlow,
+    WorkchainDescr, INVALID_WORKCHAIN_ID, MASTERCHAIN_ID, MAX_SPLIT_DEPTH,
 };
 #[cfg(feature = "xp25")]
 use ton_block::{ShardDescr, SHARD_FULL};
@@ -2286,9 +2286,14 @@ impl ValidateQuery {
             base.next_block_descr,
             base.value_flow
         );
-        // if !base.value_flow.validate() {
-        //     reject_query!("ValueFlow of block {} is invalid (in-balance is not equal to out-balance)", base.block_id())
-        // }
+        if !base.value_flow.validate().map_err(|err| {
+            error!("Cannot validate ValueFlow of block {}: {err}", base.block_id())
+        })? {
+            reject_query!(
+                "ValueFlow of block {} is invalid (in-balance is not equal to out-balance)",
+                base.block_id()
+            )
+        }
         if !base.shard().is_masterchain() && !base.value_flow.minted.is_zero()? {
             reject_query!(
                 "ValueFlow of block {} \
@@ -3227,11 +3232,19 @@ impl ValidateQuery {
         if prev.out_queue_size <= base.limits.defer_out_queue_size_limit as usize {
             // Check that at least one message was taken from each AccountDispatchQueue
             let mut total_account_dispatch_queues = 0;
-            prev.dispatch_queue().iterate_slices(|_, _| {
+            let res = prev.dispatch_queue().iterate_slices(|_, _| {
                 total_account_dispatch_queues += 1;
                 Ok(total_account_dispatch_queues <= processed_account_dispatch_queues)
-            })?;
-            if total_account_dispatch_queues != processed_account_dispatch_queues {
+            });
+            let have_unprocessed_account_dispatch_queue = if let Err(err) = res {
+                if err.downcast_ref() != Some(&ExceptionCode::PrunedCellAccess) {
+                    return Err(err);
+                }
+                true
+            } else {
+                total_account_dispatch_queues != processed_account_dispatch_queues
+            };
+            if have_unprocessed_account_dispatch_queue {
                 base.result.have_unprocessed_account_dispatch_queue.store(true, Ordering::Relaxed);
             }
         }
@@ -5550,8 +5563,16 @@ impl ValidateQuery {
         match executor.execute_with_params(in_msg_cell, account, params) {
             Ok(mut trans_execute) => {
                 // For an account whose storage roots are unchanged we can just update `used` info
-                // without dictionary reconstruction
-                if account.precalc_storage_stat()?.map(|stat| stat.is_changed()).unwrap_or(false) {
+                // without dictionary reconstruction — UNLESS the account is large enough to need a
+                // dict but still has none.
+                let stat_changed =
+                    account.precalc_storage_stat()?.is_some_and(|stat| stat.is_changed());
+                let needs_initial_dict = !base.shard().is_masterchain()
+                    && account.dict_hash().is_none()
+                    && account
+                        .storage_info()
+                        .is_some_and(|info| info.used().cells() >= dict_hash_min_cells as u64);
+                if stat_changed || needs_initial_dict {
                     *storage_dict = account.calc_storage_stat_dict(dict_hash_min_cells)?;
                 }
                 #[cfg(test)]

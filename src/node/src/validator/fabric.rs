@@ -285,6 +285,10 @@ pub async fn run_collate_query(
     set: ValidatorSet,
     engine: Arc<dyn EngineOperations>,
     is_simplex: bool,
+    requires_real_state_update: bool,
+    collation_budget_anchor: Option<SystemTime>,
+    soft_deadline: Option<SystemTime>,
+    hard_deadline: Option<SystemTime>,
 ) -> Result<(Arc<ValidatorBlockCandidate>, Arc<ShardStateStuff>, Block, Cell)> {
     let labels = [("shard", shard.to_string())];
     metrics::gauge!("ton_node_collator_active", &labels).increment(1.0);
@@ -302,10 +306,14 @@ pub async fn run_collate_query(
         None,
         CollatorSettings {
             is_simplex,
+            requires_real_state_update,
             min_gen_utime_ms: Some(
                 min_ts.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis()
                     as u64,
             ),
+            collation_budget_anchor,
+            soft_deadline,
+            hard_deadline,
             ..Default::default()
         },
     )?;

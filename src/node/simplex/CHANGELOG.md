@@ -2,7 +2,445 @@
 
 All notable changes to the Simplex Consensus Protocol implementation will be documented in this file.
 
-## [Unreleased]
+## [1.1.0] - 2026-06-18
+
+Collation timeout / window-budget C++ parity, plus the C++ parity
+baseline re-pin onto mainline `master`. The Rust collator now mirrors the C++
+block producer's two-tier timeout model end-to-end, removing the within-window
+collation-cancellation / retry storm that could starve block production under a
+slow collator, plus a comment/documentation polish pass over the collation
+controller. This release also re-pins the parity baseline from the moving
+`testnet` branch onto `master` and re-verifies wire-compatibility against a
+freshly built C++ reference. It additionally completes the phase-controller
+family by extracting the candidate domain out of `SessionProcessor`
+into a dedicated `CandidateController` (behavior-neutral code motion).
+
+**C++ baseline**: re-pinned to mainline `master` @
+[`8e6f0917`](https://github.com/ton-blockchain/ton/commit/8e6f09172dc95ba3d302cc52ccc3fa9169ef0760)
+(2026-05-31, the #2410 `testnet` → `master` merge that landed Simplex in
+mainline), `validator/consensus/simplex` — replacing the previous moving
+`testnet`-branch reference. No on-wire protocol changes.
+
+### Changed
+
+#### C++ parity baseline re-pinned to mainline `master`
+
+- Upstream [#2410](https://github.com/ton-blockchain/ton/pull/2410)
+  (`testnet` → `master`, 2026-05-31) landed Simplex in ton-blockchain/ton
+  mainline, so the parity baseline is now pinned to a fixed commit —
+  [`8e6f0917`](https://github.com/ton-blockchain/ton/commit/8e6f09172dc95ba3d302cc52ccc3fa9169ef0760)
+  (`master`, 2026-05-31), `validator/consensus/simplex` — replacing the moving
+  `testnet`-branch reference in the README / source map. Verified wire-compatible
+  against a freshly built C++ `validator-engine` at this commit via the mixed
+  5×5 Rust/C++ QUIC simplex network test (0 stalls / 0 isolations; 5/5 Rust +
+  5/5 C++ nodes producing blocks); the crate suite passed 799/0
+  (`cargo test -p simplex --all-targets`). The block-sync overlay on top of this
+  baseline (C++ #2380) stays opt-in (`enable_observers`, ConfigParam 30, default
+  off), so the default consensus-overlay candidate path remains byte-compatible.
+
+#### Collation timeout / window-budget parity
+
+- **Absolute collation deadlines.** Soft / hard collation deadlines are now
+  absolute `SystemTime` instants, so every attempt for a slot shares one budget.
+  The soft cutoff caps message intake to roughly one slot
+  (`min(budget_anchor + cutoff_timeout_ms, slot_start + target_rate)`); the hard
+  cap is the leader-window end (the next leader's producer owns the chain past it).
+  Mirrors C++ `block-producer.cpp` / `collator.cpp`.
+- **Explicit collation budget anchor.** The collator's percentage-based
+  message-intake sub-budgets are measured from a dedicated budget anchor — the
+  dispatch instant (shardchains dispatch `target_rate` before the slot start, the
+  masterchain at the slot start) — rather than the request creation time /
+  `min_gen_time`. On shardchains, where the soft deadline equals the slot start,
+  this keeps the intake window non-zero (the early-dispatch lead) instead of
+  collapsing every sub-budget to zero; late-start external/clean sub-phases are
+  also clamped to the absolute soft cutoff so they cannot overshoot it. Catchain /
+  non-simplex paths carry no anchor and keep the static `cutoff_timeout_ms` /
+  `stop_timeout_ms` behavior.
+- **Collation deadlines on a dedicated request trait.** The soft / hard deadlines
+  and budget anchor are exposed through a new `AsyncCollationRequest: AsyncRequest`
+  sub-trait (`get_collation_soft_deadline` / `get_collation_hard_deadline` /
+  `get_collation_budget_anchor`); `on_generate_slot` now takes an
+  `AsyncCollationRequestPtr`. The base `AsyncRequest` (shared with the validation
+  path) stays free of collation-only timing, and Catchain inherits the `None`
+  defaults.
+- **Single in-flight real collation per window.** A leader runs at most one real
+  collation at a time (`block_generation_active`); a second dispatch is declined
+  while one is in flight, matching the C++ `block_generation` single-await.
+- **Per-slot empty fillers + late re-tag.** While a real collation overruns its
+  slot, a per-slot deadline wake publishes state-preserving empty fillers for the
+  elapsed slots and keeps the real alive; when the real finally completes it is
+  re-tagged onto the current chain head rather than its original (now-occupied)
+  slot, avoiding equivocation. Mirrors the C++ `await_with_timeout` loop.
+- **`allow_empty` finalization-staleness gate.** Empty fillers are suppressed
+  once consensus has not finalized anything for `no_empty_blocks_on_error_timeout`
+  (default 15s), so filling cannot deepen a finalization stall; the producer keeps
+  waiting for a real block instead.
+- **Strict genuine-error path.** A collation error recovers by publishing one
+  empty block (when `allow_empty` holds and a parent is available, re-tagging past
+  any fillers), drops the slot if its leader window already moved on, or otherwise
+  restarts the slot once after a 100 ms backoff sharing the same window budget. The
+  restart reuses the original attempt's pinned soft / hard deadlines and budget
+  anchor, so retries race the same window-end budget instead of recomputing a fresh
+  full-window budget from the (now advanced) clock.
+- **Stale in-flight cleanup on window change.** When the leader window advances
+  while a real collation is still tracked, the `block_generation_active` marker is
+  cleared and its pending request cancelled (on both the main pipeline tick and the
+  per-slot wake), so the single in-flight guard cannot wedge the new window with a
+  collation the next leader now owns.
+- **Callback-safe collation guard.** `ValidatorGroup::on_generate_slot` now reports
+  an error through the collation callback when the `is_collating` guard is already
+  held, instead of silently dropping the request — under simplex the callback is
+  the only signal back to the controller, so a dropped request would otherwise
+  strand the in-flight marker.
+
+#### Session architecture: candidate domain extracted to `CandidateController`
+
+- Completes the phase-controller family started in [1.0.0]: the candidate domain
+  moves out of `SessionProcessor` into a dedicated `CandidateController`
+  (`candidate_controller.rs`) behind a narrow `CandidateBackend` split-borrow seam,
+  mirroring the collation / validation / consensus controllers. Behavior-neutral —
+  a controller boundary plus code motion only; the wire format and `*Listener`
+  seams are untouched.
+- **State ownership.** The `CandidateBook` (received candidates + data caches) and
+  the `requested_candidates` repair throttle now live on the controller; other
+  aspects source the book through `book()` / `book_mut()` at the composition root.
+- **Ingress.** `CandidateController::receive_candidate` runs precheck →
+  parse/verify → dedup → book/cache/DB-persist and returns an `IngressOutcome`;
+  `SessionProcessor::on_candidate_received` is now a thin shell performing the
+  cross-controller fan-out synchronously in the historical order (before-split
+  insert → observe callback → consensus retry → notar-cert path → validation
+  registration → `check_all`).
+- **Outbound repair + serving.** `ensure_candidate_available` / `request_candidate`
+  and the throttle move to the controller (delayed retries re-enter through its
+  `ControllerQueue`); the `RequestCandidate` serving fallback moves with them. The
+  `BlockIdExt → RawCandidateId` resolve is split: collation's generated-parent half
+  via the backend, ORed with the controller's own book.
+- The candidate-received trace event (`record_candidate_received`,
+  `is_collator = false`) and the relayed-broadcast acceptance precheck move onto the
+  controller intact, preserving behavior through the extraction.
+- Removed now-dead `CollationController::resolve_candidate_id_by_block_id` and its
+  `book_candidate_id_by_block_id` backend seam (their only purpose was the inlined
+  resolve, now split at the new owner).
+
+### Removed
+
+- **Breaking (`SessionOptions`).** `SessionOptions::collation_retry_timeout` and
+  `SessionOptions::collation_retry_max_attempts` are removed. The configurable
+  collation-retry loop is retired in favor of the window-bounded model above; a
+  genuine error now recovers with an empty block or a single fixed-backoff restart,
+  never an attempt-count storm. _Migration_: drop both fields from any
+  `SessionOptions` initializer — the new behavior is unconditional and needs no
+  configuration. The protobuf telemetry field `collation_retry_max_attempts` is
+  retained for wire compatibility and reported as `0`.
+
+### Documentation
+
+- Polished the collation-controller comments: dropped PR scaffolding (C++
+  `block-producer.cpp:NNN` line numbers and step identifiers) in favor of durable
+  file / function references, and corrected comments left stale mid-development
+  (e.g. the `RealCollationState` "no decision reads it yet" note and the
+  over-broad `#[allow(dead_code)]`, now narrowed to the one test-only field).
+- `README.md`: new window-bounded-collation semantics bullet, a refreshed
+  `no_empty_blocks_on_error_timeout` description, the resolved-parity note, and
+  updated test counts.
+- `README.md`: pinned the C++ parity baseline to `master` @ `8e6f0917`
+  (reference table + footer) and restructured the parity gaps into a link-free
+  `Parity state` section (protocol + implementation gap tables).
+- `README.md`: added `CandidateController` to the component architecture
+  (diagram, source tree, and controller table) and moved the `CandidateBook` from
+  a standalone aspect to controller-owned state, reflecting the extraction.
+- `Cargo.toml` crate version bumped `1.0.0` → `1.1.0`.
+
+### Tests
+
+- Simplex lib test count grew to 783 (`#[test]` in `node/simplex/src/`); 16
+  integration + 6 doctests unchanged. New coverage: absolute soft/hard
+  `collation_deadlines`, the single in-flight guard, the per-slot deadline wake
+  (filler publish / staleness suppression / re-arm / stale-wake no-op), late
+  re-tag on completion, the `allow_empty` gate, the genuine-error recovery /
+  single-restart / stale-window-drop paths, restart deadline pinning across a clock
+  advance, and stale-window `block_generation_active` cleanup.
+- Node-side collator/validator-group coverage for the budget anchor: shard
+  `soft_deadline == slot_start` still yields a non-zero intake budget, late-start
+  external intake is clamped to the absolute soft cutoff, the no-anchor fallback
+  keeps the static budget, and `on_generate_slot` reports a callback error when the
+  `is_collating` guard is already held.
+- `CandidateController` coverage (`src/tests/test_candidate_controller.rs`): a
+  `FakeCandidateBackend` + recording queue exercise the repair
+  `BlockIdExt → RawCandidateId` resolve fork and the request throttle; the existing
+  `SessionProcessor` candidate tests were repointed to `#[cfg(test)]` accessors,
+  and the relayed-broadcast acceptance test was preserved through the move.
+
+## [1.0.0] - 2026-06-16
+
+First stable release of the Rust Simplex consensus crate. Wire-compatible with
+the upstream C++ implementation and validated in mixed Rust/C++ validator
+networks. This release consolidates the controller-based session architecture,
+candidate-relay liveness and restart-safety parity fixes, the canonical source
+reorganization, and a full documentation overhaul aligned to the protocol spec,
+the C++ baseline, and the shipping Rust code.
+
+**C++ baseline**: unchanged from [0.7.1] — upstream
+[ton-blockchain/ton](https://github.com/ton-blockchain/ton)
+`testnet/validator/consensus/simplex`. No breaking on-wire protocol changes vs
+0.7.1; this is an architecture, quality, and documentation milestone.
+
+### Changed
+
+#### Session architecture: kernel + coordinator + controllers + aspects
+
+- `SessionProcessor` is now a thin SXMAIN coordinator that owns no consensus
+  policy. Each consensus phase moved to a dedicated controller reached through a
+  `with_*_backend` split-borrow seam:
+  - `CollationController` (`collation_controller.rs`) — collation, precollation,
+    empty-block recovery, collation pacing.
+  - `ValidationController` (`validation_controller.rs`) — candidate-validation
+    pipeline and missing-parent repair scheduling.
+  - `ConsensusController` (`consensus_controller.rs`) — vote/cert ingress and
+    egress, FSM finalization handlers, the recursive finalization walk, and the
+    masterchain applied-top tracking.
+  - `ControllerQueue` (`controller_queue.rs`) — re-entrancy-safe task posting so
+    controllers bounce re-entrant work onto SXMAIN instead of recursing.
+- Cross-cutting session state moved to data-owning aspects: `SessionRuntime`,
+  `SessionTelemetry`, `CandidateBook`, `DatabaseController`, `SessionCallbacks`,
+  and the SXRCV -> SXMAIN `ReceiverCallbacks` adapter.
+- Every extracted module was sectioned, had its visibility minimized, and had
+  dead code / stale `#[allow(dead_code)]` attributes removed.
+
+#### Canonical source reorganization
+
+- Canonical section banners across `simplex/src`, concern-grouped `impl` splits,
+  and value-ranked method ordering in the large files.
+- `simplex_state.rs` and `receiver.rs` fully reordered into lifecycle-layered
+  sections (verified pure relocation via code-line multiset comparison), with
+  the slot/window diagnostic types co-located with the FSM.
+- Removed dead `SlotDiagnostic` / `WindowDiagnostic` fields surfaced after
+  dropping the masking `#[allow(dead_code)]` attributes.
+
+#### Documentation overhaul for 1.0.0
+
+- `README.md` rewritten to the shipping architecture: a kernel / coordinator /
+  controllers / aspects component map, corrected quorum thresholds
+  (`(W*2)/3 + 1` and `W/3 + 1`), the full `SessionOptions` table, a metrics
+  catalog reconciled against `session_telemetry.rs`, the spec Rule 1-8
+  concept-to-code map, and a refreshed test inventory (734 unit + 16 integration
+  + 6 doctests).
+- Pruned changelog-style history and cosmetic doc comments from the README and
+  rustdoc, repaired intra-doc links, and cross-linked
+  README <-> CHANGELOG <-> spec <-> C++ <-> source.
+- Bumped the crate version to `1.0.0`.
+
+### Fixed
+
+- **Candidate-relay liveness.** Accept relayed leader-signed
+  candidates for C++ parity; reject empty / zero-weight validator sets in repair
+  notar verification; restart no longer skips a `voted_final` slot; recover the
+  body of a finalization-blocking candidate.
+- **Skip-base panic.** Defer skip-window publication until the
+  progress-cursor base repair completes.
+- **Consensus DB cleanup.** Log-level, doc, and test fixes in the
+  consensus DB path.
+
+## [0.7.1] - 2026-06-09
+
+Maintenance + parity release: **async DB persistence moved off the SXMAIN
+consensus thread**, **restart-recovery hardening** (skip/final-cert replay,
+base repair across already-skipped slots, deferred window publication),
+**non-fatal invariant handling** (skipscan, finalized-callback dedup,
+far-future FinalCert), **requestCandidate repair validation**, **shard
+collation timing parity**, and the opt-in **block-sync overlay (observers)**
+ingress path. ~40 non-merge commits since v0.7.0.
+
+**C++ baseline**: upstream [ton-blockchain/ton](https://github.com/ton-blockchain/ton)
+`testnet/validator/consensus/simplex` at local mirror commit `6655bbdd`
+(fast-forwarded 2026-04-24; +19 commits over the v0.7.0 `5cbcc5d3`
+baseline). This is the snapshot the `validator-engine` binary is built from
+for the mixed Rust/C++ 5x5 simplex network acceptance test
+(`node/tests/test_run_net_py/run_test_mixed_5x5_simplex.sh`).
+
+**Milestones**
+- The SXMAIN consensus thread no longer blocks on RocksDB latency: every
+  SYNC-CRITICAL persist (pool state, our-vote-before-broadcast, the three
+  cert handlers, candidate-info waits, and the MC finalized record) is
+  handed to a per-session pending-async-DB-results registry and completed
+  from a `check_all()` continuation, preserving the persist-before-action
+  ordering and matching the C++ db-actor model.
+- Restart recovery replays persisted skip and final certificates and
+  repairs the progress-cursor `available_base` across already-skipped
+  slots before live ingress is accepted — fixing the releasenet stall
+  where `slot_np` advanced through skipped slots while `slot_nf` and the
+  finalized seqno stayed frozen.
+- Invariant breaches that previously panicked the validator (broken
+  skipscan boundary, duplicate finalized callback per seqno, far-future
+  FinalCert base) now degrade gracefully with bounded fallbacks and
+  idempotent guards.
+
+### Added
+
+#### Async DB persistence registry (off SXMAIN `wait()`)
+
+- `SessionProcessor::post_async_db_result(label, result, timeout, on_ready)`
+  registers an in-flight async DB result with a one-shot continuation and
+  arms `set_next_awake_time(now + ASYNC_DB_POLL_DELAY)` (5 ms cadence) so
+  SXMAIN re-polls without busy-waiting.
+- `PendingAsyncDbEntry` (`id`, `op_label`, `result`, `registered_at`,
+  `deadline`, `on_ready`) and the `pending_async_db_results` registry on
+  `SessionProcessor`.
+- `process_pending_async_db_results()` drains ready entries via `try_get()`
+  from `check_all()` (next to `process_delayed_actions()`), fires
+  continuations on Ok/Err, times out past-deadline entries with
+  `Err("<label>: db wait timed out")`, and re-arms the wake for still-pending
+  entries. Default per-write timeout `DEFAULT_ASYNC_DB_WRITE_TIMEOUT` = 30 s,
+  measured on session time (overridable by the test clock).
+- New metrics: `simplex_async_db_pending_count` (gauge),
+  `simplex_async_db_timeout_total` (counter),
+  `simplex_async_db_completion_latency_ms` (histogram).
+- `consensus-common`: typed `StorageResultAlreadyTaken` sentinel (with a
+  manual `Display` preserving the legacy text) replaces the stringly-typed
+  `err.to_string().contains("result already taken")` match — zero-alloc,
+  zero false-positive (`downcast_ref::<StorageResultAlreadyTaken>()`).
+
+#### Block-sync overlay (observers) — opt-in, C++ #2380 parity
+
+- `SessionOptions::enable_observers` (default `false`) maps to
+  `SimplexConfig.enable_observers` (ConfigParam 30). When enabled, block
+  candidates propagate over a dedicated block-sync overlay and candidate
+  broadcasts arriving on the consensus private overlay are dropped at
+  ingress (mirrors C++ `private-overlay.cpp`).
+- `consensus.blockSyncOverlayId` TL type + `utils::compute_block_sync_overlay_short_id(session_id)`.
+  The block-sync seed excludes the validator-set node list, so its short id
+  differs from the consensus overlay's even for the same `session_id`;
+  byte-equal with C++ via `test_block_sync_overlay_id_matches_cpp`.
+- New counter `simplex_receiver_in_broadcasts_dropped_observers`.
+
+#### Shard collation timing parity
+
+- `compute_collation_timing()` returns `CollationTiming { dispatch_time,
+  min_gen_time, start_collate_before, parent_gen_utime_ms }`. Shard
+  collation now dispatches at `slot_start - target_rate` (the block utime
+  stays `slot_start`), matching C++ `block-producer.cpp`; masterchain
+  dispatch is unchanged. Replaces `compute_collation_start_time()`.
+- Per-dispatch INFO `COLLATION_TIMING` log (shard, slot, parent,
+  parent_gen_utime, dispatch / min-gen instants, start-collate-before delta)
+  for production parity verification.
+
+### Changed
+
+#### Restart / startup recovery
+
+- Replay persisted `SkipCert` and `FinalCert` records
+  before restart skip generation, so a restarted validator repairs its
+  progress cursor from certificate-backed evidence before accepting live
+  ingress. A persisted `FinalCert` is now accepted as parent evidence in
+  `get_latest_notarized_candidate_up_to` (finalization implies
+  notarization), matching C++ `pool.cpp::advance_present()`.
+- `set_available_base_after_restart()` detects a first-non-finalized slot
+  that already carries a skip certificate and immediately runs
+  `propagate_base_after_skip_cert()` +
+  `advance_leader_window_on_progress_cursor()` to carry the seeded base to
+  the first non-skipped successor, matching the C++
+  base-propagation invariant.
+- Leader-window publication is suppressed until startup replay completes,
+  preventing restored out-of-order certs from advancing into baseless
+  windows. `repair_progress_cursor_base_after_startup_replay()` reconstructs
+  `available_base` after replay.
+
+#### Async migration of SYNC-CRITICAL DB callers
+
+- `maybe_store_pool_state`, `persist_our_vote_before_broadcast`,
+  `handle_{notarization,skip_certificate,finalization}_reached`,
+  candidate-info waits (`ensure_candidate_info_stored`), and
+  `maybe_apply_finalized_state` were migrated off blocking `result.wait()`
+  to the async-DB registry. The in-memory cursor / local state advances
+  synchronously before the persist and all post-persist side effects (vote
+  broadcast, cert relay, notar/standstill caching, recursive finalized
+  walk) run from the continuation, preserving pre-migration ordering and
+  the persist-before-action invariant.
+- Session-stop teardown: `SessionProcessor::stop()` drains the registry
+  (bounded by `SHUTDOWN_DRAIN_TIMEOUT` = 10 s, including chained
+  continuations) and then calls `db.sync(SHUTDOWN_DB_SYNC_TIMEOUT = 30 s)`,
+  surfacing shutdown-time DB latency / failures with logging — matching
+  C++ `bridge.cpp::destroy_inner()` close ordering. Shutdown drain / sync
+  deadlines use wall-clock time (`wall_now()`) so a stuck writer cannot
+  park `stop()` forever even under a frozen manual clock.
+
+### Fixed
+
+- **Validator panic on a broken skipscan invariant**:
+  `SimplexState::find_next_nonskipped_slot` now returns `Option<SlotIndex>`
+  with a bounded forward-scan fallback (`is_slot_skipped_cert` walk) and a
+  once-per-session error-log latch instead of `panic!`/`assert!`. Callers
+  (`propagate_base_after_notarization`, `propagate_base_after_skip_cert`)
+  degrade gracefully on `None`: warn, still advance the progress cursor and
+  re-check pending blocks, and (skip-cert path) unconditionally erase the
+  stale `skip_intervals` boundary for C++ parity. The skip-interval
+  `BTreeSet` fast path mirrors C++ `pool.cpp::next_nonskipped_slot_after()`
+  unchanged; the fallback only runs on observed corruption.
+- **Validator panic on a duplicate finalized callback per seqno**:
+  the seqno-keyed dedup is promoted to `FinalizedSeqnoRecord { slot,
+  block_id }` and pruned in lock-step with `finalized_delivery_sent` in
+  `cleanup_old_slots`; the duplicate-seqno guard is idempotent on an
+  identical `block_id` (re-seeds the slot-keyed dedup and returns) and only
+  asserts when a genuinely different block would be delivered for the same
+  seqno.
+- **Validator panic on a far-future FinalCert**: a `WindowAlloc`
+  policy (`BoundedByHorizon` / `VerifiedCertificate`) threaded through
+  `ensure_window_exists` / `get_slot_mut` / `find_next_nonskipped_slot` /
+  `is_slot_skipped_cert_at` lets verified-certificate paths materialize
+  slots beyond `max_acceptable_slot()` (mirrors C++ `state.slot_at()`);
+  `apply_final_cert_parent_chain_for_verified_certificate()` writes the
+  successor `available_base` before `advance_progress_cursor()` runs,
+  eliminating the "base unknown for progress cursor slot" panic.
+- **Spurious `result already taken` cert-handler errors**: the per-slot cert
+  dedup maps share one in-flight persist handle, so a second registry
+  continuation observes the `Taken` sentinel rather than a real failure.
+  The three cert handlers now classify it as a benign redundant wake (TRACE,
+  no `increment_error()`, no side effects), removing ~200-290 false ERROR
+  lines per node per 6-minute soak. Centralized in the free helper
+  `is_storage_result_already_taken()`.
+- **requestCandidate repair validation**: reject
+  `consensus.block` responses with empty inner candidate bytes and require a
+  slot-leader candidate signature before repair data is merged into resolver
+  state or served from cache; the C++-compatible partial-merge / serving-cache
+  behavior for trusted parts is preserved.
+- `ensure_candidate_info_stored` combined-wait (candidateInfo + notarCert)
+  is now a real runtime guard (log + `increment_error()` + `on_complete(Err)`),
+  not a release-build silent fall-through, with the `debug_assert!` retained
+  as a dev-time tripwire.
+
+### Internal / refactor
+
+- `SlotWaitPhase`, `SlotDiagnostic`, `WindowDiagnostic` (and `Display for
+  SlotWaitPhase`) moved from `session_processor.rs` to `simplex_state.rs`
+  as `pub(crate)` siblings of `SimplexState`,
+  breaking the `simplex_state` ↔ `session_processor` import cycle. No
+  behavioral change.
+- `Ed25519KeyOptionFactory` removed; crate crypto helpers refactored off
+  `ton_block` (e.g. `KeyId`-based block-sync overlay id computation).
+
+### Tests
+
+- Lib test count grew to ~559 (`#[test]` in `node/simplex/src/`); 16
+  integration + 6 doc-tests unchanged.
+- New coverage: async-DB registry infrastructure, per-caller migration
+  (`maybe_store_pool_state`, vote persist, cert handlers, finalized state),
+  shutdown drain incl. chained continuations,
+  `is_storage_result_already_taken` benign classification, skipscan
+  no-panic fast-path / fallback / caller paths, finalized-callback seqno
+  dedup + same-block idempotency + lock-step pruning, far-future FinalCert
+  base repair (panic → repaired state), `test_tn1401_restart_base_repair_crosses_already_skipped_slot`,
+  startup skip/final-cert replay + progress-cursor base repair,
+  requestCandidate repair body/signature validation, and
+  `test_block_sync_overlay_id_matches_cpp`.
+
+### Documentation
+
+- README version bumped to 0.7.1; `Current semantics` extended with the
+  async-DB registry, restart-recovery base repair, and the opt-in block-sync
+  overlay; `SessionOptions` table gains `enable_observers`; the metrics
+  catalog gains the async-DB and observers families; the utils table gains
+  `compute_block_sync_overlay_short_id`.
+- `Cargo.toml` / `Cargo.lock` crate version bumped `0.7.0` → `0.7.1`.
 
 ## [0.7.0] - 2026-04-21
 
@@ -858,6 +1296,9 @@ Major release focusing on candidate resolution, certificate system, and operatio
 
 | Version | Date | Tag | Description |
 |---------|------|-----|-------------|
+| 1.1.0 | 2026-06-18 | `simplex-1.1.0` | Collation timeout / window-budget C++ parity (absolute soft/hard collation deadlines, a single in-flight real collation with per-slot empty fillers + late re-tag, the `allow_empty` finalization-staleness gate, and a strict genuine-error path; retires the `collation_retry_*` SessionOptions) + C++ parity baseline re-pinned to mainline `master` @ `8e6f0917`, re-verified wire-compatible via mixed 5×5 Rust/C++ |
+| 1.0.0 | 2026-06-16 | `simplex-1.0.0` | First stable release: controller-based session architecture (kernel + coordinator + controllers + aspects), candidate-relay liveness & restart-safety parity fixes, canonical source reorganization, full documentation overhaul aligned to spec + C++ + code |
+| 0.7.1 | 2026-06-09 | `simplex-0.7.1` | Async DB persistence off the SXMAIN thread, restart-recovery hardening (skip/final-cert replay + base repair), non-fatal invariant handling (skipscan / finalized dedup / far-future FinalCert), requestCandidate repair validation, shard collation timing parity, opt-in block-sync overlay (observers) |
 | 0.7.0 | 2026-04-21 | `simplex-0.7.0` | State resolver for ghost-parent collation, cert order + DB-wait-order durability, bootstrap-deadlock fixes, bad-signature peer-ban DoS hardening, per-session Prometheus republishing |
 | 0.6.0 | 2026-04-08 | `simplex-0.6.0` | Finalized-driven delivery, C++ parity overhaul, legacy mode removal, stall diagnostics |
 | 0.5.0 | 2026-03-20 | `simplex-0.5.0` | Committed-block proof recovery, restart gremlin fix, requestCandidate2 removal, parity docs update |

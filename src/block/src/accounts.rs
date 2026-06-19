@@ -947,6 +947,13 @@ impl Account {
         }
     }
 
+    /// Seed the storage-stat hint from VM-loaded cells.
+    pub fn add_storage_stat_hint(&mut self, loaded: &std::collections::HashSet<UInt256>) {
+        if let Some(stuff) = self.stuff_mut() {
+            stuff.storage_stat.add_hint(loaded);
+        }
+    }
+
     pub fn del_storage_stat(&mut self) {
         if let Some(stuff) = self.stuff.as_mut() {
             stuff.storage_info.storage_extra.dict_hash = None;
