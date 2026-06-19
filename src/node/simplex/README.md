@@ -588,7 +588,6 @@ Cryptographic and utility functions:
 | `sign_vote()` | Sign a vote with session-scoped signature |
 | `verify_vote_signature()` | Verify vote signature |
 | `extract_vote()` | Extract FSM vote from TL signed vote |
-| `compute_block_sync_overlay_short_id()` | Compute the block-sync overlay short id from a session id (C++ `block-sync-overlay.cpp` parity; seed excludes the node list) |
 
 **Session-scoped signatures**: All signatures are wrapped with the session ID using `consensus.dataToSign` TL type to prevent cross-session replay attacks.
 
@@ -749,7 +748,7 @@ Multi-instance consensus tests with in-process overlay.
 | `test_simplex_consensus_shard_with_mc_notifications` | MC finalization forwarding to shards | ✅ |
 | `test_simplex_consensus_adnl_overlay` | ADNL overlay-based consensus | ✅ |
 | `test_simplex_consensus_adnl_net_gremlin` | ADNL net gremlin (packet loss/delay simulation) | ✅ |
-| `test_simplex_consensus_restart_gremlin` | Restart gremlin (stop/restart with DB persistence) | ✅ (residual flakiness tracked separately) |
+| `test_simplex_consensus_restart_gremlin` | Restart gremlin (stop/restart with DB persistence) | ✅ (residual flakiness tracked in [TN-1085](https://rsquad-blockchain-lab.atlassian.net/browse/TN-1085) / [NODE-136](https://linear.app/rsquad/issue/NODE-136/simplex-restart-gremlin-stability-1-fix-timeout-in-test-simplex)) |
 | `test_simplex_consensus_candidate_chaining` | Candidate chaining within leader windows | ✅ |
 | `test_simplex_consensus_candidate_chaining_with_lossy_overlay` | Candidate chaining with packet loss | ✅ |
 | `test_simplex_consensus_ghost_parent_resolver_probe` | Ghost-parent state-resolver repair probe | ✅ |
@@ -872,7 +871,6 @@ TL schema messages from `tl/ton_api/tl/ton_api.tl`:
 | `consensus.simplex.certificate` | Vote + signatures (for queries) |
 | `consensus.simplex.candidateAndCert` | Candidate + notarization cert (query response) |
 | `consensus.simplex.requestCandidate` | Query for missing candidate (RPC) |
-| `consensus.blockSyncOverlayId` | Block-sync overlay seed (session_id only) for `enable_observers` |
 
 ### Signature Scheme
 
@@ -944,7 +942,6 @@ All metrics use the `simplex_` prefix. Latency histograms use `time:` prefix (va
 | `simplex_finalized_pending_body_count` | Finalized blocks waiting for body arrival | `handle_block_finalized()`, cleanup, materialization |
 | `simplex_first_non_finalized_slot` | First non-finalized slot (FSM) | `check_all()` |
 | `simplex_first_non_progressed_slot` | First non-progressed slot (FSM) | `check_all()` |
-| `simplex_async_db_pending_count` | In-flight async DB persist continuations | `process_pending_async_db_results()` |
 
 #### Histograms
 
@@ -983,7 +980,6 @@ All metrics use the `simplex_` prefix. Latency histograms use `time:` prefix (va
 | `simplex_standstill_triggers` | Standstill detection triggers |
 | `simplex_standstill_votes_rebroadcast` | Votes rebroadcast on standstill |
 | `simplex_standstill_certs_rebroadcast` | Certs rebroadcast on standstill |
-| `simplex_receiver_in_broadcasts_dropped_observers` | Candidate broadcasts dropped on the consensus overlay when `enable_observers` routes candidates through the block-sync overlay |
 
 ### Derivative Metrics
 
@@ -1193,7 +1189,6 @@ Names below omit the `ton_node_simplex_` prefix and the labels.
 - `finalized_pending_body_count`
 - `health_warnings`, `errors`, `misbehavior`, `skip_total`,
   `batch_commits`
-- `async_db_pending_count`, `async_db_timeout_total`
 
 **Latency histograms flattened to `*_avg` / `*_med` / `*_min` / `*_max` / `*_cnt` / `*_last` (session)**
 
@@ -1202,13 +1197,11 @@ Names below omit the `ton_node_simplex_` prefix and the labels.
 - `validation_latency`, `collation_latency`,
   `broadcast_validation_latency`
 - `batch_commit_size` (count, not time)
-- `async_db_completion_latency_ms`
 
 **Receiver counters (receiver thread)**
 
 - `receiver_in_messages_count`, `receiver_out_messages_count`
 - `receiver_in_broadcasts_count`, `receiver_out_broadcasts_count`
-- `receiver_in_broadcasts_dropped_observers`
 - `receiver_in_queries_count`
 - `receiver_in_messages_bytes`, `receiver_out_messages_bytes`
 - `receiver_in_broadcasts_bytes`, `receiver_out_broadcasts_bytes`

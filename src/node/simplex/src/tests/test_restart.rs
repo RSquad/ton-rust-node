@@ -17,19 +17,18 @@
 
 use crate::{
     block::{RawCandidateId, SlotIndex, ValidatorIndex, WindowIndex},
-    certificate::{Certificate, FinalCertPtr, VoteSignature},
     database::{
-        Bootstrap, CandidateInfoRecord, FinalCertRecord, FinalizedBlockRecord, NotarCertRecord,
-        PoolStateRecord, SkipCertRecord, VoteRecord,
+        Bootstrap, CandidateInfoRecord, FinalizedBlockRecord, NotarCertRecord, PoolStateRecord,
+        VoteRecord,
     },
     misbehavior::VoteResult,
     session_description::SessionDescription,
-    simplex_state::{FinalizeVote, NotarizeVote, SkipVote, Vote},
+    simplex_state::{NotarizeVote, Vote},
     startup_recovery::{
         SessionStartupRecoveryListener, SessionStartupRecoveryOptions,
         SessionStartupRecoveryProcessor,
     },
-    utils::{create_data_to_sign, serialize_unsigned_vote, sign_vote, vote_to_tl_unsigned},
+    utils::sign_vote,
     SessionId, SessionNode, SessionOptions,
 };
 use std::{sync::Arc, time::SystemTime};
@@ -69,15 +68,7 @@ fn create_test_desc() -> Arc<SessionDescription> {
 /// Create a test session description with specified number of validators.
 /// `local_idx` determines which validator is the local one.
 fn create_test_desc_with_validators(count: usize, local_idx: usize) -> Arc<SessionDescription> {
-    create_test_desc_with_keys(count, local_idx).0
-}
-
-fn create_test_desc_with_keys(
-    count: usize,
-    local_idx: usize,
-) -> (Arc<SessionDescription>, Vec<crate::PrivateKey>) {
     let mut nodes = Vec::with_capacity(count);
-    let mut keys = Vec::with_capacity(count);
     let mut local_key: Option<crate::PublicKey> = None;
 
     for i in 0..count {
@@ -87,14 +78,13 @@ fn create_test_desc_with_keys(
             local_key = Some(public_key.clone());
         }
         nodes.push(SessionNode { public_key, adnl_id: key.id().clone(), weight: 1 });
-        keys.push(key);
     }
 
     let local_key = local_key.expect("local_idx out of range");
     let shard = ShardIdent::masterchain();
     let session_id = SessionId::default();
     let options = SessionOptions::default();
-    let desc = Arc::new(
+    Arc::new(
         SessionDescription::new(
             &options,
             session_id,
@@ -106,8 +96,7 @@ fn create_test_desc_with_keys(
             None,
         )
         .expect("create SessionDescription"),
-    );
-    (desc, keys)
+    )
 }
 
 // ============================================================================
@@ -194,7 +183,6 @@ fn make_validator_session_candidate_bytes(
 enum RecoveryCall {
     OnVote,
     SetFirstNonFinalized,
-    SeedFinalCert,
     MarkLocalFlag,
     SetFirstNonannouncedWindow,
     GenerateRestartSkipVotes,
@@ -204,7 +192,6 @@ enum RecoveryCall {
     SeedReceivedCandidates,
     NotifyLastFinalized,
     CacheNotarCert,
-    SeedSkipCert,
     CacheCandidateBytes,
     RestoreStandstillCache,
     RestoreStartupVotes,
@@ -225,12 +212,10 @@ struct MockRecoveryListener {
     restored_standstill_cache_votes_len: Option<usize>,
     drained_votes: Vec<Vote>,
     restored_votes: Vec<Vote>,
-    seeded_final_certs: Vec<(SlotIndex, UInt256)>,
     seeded_current_round: Option<u32>,
     seeded_finalized_blocks: Vec<(SlotIndex, UInt256)>,
     seeded_received_candidates: Vec<FinalizedBlockRecord>,
     last_finalized_notification: Option<(SlotIndex, UInt256, u32)>,
-    seeded_skip_certs: Vec<SlotIndex>,
 }
 
 impl MockRecoveryListener {
@@ -241,8 +226,6 @@ impl MockRecoveryListener {
 }
 
 impl SessionStartupRecoveryListener for MockRecoveryListener {
-    fn recovery_begin_startup_replay(&mut self) {}
-
     fn recovery_set_first_non_finalized_slot(&mut self, slot: SlotIndex) {
         self.call_log.push(RecoveryCall::SetFirstNonFinalized);
         self.set_first_non_finalized = Some(slot);
@@ -341,29 +324,6 @@ impl SessionStartupRecoveryListener for MockRecoveryListener {
         // Mock: no-op, simplex_state is not available in tests
     }
 
-    fn recovery_seed_finalize_certificate(
-        &mut self,
-        slot: SlotIndex,
-        candidate_hash: UInt256,
-        _certificate: FinalCertPtr,
-    ) {
-        self.call_log.push(RecoveryCall::SeedFinalCert);
-        self.seeded_final_certs.push((slot, candidate_hash));
-        let next_slot = slot + 1;
-        if self.set_first_non_finalized.map_or(true, |current| next_slot > current) {
-            self.set_first_non_finalized = Some(next_slot);
-        }
-    }
-
-    fn recovery_seed_skip_certificate(
-        &mut self,
-        slot: SlotIndex,
-        _certificate: crate::certificate::SkipCertPtr,
-    ) {
-        self.call_log.push(RecoveryCall::SeedSkipCert);
-        self.seeded_skip_certs.push(slot);
-    }
-
     fn recovery_restore_receiver_standstill_cache(&mut self, votes: &[VoteRecord]) {
         self.call_log.push(RecoveryCall::RestoreStandstillCache);
         self.restored_standstill_cache_votes_len = Some(votes.len());
@@ -390,60 +350,6 @@ fn make_vote_record(
     let serialized = serialize_boxed(&tl_vote).expect("serialize vote failed");
     let vote_hash = UInt256::from_slice(&sha256_digest(&serialized));
     VoteRecord { vote_hash, data: serialized.into(), node_idx, seqno: 0 }
-}
-
-fn make_final_cert_record(
-    session_id: &SessionId,
-    keys: &[crate::PrivateKey],
-    candidate_id: RawCandidateId,
-    signers: &[usize],
-) -> FinalCertRecord {
-    let vote = FinalizeVote { slot: candidate_id.slot, block_hash: candidate_id.hash.clone() };
-    let unsigned_vote =
-        vote_to_tl_unsigned(&Vote::Finalize(vote.clone())).expect("build finalize unsigned vote");
-    let raw_vote_bytes = serialize_unsigned_vote(&unsigned_vote);
-    let to_sign = create_data_to_sign(session_id, &raw_vote_bytes);
-
-    let signatures = signers
-        .iter()
-        .map(|&idx| {
-            let signature = keys[idx].sign(&to_sign).expect("sign finalize vote");
-            VoteSignature::new(ValidatorIndex::new(idx as u32), signature.to_vec())
-        })
-        .collect();
-
-    let cert = Certificate::new(vote, signatures);
-    let tl_cert = cert.to_tl().expect("serialize final cert to TL");
-    let cert_bytes = serialize_boxed(&tl_cert).expect("serialize final cert");
-
-    FinalCertRecord { candidate_id, cert_bytes: cert_bytes.into() }
-}
-
-fn make_skip_cert_record(
-    session_id: &SessionId,
-    keys: &[crate::PrivateKey],
-    slot: SlotIndex,
-    signers: &[usize],
-) -> SkipCertRecord {
-    let vote = SkipVote { slot };
-    let unsigned_vote =
-        vote_to_tl_unsigned(&Vote::Skip(vote.clone())).expect("build skip unsigned vote");
-    let raw_vote_bytes = serialize_unsigned_vote(&unsigned_vote);
-    let to_sign = create_data_to_sign(session_id, &raw_vote_bytes);
-
-    let signatures = signers
-        .iter()
-        .map(|&idx| {
-            let signature = keys[idx].sign(&to_sign).expect("sign skip vote");
-            VoteSignature::new(ValidatorIndex::new(idx as u32), signature.to_vec())
-        })
-        .collect();
-
-    let cert = Certificate::new(vote, signatures);
-    let tl_cert = cert.to_tl().expect("serialize skip cert to TL");
-    let cert_bytes = serialize_boxed(&tl_cert).expect("serialize skip cert");
-
-    SkipCertRecord { slot, cert_bytes: cert_bytes.into() }
 }
 
 #[test]
@@ -654,116 +560,6 @@ fn test_apply_bootstrap_calls_expected_listener_methods_first_commit_strategy() 
 }
 
 #[test]
-fn test_apply_bootstrap_replays_final_certs_before_restart_skip_generation() {
-    let session_id = SessionId::default();
-    let options = SessionStartupRecoveryOptions::new(1);
-    let (desc, keys) = create_test_desc_with_keys(4, 0);
-
-    let persisted_prefix = FinalizedBlockRecord {
-        candidate_id: make_candidate_id(31, 0x31),
-        block_id: make_block_id(143_023),
-        parent: None,
-        is_final: true,
-    };
-    let restored_final = make_candidate_id(736, 0xF7);
-    let final_cert = make_final_cert_record(&session_id, &keys, restored_final.clone(), &[0, 1, 2]);
-
-    let bootstrap = Bootstrap {
-        finalized_blocks: vec![persisted_prefix],
-        candidate_infos: vec![],
-        notar_certs: vec![],
-        final_certs: vec![final_cert],
-        skip_certs: vec![],
-        votes: vec![],
-        pool_state: Some(PoolStateRecord { first_nonannounced_window: WindowIndex::new(94) }),
-        candidate_payloads: vec![],
-    };
-
-    let proc = SessionStartupRecoveryProcessor::new(session_id, desc, options, bootstrap);
-    let mut listener = MockRecoveryListener::default().with_drained_votes(vec![]);
-
-    proc.apply_bootstrap(&mut listener).expect("apply_bootstrap failed");
-
-    assert_eq!(
-        listener.seeded_final_certs,
-        vec![(restored_final.slot, restored_final.hash.clone())],
-        "persisted FinalCert must be replayed during startup recovery"
-    );
-    assert_eq!(
-        listener.set_first_non_finalized,
-        Some(SlotIndex::new(737)),
-        "FinalCert replay must repair the finalized boundary beyond filtered finalized_blocks"
-    );
-
-    let final_cert_pos = listener
-        .call_log
-        .iter()
-        .position(|c| *c == RecoveryCall::SeedFinalCert)
-        .expect("expected FinalCert replay");
-    let generate_skip_pos = listener
-        .call_log
-        .iter()
-        .position(|c| *c == RecoveryCall::GenerateRestartSkipVotes)
-        .expect("expected restart skip generation");
-    assert!(
-        final_cert_pos < generate_skip_pos,
-        "FinalCert replay must happen before restart skip generation"
-    );
-}
-
-#[test]
-fn test_apply_bootstrap_replays_skip_certs_before_restart_skip_generation() {
-    let session_id = SessionId::default();
-    let options = SessionStartupRecoveryOptions::new(1);
-    let (desc, keys) = create_test_desc_with_keys(4, 0);
-
-    let skip_slot = SlotIndex::new(656);
-    let skip_cert = make_skip_cert_record(&session_id, &keys, skip_slot, &[0, 1, 2]);
-
-    let bootstrap = Bootstrap {
-        finalized_blocks: vec![FinalizedBlockRecord {
-            candidate_id: make_candidate_id(639, 0x63),
-            block_id: make_block_id(136_107),
-            parent: None,
-            is_final: true,
-        }],
-        candidate_infos: vec![],
-        notar_certs: vec![],
-        final_certs: vec![],
-        skip_certs: vec![skip_cert],
-        votes: vec![],
-        pool_state: Some(PoolStateRecord { first_nonannounced_window: WindowIndex::new(83) }),
-        candidate_payloads: vec![],
-    };
-
-    let proc = SessionStartupRecoveryProcessor::new(session_id, desc, options, bootstrap);
-    let mut listener = MockRecoveryListener::default().with_drained_votes(vec![]);
-
-    proc.apply_bootstrap(&mut listener).expect("apply_bootstrap failed");
-
-    assert_eq!(
-        listener.seeded_skip_certs,
-        vec![skip_slot],
-        "persisted SkipCert must be replayed during startup recovery"
-    );
-
-    let skip_cert_pos = listener
-        .call_log
-        .iter()
-        .position(|c| *c == RecoveryCall::SeedSkipCert)
-        .expect("expected SkipCert replay");
-    let generate_skip_pos = listener
-        .call_log
-        .iter()
-        .position(|c| *c == RecoveryCall::GenerateRestartSkipVotes)
-        .expect("expected restart skip generation");
-    assert!(
-        skip_cert_pos < generate_skip_pos,
-        "SkipCert replay must happen before restart skip generation"
-    );
-}
-
-#[test]
 fn test_apply_bootstrap_seeds_persisted_empty_mc_chain_before_last_finalized_notification() {
     let session_id = SessionId::default();
     let options = SessionStartupRecoveryOptions::new(1);
@@ -901,8 +697,6 @@ struct CandidateCacheListener {
 }
 
 impl SessionStartupRecoveryListener for CandidateCacheListener {
-    fn recovery_begin_startup_replay(&mut self) {}
-
     fn recovery_set_first_non_finalized_slot(&mut self, _slot: SlotIndex) {}
 
     fn recovery_on_vote(
@@ -970,21 +764,6 @@ impl SessionStartupRecoveryListener for CandidateCacheListener {
         _slot: SlotIndex,
         _candidate_hash: UInt256,
         _certificate: crate::certificate::NotarCertPtr,
-    ) {
-    }
-
-    fn recovery_seed_finalize_certificate(
-        &mut self,
-        _slot: SlotIndex,
-        _candidate_hash: UInt256,
-        _certificate: FinalCertPtr,
-    ) {
-    }
-
-    fn recovery_seed_skip_certificate(
-        &mut self,
-        _slot: SlotIndex,
-        _certificate: crate::certificate::SkipCertPtr,
     ) {
     }
 
@@ -1229,8 +1008,6 @@ fn test_restart_restore_candidate_bytes_skips_non_empty_and_keeps_empty() {
     }
 
     impl SessionStartupRecoveryListener for FailFetchListener {
-        fn recovery_begin_startup_replay(&mut self) {}
-
         fn recovery_set_first_non_finalized_slot(&mut self, _slot: SlotIndex) {}
         fn recovery_on_vote(
             &mut self,
@@ -1287,19 +1064,6 @@ fn test_restart_restore_candidate_bytes_skips_non_empty_and_keeps_empty() {
             _slot: SlotIndex,
             _candidate_hash: UInt256,
             _certificate: crate::certificate::NotarCertPtr,
-        ) {
-        }
-        fn recovery_seed_finalize_certificate(
-            &mut self,
-            _slot: SlotIndex,
-            _candidate_hash: UInt256,
-            _certificate: FinalCertPtr,
-        ) {
-        }
-        fn recovery_seed_skip_certificate(
-            &mut self,
-            _slot: SlotIndex,
-            _certificate: crate::certificate::SkipCertPtr,
         ) {
         }
         fn recovery_restore_receiver_standstill_cache(&mut self, _votes: &[VoteRecord]) {

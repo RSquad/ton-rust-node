@@ -43,8 +43,8 @@ use crate::{
     certificate::{Certificate as SimplexCertificate, FinalCertPtr, NotarCertPtr, SkipCertPtr},
     consensus_controller::ConsensusController,
     database::{
-        Bootstrap, CandidateInfoRecord, FinalCertRecord, FinalizedBlockRecord, NotarCertRecord,
-        PoolStateRecord, SkipCertRecord, VoteRecord,
+        Bootstrap, CandidateInfoRecord, FinalizedBlockRecord, NotarCertRecord, PoolStateRecord,
+        VoteRecord,
     },
     database_controller::DatabaseController,
     misbehavior::VoteResult,
@@ -60,12 +60,10 @@ use std::{
     sync::Arc,
 };
 use ton_api::{
-    deserialize_boxed, deserialize_typed, serialize_boxed,
+    deserialize_boxed, serialize_boxed,
     ton::consensus::{
-        candidatedata::Empty as CandidateDataEmpty,
-        candidateid::CandidateId,
-        simplex::{Certificate as CertificateBoxed, Vote as TlVoteBoxed},
-        CandidateData, CandidateHashData,
+        candidatedata::Empty as CandidateDataEmpty, candidateid::CandidateId,
+        simplex::Vote as TlVoteBoxed, CandidateData, CandidateHashData,
     },
     IntoBoxed,
 };

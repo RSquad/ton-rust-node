@@ -284,10 +284,7 @@ pub trait StorageAsyncResult<T>: Send + Sync {
     /// Gets result if ready (non-blocking).
     ///
     /// Returns `None` if still pending.
-    /// Returns `Some(Err)` if an operation error occurred or the result has
-    /// already been consumed. In the "already consumed" case the inner
-    /// `anyhow::Error` downcasts to [`StorageResultAlreadyTaken`] — see
-    /// that type for the recommended detection pattern.
+    /// Returns `Some(Err)` if already taken or error occurred.
     fn try_get(&self) -> Option<Result<T>>;
 
     /// Waits for result with timeout (**BLOCKING**).
@@ -301,9 +298,7 @@ pub trait StorageAsyncResult<T>: Send + Sync {
     /// # Returns
     ///
     /// * `Some(Ok(value))` if operation completed successfully
-    /// * `Some(Err(e))` if operation failed or result already taken (see
-    ///   [`StorageResultAlreadyTaken`] for the typed sentinel emitted in the
-    ///   already-taken case)
+    /// * `Some(Err(e))` if operation failed or result already taken
     /// * `None` if timeout expired (result still pending)
     fn wait_timeout(&self, timeout: Duration) -> Option<Result<T>>;
 
@@ -312,8 +307,7 @@ pub trait StorageAsyncResult<T>: Send + Sync {
     /// # Returns
     ///
     /// * `Ok(value)` if operation completed successfully
-    /// * `Err(e)` if operation failed or result already taken (see
-    ///   [`StorageResultAlreadyTaken`])
+    /// * `Err(e)` if operation failed or result already taken
     fn wait(&self) -> Result<T> {
         // Wait in 1-second chunks to allow for spurious wakeups
         // This matches typical condvar usage patterns

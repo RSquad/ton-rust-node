@@ -1458,9 +1458,6 @@ fn test_on_certificate_relays_and_caches_skip_certificate_once() {
 
     // First application should store + relay + cache
     fixture.processor.on_certificate(1, tl_cert.clone());
-    // SXMAIN async-DB-results registry: drain so the skip persist continuation runs
-    // (relay + cache happen in the continuation post-migration).
-    fixture.drain_pending_async_db_results();
 
     let actions = fixture.drain_receiver_actions();
     let send_cert_count =
@@ -1489,7 +1486,6 @@ fn test_on_certificate_relays_and_caches_skip_certificate_once() {
 
     // Second application should be ignored (already have skip certificate), so no relay/caching
     fixture.processor.on_certificate(1, tl_cert);
-    fixture.drain_pending_async_db_results();
     let actions2 = fixture.drain_receiver_actions();
     assert!(
         !actions2.iter().any(|a| matches!(a, ReceiverAction::SendCertificate { .. })),
@@ -1511,8 +1507,6 @@ fn test_future_certificate_is_not_rejected_like_cpp() {
         build_skip_certificate_tl(&SessionId::default(), &fixture.nodes, slot, &[0, 1, 2]);
 
     fixture.processor.on_certificate(1, tl_cert);
-    // Skip persist + relay are async (registry continuation); drain before asserting.
-    fixture.drain_pending_async_db_results();
 
     assert!(
         fixture.processor.simplex_state.has_skip_certificate(SlotIndex::new(slot)),
@@ -1636,9 +1630,6 @@ fn test_handle_finalization_reached_caches_final_certificate_for_standstill() {
 
     fixture.processor.handle_finalization_reached(event);
 
-    // Persist + cache + relay are async (registry continuation); drain before asserting.
-    fixture.drain_pending_async_db_results();
-
     let actions = fixture.drain_receiver_actions();
     assert!(
         actions.iter().any(|a| matches!(
@@ -1678,10 +1669,6 @@ fn test_handle_notarization_reached_persists_before_relay() {
 
     fixture.processor.handle_notarization_reached(event);
 
-    // Drain the SXMAIN async-DB-results registry: storage thread completes the
-    // notar persist, registry continuation runs broadcast + cache.
-    fixture.drain_pending_async_db_results();
-
     assert!(
         fixture
             .processor
@@ -1690,7 +1677,7 @@ fn test_handle_notarization_reached_persists_before_relay() {
             .load_notar_cert_by_id(&candidate_id, Duration::from_secs(1))
             .expect("notar cert lookup must succeed")
             .is_some(),
-        "notar cert must be persisted in DB after the registry continuation runs"
+        "notar cert must be persisted in DB by the time handler returns"
     );
 
     let actions = fixture.drain_receiver_actions();
@@ -1719,10 +1706,6 @@ fn test_handle_finalization_reached_persists_before_relay() {
 
     fixture.processor.handle_finalization_reached(event);
 
-    // Drain the SXMAIN async-DB-results registry: storage thread completes the
-    // final persist, registry continuation runs broadcast + cache + standstill update.
-    fixture.drain_pending_async_db_results();
-
     assert!(
         fixture
             .processor
@@ -1731,7 +1714,7 @@ fn test_handle_finalization_reached_persists_before_relay() {
             .load_final_cert_by_id(&candidate_id, Duration::from_secs(1))
             .expect("final cert lookup must succeed")
             .is_some(),
-        "final cert must be persisted in DB after the registry continuation runs"
+        "final cert must be persisted in DB by the time handler returns"
     );
 
     let actions = fixture.drain_receiver_actions();
@@ -1757,10 +1740,6 @@ fn test_handle_skip_certificate_reached_persists_before_relay() {
 
     fixture.processor.handle_skip_certificate_reached(event);
 
-    // Drain the SXMAIN async-DB-results registry: storage thread completes the
-    // skip persist, registry continuation runs broadcast + cache.
-    fixture.drain_pending_async_db_results();
-
     assert!(
         fixture
             .processor
@@ -1769,7 +1748,7 @@ fn test_handle_skip_certificate_reached_persists_before_relay() {
             .load_skip_cert_by_slot(slot, Duration::from_secs(1))
             .expect("skip cert lookup must succeed")
             .is_some(),
-        "skip cert must be persisted in DB after the registry continuation runs"
+        "skip cert must be persisted in DB by the time handler returns"
     );
 
     let actions = fixture.drain_receiver_actions();
@@ -5249,7 +5228,6 @@ fn test_foreign_notarization_cert_is_relayed() {
     };
 
     fixture.processor.handle_notarization_reached(event);
-    fixture.drain_pending_async_db_results();
 
     let actions = fixture.drain_receiver_actions();
     assert!(
@@ -5282,7 +5260,6 @@ fn test_foreign_finalization_cert_is_relayed() {
     };
 
     fixture.processor.handle_finalization_reached(event);
-    fixture.drain_pending_async_db_results();
 
     let actions = fixture.drain_receiver_actions();
     assert!(
@@ -5956,32 +5933,15 @@ fn test_finalized_callback_not_emitted_when_finalized_record_persist_fails() {
     );
 }
 
-/// Finalized-record persist now happens asynchronously through the SXMAIN
-/// async-DB-results registry (`maybe_apply_finalized_state` migration). The
-/// listener callback fires before the persist completes — matching C++
-/// `state-resolver.cpp::do_finalize_blocks`:
-///
-/// ```text
-///   co_await owning_bus().publish<FinalizeBlock>(candidate, sig_set);  // callback
-///   ...
-///   co_await bus.db->set(std::move(key), td::BufferSlice());           // persist
-/// ```
-///
-/// This test verifies the new ordering invariants:
-/// 1. The `on_block_finalized` callback fires (immediately, with the in-memory
-///    state already applied).
-/// 2. The finalized record is eventually durable in the DB after the SXMAIN
-///    registry continuation drains and the storage queue flushes.
 #[test]
-fn test_finalized_callback_fires_then_record_eventually_persists() {
-    struct CallbackTracker {
+fn test_finalized_callback_observes_persisted_record() {
+    struct PersistOrderListener {
         db: crate::database::SimplexDbPtr,
         candidate_id: RawCandidateId,
-        callback_invoked: Arc<AtomicBool>,
-        persisted_visible_during_callback: Arc<AtomicBool>,
+        persisted_visible: Arc<AtomicBool>,
     }
 
-    impl consensus_common::SessionListener for CallbackTracker {
+    impl consensus_common::SessionListener for PersistOrderListener {
         fn on_candidate(
             &self,
             _source_info: BlockSourceInfo,
@@ -6028,17 +5988,15 @@ fn test_finalized_callback_fires_then_record_eventually_persists() {
             _signatures: BlockSignaturesVariant,
             _approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
         ) {
-            self.callback_invoked.store(true, Ordering::Relaxed);
-            // Snapshot DB visibility at callback time — informational only.
-            // The new ordering does NOT guarantee the record is persisted yet
-            // (matches C++ which `co_await`s FinalizeBlock before db->set).
             let has_record = self
                 .db
                 .load_finalized_blocks()
                 .expect("finalized records load must succeed")
                 .iter()
                 .any(|record| record.candidate_id == self.candidate_id);
-            self.persisted_visible_during_callback.store(has_record, Ordering::Relaxed);
+            if has_record {
+                self.persisted_visible.store(true, Ordering::Relaxed);
+            }
         }
 
         fn get_approved_candidate(
@@ -6050,7 +6008,7 @@ fn test_finalized_callback_fires_then_record_eventually_persists() {
             _callback: ValidatorBlockCandidateCallback,
         ) {
             panic!(
-                "unexpected legacy get_approved_candidate request in CallbackTracker (root_hash={})",
+                "unexpected legacy get_approved_candidate request in PersistOrderListener (root_hash={})",
                 root_hash.to_hex_string()
             );
         }
@@ -6070,14 +6028,12 @@ fn test_finalized_callback_fires_then_record_eventually_persists() {
         .expect("candidate must exist")
         .clone();
 
-    let callback_invoked = Arc::new(AtomicBool::new(false));
-    let persisted_visible_during_callback = Arc::new(AtomicBool::new(false));
+    let persisted_visible = Arc::new(AtomicBool::new(false));
     let listener: Arc<dyn consensus_common::SessionListener + Send + Sync> =
         Arc::new(CallbackTracker {
             db: fixture.processor.database.db().clone(),
             candidate_id: candidate_id.clone(),
-            callback_invoked: callback_invoked.clone(),
-            persisted_visible_during_callback: persisted_visible_during_callback.clone(),
+            persisted_visible: persisted_visible.clone(),
         });
     fixture.processor.set_listener_for_test(Arc::downgrade(&listener));
 
@@ -6600,10 +6556,6 @@ fn test_recursive_finalization_defers_until_parent_notar_cert_arrives() {
         &[0, 1, 2],
     );
     fixture.processor.process_received_notar_cert(parent_id.slot, &parent_id.hash, &notar_bytes);
-    // Notar-cert persist + FSM feed + retry_pending_recursive_finalization() now run from
-    // the SXMAIN async-DB-results registry continuation; drain so the recursive retry fires
-    // before we assert on its observable side-effects.
-    fixture.drain_pending_async_db_results();
 
     let finalized_events = drain_finalized_events(&recording);
     assert_eq!(finalized_events.len(), 1);
@@ -6918,71 +6870,28 @@ fn test_recursive_finalization_applied_top_floor_skips_older_ancestor_callbacks(
     );
 }
 
-// ============================================================================
-// `ensure_candidate_info_stored` — direct-API tests
-// ============================================================================
-//
-// These tests target `ensure_candidate_info_stored` directly to verify the three
-// completion paths (Ok inline, Err inline for missing entry, Ok via deferred
-// continuation). End-to-end coverage of the per-caller wiring lives further down
-// next to `broadcast_vote` / `process_received_notar_cert` / `process_validated_candidates`.
-
-/// Capture the `Result<()>` argument the callback receives, so tests can assert
-/// on the outcome after the call returns (inline) or after the registry drains
-/// (deferred). `None` means the callback hasn't fired yet.
-type EnsureCallbackOutcome = Arc<Mutex<Option<std::result::Result<(), String>>>>;
-
-/// Build an `EnsureCallbackOutcome` and a closure suitable for passing to
-/// `ensure_candidate_info_stored`. The closure stores `Ok(())` / `Err(msg)`
-/// into the shared cell; `msg` is the `Display`-formatted error so we don't
-/// have to clone failure errors.
-fn make_ensure_callback() -> (
-    EnsureCallbackOutcome,
-    impl FnOnce(&mut SessionProcessor, ton_block::Result<()>) + Send + 'static,
-) {
-    let outcome: EnsureCallbackOutcome = Arc::new(Mutex::new(None));
-    let outcome_for_cb = outcome.clone();
-    let cb = move |_processor: &mut SessionProcessor, res: ton_block::Result<()>| {
-        let stored = match res {
-            Ok(()) => Ok(()),
-            Err(e) => Err(e.to_string()),
-        };
-        *outcome_for_cb.lock().unwrap() = Some(stored);
-    };
-    (outcome, cb)
-}
-
-/// Missing dedup-map entry → callback fires inline with `Err(...)` and the
-/// session error counter is bumped.
 #[test]
-fn test_ensure_candidate_info_stored_callback_fires_inline_with_err_when_missing() {
+fn test_wait_candidate_info_stored_returns_false_when_missing_entry() {
     let mut fixture = TestFixture::new(4);
     let candidate_id = RawCandidateId { slot: SlotIndex::new(77), hash: UInt256::rand() };
     let errors_before =
         fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
 
-    let (outcome, cb) = make_ensure_callback();
-    fixture.processor.ensure_candidate_info_stored(&candidate_id, true, false, cb);
-
-    let captured = outcome.lock().unwrap().clone().expect("callback must fire inline");
-    let err = captured.expect_err("missing candidateInfo entry must surface as Err");
     assert!(
-        err.contains("missing candidateInfo store result"),
-        "Err must describe the missing prerequisite, got: {err}",
+        !fixture.processor.wait_candidate_info_stored(&candidate_id, true, false),
+        "missing candidateInfo wait must report failure"
     );
 
     let errors_after =
         fixture.processor.telemetry.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
     assert!(
         errors_after > errors_before,
-        "missing candidateInfo path must increment error counter (matches abort semantics)",
+        "missing candidateInfo wait must increment error counter"
     );
 }
 
-/// Persisted candidateInfo → callback fires inline with `Ok(())` and the DB is
-/// queryable. No deferred entry is registered.
 #[test]
-fn test_ensure_candidate_info_stored_callback_fires_inline_with_ok_when_persisted() {
+fn test_wait_candidate_info_stored_returns_true_when_candidate_info_is_persisted() {
     let mut fixture = TestFixture::new(4);
     let (leader_source, candidate_id, broadcast) =
         make_signed_block_broadcast(&fixture, 78, vec![1, 2, 3, 4]);
