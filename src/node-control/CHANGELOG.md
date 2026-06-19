@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-06-19
+
+### Added
+
+- **Audit log** — nodectl now records an append-only log of domain events (elections, config changes, authentication, service start/stop) to `./logs/audit.jsonl`, separate from the service log. It rotates files automatically and offers optional client-IP privacy controls, all configured under a new `audit_log` config section. Recent elections events also appear in `GET /v1/elections`. See `docs/audit-log.md`.
+
+### Fixed
+
+- **Nominator Pool: out-of-gas when processing withdraw requests** — fixed gas calculation so the process-withdraw-requests (op 2) message covers large withdraw-stake-request batches.
+
 ## [0.5.1] - 2026-05-25
 
 ### Added

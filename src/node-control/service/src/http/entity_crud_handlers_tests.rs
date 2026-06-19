@@ -82,6 +82,7 @@ fn empty_app_cfg() -> AppConfig {
         tick_interval: 30,
         automation: Default::default(),
         log: Some(Default::default()),
+        audit_log: Default::default(),
     }
 }
 
@@ -135,9 +136,12 @@ async fn app_state(cfg: AppConfig) -> AppState {
         runtime_cfg: rt.clone(),
         elections_task: Arc::new(TaskController::new("elections", Noop, rt.clone())),
         jwt_auth,
-        user_store: Arc::new(UserStore::new(rt as Arc<dyn RuntimeConfig>)),
+        user_store: Arc::new(UserStore::new(rt.clone() as Arc<dyn RuntimeConfig>)),
         login_rate_limiter: Arc::new(tokio::sync::Mutex::new(Default::default())),
         config_changed: Arc::new(tokio::sync::Notify::new()),
+        audit: Arc::new(crate::audit::log::NoopAuditLog),
+        actor_builder: Arc::new(crate::audit::AuditActorBuilder::new(rt.clone())),
+        audit_ring: crate::audit::AuditEventBuffer::new(0),
     }
 }
 
@@ -153,9 +157,12 @@ async fn app_state_with_path(cfg: AppConfig, path: std::path::PathBuf) -> AppSta
         runtime_cfg: rt.clone(),
         elections_task: Arc::new(TaskController::new("elections", Noop, rt.clone())),
         jwt_auth,
-        user_store: Arc::new(UserStore::new(rt as Arc<dyn RuntimeConfig>)),
+        user_store: Arc::new(UserStore::new(rt.clone() as Arc<dyn RuntimeConfig>)),
         login_rate_limiter: Arc::new(tokio::sync::Mutex::new(Default::default())),
         config_changed: Arc::new(tokio::sync::Notify::new()),
+        audit: Arc::new(crate::audit::log::NoopAuditLog),
+        actor_builder: Arc::new(crate::audit::AuditActorBuilder::new(rt)),
+        audit_ring: crate::audit::AuditEventBuffer::new(0),
     }
 }
 
