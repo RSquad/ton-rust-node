@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Audit log** — a structured, append-only JSONL log of domain events (elections, REST config mutations, authentication, service lifecycle), written to `./logs/audit.jsonl` separately from the tracing service log. Each event carries a UUID v7 id, RFC3339 timestamp, outcome, dotted `event_type`, and `actor`/`target`. Includes size-based rotation (default 100 MiB × 10 files), batched writes with optional `fsync`, an in-memory ring buffer feeding the REST read path, and client-IP PII controls. Configured under a new `audit_log` section (read at startup); `0600` file mode on Unix. Recent elections events are surfaced in `GET /v1/elections` as `recent_events`. See `docs/audit-log.md`.
+- **Audit log** — nodectl now records an append-only log of domain events (elections, config changes, authentication, service start/stop) to `./logs/audit.jsonl`, separate from the service log. It rotates files automatically and offers optional client-IP privacy controls, all configured under a new `audit_log` config section. Recent elections events also appear in `GET /v1/elections`. See `docs/audit-log.md`.
 
 ### Fixed
 
