@@ -6,6 +6,25 @@ For Helm chart changes, see [helm/ton-rust-node/CHANGELOG.md](helm/ton-rust-node
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 Versions follow the node release tags (e.g. `v0.1.2-mainnet`).
 
+## [v0.9.0] - 2026-06-19
+
+Image: `ghcr.io/rsquad/ton-rust-node/node:v0.9.0`
+
+### Added
+
+- Simplex consensus emulator for testing and development
+
+### Changed
+
+- Simplex consensus refactoring
+- Reliability updates across node subsystems
+
+### Fixed
+
+- Collator stability fixes
+- Simplex protocol bugs and improvements (repair notar verification, candidate observation recovery)
+- Consensus stability fixes (empty-candidate repair, stale request throttle cleanup)
+
 ## [v0.8.3] - 2026-06-04
 
 Image: `ghcr.io/rsquad/ton-rust-node/node:v0.8.3`
