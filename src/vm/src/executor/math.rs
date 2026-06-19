@@ -21,12 +21,12 @@ use crate::{
                 utils::{div_by_shift, divmod},
                 Round,
             },
-            utils::{binary_op, construct_double_nan, process_double_result, unary_op},
             IntegerData,
         },
         StackItem,
     },
 };
+use num::Zero;
 use std::{borrow::Cow, cmp::Ordering, mem};
 use ton_block::{fail, Bitmask, ExceptionCode, Result, Status};
 
@@ -233,7 +233,7 @@ where
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct DivMode {
+pub struct DivMode {
     pub(super) flags: Bitmask,
 }
 
@@ -249,7 +249,7 @@ impl DivMode {
     const ROUNDING_MODE_CEILING: Bitmask                 = 0b00000010;
     const ROUNDING_MODE_NEAREST_INTEGER: Bitmask         = 0b00000001;
 
-    pub(super) fn with_flags(flags: Bitmask) -> DivMode {
+    pub fn with_flags(flags: Bitmask) -> DivMode {
         DivMode {
             flags,
         }
@@ -272,8 +272,8 @@ impl DivMode {
         (["RSHIFTMODC",           "RSHIFTMOD",           "RSHIFTMODR"          ], 0b0011_1100),  // div-by-shift
 
         (["MULADDDIVMODC",        "MULADDDIVMOD",        "MULADDDIVMODR"       ], 0b1000_0000),  // premultiply + preadd
-        (["MULDIVC",              "MULDIV",              "MULDIVR"             ], 0b1000_0100),  // !R + div-by-shift
-        (["MULMODC",              "MULMOD",              "MULMODR"             ], 0b1000_1000),  // !Q + div-by-shift
+        (["MULDIVC",              "MULDIV",              "MULDIVR"             ], 0b1000_0100),  // !R
+        (["MULMODC",              "MULMOD",              "MULMODR"             ], 0b1000_1000),  // !Q
         (["MULDIVMODC",           "MULDIVMOD",           "MULDIVMODR"          ], 0b1000_1100),  // premultiply
 
         (["MULADDRSHIFTCMOD_VAR", "MULADDRSHIFTMOD_VAR", "MULADDRSHIFTRMOD_VAR"], 0b1010_0000),  // premultiply + preadd + div-by-shift
@@ -298,7 +298,7 @@ impl DivMode {
     ];
 
     pub(super) fn command_name(&self) -> Result<&'static str> {
-        if !self.is_valid() {
+        if !self.is_valid(false) {
             fail!(ExceptionCode::InvalidOpcode)
         }
         let mut index = 0;
@@ -326,11 +326,14 @@ impl DivMode {
         }
     }
 
-    pub(super) fn is_valid(&self) -> bool {
+    pub fn is_valid(&self, quiet: bool) -> bool {
+        if quiet && self.shift_parameter() {
+            return false;
+        }
         !self.contains(DivMode::DIVISION_REPLACED_BY_RIGHT_SHIFT | DivMode::MULTIPLICATION_REPLACED_BY_LEFT_SHIFT)
             && !self.contains(DivMode::ROUNDING_MODE_NEAREST_INTEGER | DivMode::ROUNDING_MODE_CEILING)
             && (!self.contains(DivMode::MULTIPLICATION_REPLACED_BY_LEFT_SHIFT) || self.premultiply())
-            && (!self.shift_parameter() || self.mul_by_shift() || self.div_by_shift())
+            && (!self.shift_parameter() || self.mul_by_shift() || (!quiet && self.div_by_shift()))
     }
 
     #[cfg(test)]
@@ -348,14 +351,21 @@ impl DivMode {
         (self.flags & bits) == bits
     }
 
-    pub(super) fn div_by_shift(&self) -> bool {
-        self.contains(DivMode::DIVISION_REPLACED_BY_RIGHT_SHIFT)
+    /// 0b10000000 - 0x80
+    pub(super) fn premultiply(&self) -> bool {
+        self.contains(DivMode::PRE_MULTIPLICATION)
     }
 
+    /// 0b11000000 - 0xC0
     pub(super) fn mul_by_shift(&self) -> bool {
         self.contains(
             DivMode::PRE_MULTIPLICATION | DivMode::MULTIPLICATION_REPLACED_BY_LEFT_SHIFT
         )
+    }
+
+    /// 0b00100000 - 0x20
+    pub(super) fn div_by_shift(&self) -> bool {
+        self.contains(DivMode::DIVISION_REPLACED_BY_RIGHT_SHIFT)
     }
 
     pub(super) fn need_quotient(&self) -> bool {
@@ -366,10 +376,7 @@ impl DivMode {
         self.contains(DivMode::REMAINDER_RESULT_REQUIRED) || !self.contains(DivMode::QUOTIENT_RESULT_REQUIRED)
     }
 
-    pub(super) fn premultiply(&self) -> bool {
-        self.contains(DivMode::PRE_MULTIPLICATION)
-    }
-
+    /// ~0b00001100 - ~0x0C
     pub(super) fn preadd(&self) -> bool {
         !self.contains(DivMode::QUOTIENT_RESULT_REQUIRED) && !self.contains(DivMode::REMAINDER_RESULT_REQUIRED)
     }
@@ -386,6 +393,8 @@ impl DivMode {
         }
     }
 
+    /// 0b00010000 - 0x10
+    /// Shift is in command - is not supported in quiet mode
     pub(super) fn shift_parameter(&self) -> bool {
         self.contains(DivMode::SHIFT_OPERATION_PARAMETER_PASSED)
     }
@@ -497,14 +506,6 @@ fn get_var<'a>(engine: &'a Engine, index: &mut isize) -> Result<&'a IntegerData>
     result
 }
 
-fn get_shift(engine: &Engine, index: &mut isize) -> Result<usize> {
-    if engine.cmd.has_length() {
-        Ok(engine.cmd.length())
-    } else {
-        Ok(get_var(engine, index)?.as_integer_value(0..=256)?)
-    }
-}
-
 // Multiple division modes
 pub(super) fn execute_divmod<T>(engine: &mut Engine) -> Status
 where
@@ -516,7 +517,7 @@ where
             .set_opts(InstructionOptions::DivisionMode),
     )?;
     let mode = engine.cmd.division_mode().clone();
-    if !mode.is_valid() {
+    if !mode.is_valid(T::quiet()) {
         fail!(ExceptionCode::InvalidOpcode);
     }
 
@@ -546,61 +547,80 @@ where
     };
     let w = if mode.preadd() { get_var(engine, &mut index)? } else { &IntegerData::nan() };
     let z = if !mode.div_by_shift() { get_var(engine, &mut index)? } else { &IntegerData::nan() };
-    // dbg!(x, y, w, z);
-    let v = if mode.premultiply() {
-        let v = if mode.mul_by_shift() {
-            let shift = get_shift(engine, &mut index)?;
-            // dbg!(x, shift);
-            unary_op::<T, _, _, _, _, _>(x, |x| x << shift, || None, |result, _| Ok(Some(result)))?
+
+    let shift = if mode.mul_by_shift() || mode.div_by_shift() {
+        if engine.cmd.has_length() {
+            engine.cmd.length()
         } else {
-            // dbg!(x, y);
-            debug_assert!(y.as_int().is_some());
-            binary_op::<T, _, _, _, _, _>(
-                x,
-                y,
-                |x, y| x * y,
-                || None,
-                |result, _| Ok(Some(result)),
-            )?
-        };
-        Cow::Owned(v)
-    } else {
-        Cow::Borrowed(x.as_int())
-    };
-    let v = if mode.preadd() {
-        debug_assert!(w.as_int().is_some());
-        let v = if let Some(v) = v.as_ref() {
-            // dbg!(v, w);
-            unary_op::<T, _, _, _, _, _>(w, |w| v + w, || None, |result, _| Ok(Some(result)))?
-        } else {
-            None
-        };
-        Cow::Owned(v)
-    } else {
-        v
-    };
-    let (q, r) = if let Some(v) = v.as_ref() {
-        if mode.div_by_shift() {
-            let shift = get_shift(engine, &mut index)?;
-            // dbg!(v, shift);
-            process_double_result::<T, _>(div_by_shift(v, shift, rounding), construct_double_nan)?
-        } else {
-            // dbg!(v, z);
-            debug_assert!(z.as_int().is_some());
-            if z.is_zero() {
-                on_integer_overflow!(T)?;
-                construct_double_nan()
-            } else {
-                unary_op::<T, _, _, _, _, _>(
-                    z,
-                    |z| divmod(v, z, rounding),
-                    construct_double_nan,
-                    process_double_result::<T, _>,
-                )?
+            match get_var(engine, &mut index)?.as_integer_value(0..=256) {
+                Ok(shift) => shift,
+                Err(err) => {
+                    debug_assert_eq!(
+                        tvm_exception_code(&err).unwrap(),
+                        ExceptionCode::RangeCheckError
+                    );
+                    if !T::quiet() || engine.block_version() < 14 {
+                        return Err(err);
+                    } else {
+                        if mode.need_quotient() {
+                            engine.cc.stack.push(StackItem::int(IntegerData::nan()));
+                        }
+                        if mode.need_remainder() {
+                            engine.cc.stack.push(StackItem::int(IntegerData::nan()));
+                        }
+                        return Ok(());
+                    }
+                }
             }
         }
     } else {
-        construct_double_nan()
+        0
+    };
+    // dbg!(x.as_int(), y.as_int(), w.as_int(), z.as_int(), shift);
+    // v = x * y
+    let mut v = Cow::Owned(None);
+    if mode.premultiply() {
+        if let Some(x) = x.as_int() {
+            if mode.mul_by_shift() {
+                v = Cow::Owned(Some(x << shift))
+            } else if let Some(y) = y.as_int() {
+                v = Cow::Owned(Some(x * y))
+            }
+        }
+    } else {
+        v = Cow::Borrowed(x.as_int());
+    }
+    // v = v + w
+    if mode.preadd() {
+        v = if let (Some(v), Some(w)) = (v.as_ref(), w.as_int()) {
+            Cow::Owned(Some(v + w))
+        } else {
+            Cow::Owned(None)
+        }
+    }
+    // (q, r) = v / z
+    let mut res = None;
+    if let Some(v) = v.as_ref() {
+        if mode.div_by_shift() {
+            res = Some(div_by_shift(v, shift, rounding));
+        } else if let Some(z) = z.as_int() {
+            if !z.is_zero() {
+                res = Some(divmod(v, z, rounding));
+            }
+        }
+    }
+
+    let res = res.and_then(|(q, r)| match (IntegerData::from(q), IntegerData::from(r)) {
+        (Ok(q), Ok(r)) => Some((q, r)),
+        _ => None,
+    });
+
+    let (q, r) = match res {
+        Some((q, r)) => (q, r),
+        None => {
+            on_integer_overflow!(T)?;
+            (IntegerData::nan(), IntegerData::nan())
+        }
     };
 
     if mode.need_quotient() {
@@ -730,18 +750,6 @@ where
     })
 }
 
-// (x y - x<<y)
-pub(super) fn execute_lshift<T>(engine: &mut Engine) -> Status
-where
-    T: OperationBehavior,
-{
-    if engine.last_cmd() == 0xAC {
-        binary::<T>(engine, "LSHIFT", |y, x| x.shl::<T>(y.as_integer_value(0..=1023)?))
-    } else {
-        unary_with_len::<T>(engine, "LSHIFT", |x, y| x.shl::<T>(y))
-    }
-}
-
 // (x y - max(x, y))
 pub(super) fn execute_max<T>(engine: &mut Engine) -> Status
 where
@@ -841,18 +849,6 @@ where
     })
 }
 
-// (x - x>>y)
-pub(super) fn execute_rshift<T>(engine: &mut Engine) -> Status
-where
-    T: OperationBehavior,
-{
-    if engine.last_cmd() == 0xAD {
-        binary::<T>(engine, "RSHIFT", |y, x| x.shr::<T>(y.as_integer_value(0..=1023)?))
-    } else {
-        unary_with_len::<T>(engine, "RSHIFT", |x, y| x.shr::<T>(y))
-    }
-}
-
 // (x - sign(x))
 pub(super) fn execute_sgn<T>(engine: &mut Engine) -> Status
 where
@@ -871,6 +867,53 @@ where
             IntegerData::one()
         })
     })
+}
+
+// (x - x>>y) or (x - x<<y)
+pub(super) fn execute_shift<T, const RIGHT: bool>(engine: &mut Engine) -> Status
+where
+    T: OperationBehavior,
+{
+    if RIGHT {
+        unary_with_len::<T>(engine, "RSHIFT", |x, y| x.shr::<T>(y))
+    } else {
+        unary_with_len::<T>(engine, "LSHIFT", |x, y| x.shl::<T>(y))
+    }
+}
+
+// (x y - x<<y) or (x y - x>>y)
+pub(super) fn execute_shift_stack<T, const RIGHT: bool>(engine: &mut Engine) -> Status
+where
+    T: OperationBehavior,
+{
+    let name = if RIGHT { "RSHIFT" } else { "LSHIFT" };
+    engine.load_instruction(Instruction::new(name).set_name_prefix(T::name_prefix()))?;
+    if engine.cc.stack.depth() < 2 {
+        fail!(ExceptionCode::StackUnderflow)
+    }
+    let block_version = engine.block_version();
+    let v0 = engine.cc.stack.get_mut(0).withdraw();
+    let v0 = v0.as_integer()?;
+    let v1 = engine.cc.stack.get_mut(1).as_integer_mut()?;
+    *v1 = match v0.as_integer_value(0..=1023) {
+        Ok(shift) => {
+            if RIGHT {
+                v1.shr::<T>(shift)?
+            } else {
+                v1.shl::<T>(shift)?
+            }
+        }
+        Err(err) => {
+            debug_assert_eq!(tvm_exception_code(&err).unwrap(), ExceptionCode::RangeCheckError);
+            if !T::quiet() || block_version < 14 {
+                return Err(err);
+            } else {
+                IntegerData::nan()
+            }
+        }
+    };
+    engine.cc.stack.drop(0)?;
+    Ok(())
 }
 
 // (x y - x-y)

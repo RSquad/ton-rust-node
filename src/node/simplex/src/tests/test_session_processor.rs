@@ -1534,6 +1534,178 @@ fn test_handle_skip_certificate_reached_persists_before_relay() {
     );
 }
 
+/// Regression for TN-1386: do not prune the seqno-keyed callback dedup while
+/// old `received_candidates` are still retained.
+///
+/// The original panic happened after `cleanup_old_slots` pruned the slot-keyed
+/// `finalized_delivery_sent` entry, while `received_candidates` still kept the
+/// old ancestor reachable. If we also prune `finalized_delivery_sent_seqno` here,
+/// the next recursive parent-chain walk can emit the same finalized callback a
+/// second time. The seqno map must therefore outlive slot-keyed dedup until old
+/// received-candidate metadata is pruned under the same invariant.
+#[test]
+fn test_cleanup_old_slots_keeps_seqno_dedup_while_received_candidates_are_retained() {
+    let mut opts = SessionOptions::default();
+    opts.use_callback_thread = false;
+    let mut fixture = TestFixture::new_with_opts(4, opts);
+
+    let recording = RecordingListener::new();
+    let listener: Arc<dyn consensus_common::SessionListener + Send + Sync> = recording.clone();
+    fixture.processor.listener = Arc::downgrade(&listener);
+
+    let old_slot = SlotIndex::new(10);
+    let old_hash = UInt256::from([0xAA; 32]);
+    let old_candidate_id = RawCandidateId { slot: old_slot, hash: old_hash.clone() };
+    let old_block_id = BlockIdExt {
+        shard_id: ShardIdent::masterchain(),
+        seq_no: 100,
+        root_hash: UInt256::from([0xAB; 32]),
+        file_hash: UInt256::from([0xAC; 32]),
+    };
+    let received = ReceivedCandidate {
+        slot: old_slot,
+        source_idx: ValidatorIndex::new(0),
+        candidate_id_hash: old_hash.clone(),
+        candidate_hash_data_bytes: vec![1, 2, 3],
+        block_id: old_block_id.clone(),
+        root_hash: old_block_id.root_hash.clone(),
+        file_hash: old_block_id.file_hash.clone(),
+        data: consensus_common::ConsensusCommonFactory::create_block_payload(Vec::new()),
+        collated_data: consensus_common::ConsensusCommonFactory::create_block_payload(Vec::new()),
+        gen_utime_ms: None,
+        receive_time: SystemTime::now(),
+        is_empty: false,
+        parent_id: None,
+    };
+
+    fixture.processor.finalized_delivery_sent.insert(old_candidate_id.clone());
+    fixture.processor.finalized_delivery_sent_seqno.insert(
+        old_block_id.seq_no(),
+        FinalizedSeqnoRecord { slot: old_slot, block_id: old_block_id.clone() },
+    );
+    fixture.processor.received_candidates.insert(old_candidate_id.clone(), received.clone());
+
+    // cleanup_old_slots(MAX_HISTORY_SLOTS) computes up_to_slot = 1, so slot=0
+    // entries would be the only ones cleaned. Using slot=10 above guarantees the
+    // "old" entry sits below the cutoff once we bump the cleanup boundary.
+    fixture.processor.cleanup_old_slots(SlotIndex::new(MAX_HISTORY_SLOTS + old_slot.value() + 1));
+
+    assert!(
+        !fixture.processor.finalized_delivery_sent.contains(&old_candidate_id),
+        "pre-existing slot-keyed dedup pruning must continue to work"
+    );
+    assert!(
+        fixture.processor.received_candidates.contains_key(&old_candidate_id),
+        "old received candidates are still retained today; pruning seqno dedup before this \
+         metadata is gone would allow duplicate callback emission"
+    );
+    assert!(
+        fixture.processor.finalized_delivery_sent_seqno.contains_key(&old_block_id.seq_no()),
+        "TN-1386: seqno-keyed dedup must remain while old candidate metadata remains reachable"
+    );
+
+    let mut complete = true;
+    fixture.processor.try_emit_recursive_finalized_callback(
+        &old_candidate_id,
+        &received,
+        &BlockFinalizedEvent {
+            slot: old_slot,
+            block_hash: old_hash.clone(),
+            block_id: Some(old_block_id.clone()),
+            certificate: make_test_final_cert(old_slot, old_hash),
+        },
+        /*has_final_cert=*/ true,
+        old_slot,
+        &[1, 2, 3],
+        &mut complete,
+    );
+
+    assert!(complete);
+    assert!(
+        drain_finalized_events(&recording).is_empty(),
+        "idempotent re-entry after slot-keyed cleanup must not emit a second finalized callback"
+    );
+    assert!(fixture.processor.finalized_delivery_sent.contains(&old_candidate_id));
+}
+
+/// Regression for TN-1386: `try_emit_recursive_finalized_callback` must treat a
+/// second emit attempt for the **same** `block_id` at the same seqno as
+/// idempotent (no panic, no double-callback) and only assert when a
+/// **different** `block_id` would be reported for an already-delivered seqno.
+///
+/// This protects against the deep recursive parent-chain walk re-entering an
+/// already-delivered ancestor whose slot-keyed `finalized_delivery_sent` entry
+/// was pruned by `cleanup_old_slots` while the seqno-keyed dedup still remembers
+/// the delivered block.
+#[test]
+fn test_try_emit_recursive_finalized_callback_idempotent_on_same_block_id() {
+    let mut fixture = TestFixture::new(4);
+
+    let slot = SlotIndex::new(5);
+    let hash = UInt256::from([0xCC; 32]);
+    let candidate_id = RawCandidateId { slot, hash: hash.clone() };
+    let block_id = BlockIdExt {
+        shard_id: ShardIdent::masterchain(),
+        seq_no: 42,
+        root_hash: UInt256::from([0xDD; 32]),
+        file_hash: UInt256::from([0xEE; 32]),
+    };
+
+    // Seed the seqno-dedup map as if the callback already fired once.
+    fixture
+        .processor
+        .finalized_delivery_sent_seqno
+        .insert(block_id.seq_no(), FinalizedSeqnoRecord { slot, block_id: block_id.clone() });
+    // Simulate that the slot-keyed dedup was pruned by cleanup_old_slots —
+    // i.e. `finalized_delivery_sent` does NOT contain this candidate_id.
+    assert!(!fixture.processor.finalized_delivery_sent.contains(&candidate_id));
+
+    let received = ReceivedCandidate {
+        slot,
+        source_idx: ValidatorIndex::new(0),
+        candidate_id_hash: hash.clone(),
+        candidate_hash_data_bytes: vec![1, 2, 3],
+        block_id: block_id.clone(),
+        root_hash: block_id.root_hash.clone(),
+        file_hash: block_id.file_hash.clone(),
+        data: consensus_common::ConsensusCommonFactory::create_block_payload(Vec::new()),
+        collated_data: consensus_common::ConsensusCommonFactory::create_block_payload(Vec::new()),
+        gen_utime_ms: None,
+        receive_time: SystemTime::now(),
+        is_empty: false,
+        parent_id: None,
+    };
+
+    let dummy_event = BlockFinalizedEvent {
+        slot,
+        block_hash: hash.clone(),
+        block_id: Some(block_id.clone()),
+        certificate: Arc::new(crate::certificate::Certificate {
+            vote: crate::simplex_state::FinalizeVote { slot, block_hash: hash.clone() },
+            signatures: Vec::new(),
+        }),
+    };
+
+    let mut complete = true;
+    // The pre-fix code would unconditionally panic on the seqno-dedup hit.
+    // With the fix this must return silently and re-seed the slot-keyed dedup.
+    fixture.processor.try_emit_recursive_finalized_callback(
+        &candidate_id,
+        &received,
+        &dummy_event,
+        /*has_final_cert=*/ true,
+        slot,
+        &[1, 2, 3],
+        &mut complete,
+    );
+
+    assert!(complete, "idempotent re-entry must not flip the `complete` flag back to false");
+    assert!(
+        fixture.processor.finalized_delivery_sent.contains(&candidate_id),
+        "idempotent path must re-seed the slot-keyed dedup so subsequent walks short-circuit early"
+    );
+}
+
 #[test]
 fn test_update_standstill_after_final_cert_updates_ingress_when_cleanup_is_skipped() {
     let mut fixture = TestFixture::new(4);

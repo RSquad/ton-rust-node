@@ -349,6 +349,7 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
         };
         let mut out_msgs = vec![];
         let need_bounce;
+        let mut msg_balance_before_action = None;
         description.compute_ph = compute_ph;
         description.action = match &description.compute_ph {
             TrComputePhase::Vm(phase) => {
@@ -356,6 +357,7 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
                 if phase.success {
                     log::debug!(target: "executor", "compute_phase: success");
                     log::debug!(target: "executor", "action_phase: lt={}", lt);
+                    msg_balance_before_action = Some(msg_balance.clone());
                     match self.action_phase(
                         &mut tr,
                         account,
@@ -420,11 +422,17 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
             }
         };
 
-        log::debug!(target: "executor", "Desciption.aborted {}", description.aborted);
+        log::debug!(target: "executor", "Description.aborted {}", description.aborted);
         if description.aborted && !is_ext_msg && bounce && need_bounce {
             log::debug!(target: "executor", "bounce_phase");
+            let remaining_msg_balance =
+                if self.config.block_version() >= 14 && description.action.is_some() {
+                    msg_balance_before_action.clone().unwrap_or_else(|| msg_balance.clone())
+                } else {
+                    msg_balance.clone()
+                };
             description.bounce = match self.bounce_phase(
-                msg_balance.clone(),
+                remaining_msg_balance,
                 &mut acc_balance,
                 &description.compute_ph,
                 description.action.as_ref(),

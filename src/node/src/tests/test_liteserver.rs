@@ -378,6 +378,7 @@ struct LiteServerTestEngine {
     current_time: u32,
     internal_db: Arc<InternalDb>,
     last_mc_block_id: BlockIdExt,
+    shard_client_mc_block_id: Option<BlockIdExt>,
     mock_blocks: HashMap<BlockIdExt, Vec<u8>>,
     mock_handles: HashMap<BlockIdExt, Arc<BlockHandle>>,
     mock_states: HashMap<BlockIdExt, MockShardState>,
@@ -455,6 +456,7 @@ impl LiteServerTestEngine {
             current_time: 1640995200,
             internal_db: Arc::new(db),
             last_mc_block_id: mc_state_id.clone(),
+            shard_client_mc_block_id: None,
             zerostate_id,
             mock_blocks: HashMap::new(),
             mock_handles: HashMap::new(),
@@ -525,6 +527,10 @@ impl LiteServerTestEngine {
         self.last_mc_block_id = id;
     }
 
+    fn set_shard_client_mc_block_id(&mut self, id: BlockIdExt) {
+        self.shard_client_mc_block_id = Some(id);
+    }
+
     //fn set_state_delay_ms(&self, delay_ms: u64) {
     //    self.state_delay_ms.store(delay_ms, Ordering::Relaxed);
     //}
@@ -550,7 +556,8 @@ impl EngineOperations for LiteServerTestEngine {
     }
 
     fn load_shard_client_mc_block_id(&self) -> Result<Option<Arc<BlockIdExt>>> {
-        Ok(Some(Arc::new(self.last_mc_block_id.clone())))
+        let id = self.shard_client_mc_block_id.as_ref().unwrap_or(&self.last_mc_block_id);
+        Ok(Some(Arc::new(id.clone())))
     }
 
     fn find_full_block_id(&self, root_hash: &UInt256) -> Result<Option<BlockIdExt>> {
@@ -727,7 +734,7 @@ async fn test_get_version() -> Result<()> {
 
     assert_eq!(result.mode, 0);
     assert_eq!(result.version, 0x101);
-    assert_eq!(result.capabilities, 0x7);
+    assert_eq!(result.capabilities, 0xf);
 
     Ok(())
 }
@@ -883,6 +890,75 @@ async fn test_get_masterchain_info() -> Result<()> {
     assert_eq!(result.last.shard(), &ShardIdent::masterchain());
     assert_eq!(result.init.workchain, -1);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_get_masterchain_info_ext_shard_client_state() -> Result<()> {
+    let last_liteserver_state = gen_master_state(
+        GenMasterStateParams {
+            master_state_id: Some(BlockIdExt {
+                shard_id: ShardIdent::masterchain(),
+                seq_no: 100,
+                root_hash: UInt256::from([10u8; 32]),
+                file_hash: UInt256::from([11u8; 32]),
+            }),
+            ..Default::default()
+        },
+        #[cfg(feature = "telemetry")]
+        None,
+        None,
+    );
+    let shard_client_state = gen_master_state(
+        GenMasterStateParams {
+            master_state_id: Some(BlockIdExt {
+                shard_id: ShardIdent::masterchain(),
+                seq_no: 80,
+                root_hash: UInt256::from([12u8; 32]),
+                file_hash: UInt256::from([13u8; 32]),
+            }),
+            ..Default::default()
+        },
+        #[cfg(feature = "telemetry")]
+        None,
+        None,
+    );
+
+    let mut engine = LiteServerTestEngine::new().await;
+    engine.set_last_mc_block_id(last_liteserver_state.block_id().clone());
+    engine.set_shard_client_mc_block_id(shard_client_state.block_id().clone());
+    engine.add_ready_state(last_liteserver_state.block_id().clone(), last_liteserver_state.clone());
+    engine.add_ready_state(shard_client_state.block_id().clone(), shard_client_state.clone());
+    let engine = Arc::new(engine);
+    let engine_dyn = engine.clone() as Arc<dyn EngineOperations>;
+
+    let last_liteserver_info =
+        LiteServerQuerySubscriber::get_masterchain_info_ext(&engine_dyn, 0).await?;
+    assert_eq!(last_liteserver_info.mode, 0);
+    assert_eq!(last_liteserver_info.version, 0x101);
+    assert_eq!(last_liteserver_info.capabilities, 0xf);
+    assert_eq!(last_liteserver_info.last, last_liteserver_state.block_id().clone());
+    assert_eq!(
+        last_liteserver_info.state_root_hash,
+        last_liteserver_state.root_cell().repr_hash().clone()
+    );
+
+    let shard_client_info =
+        LiteServerQuerySubscriber::get_masterchain_info_ext(&engine_dyn, 1).await?;
+    assert_eq!(shard_client_info.mode, 1);
+    assert_eq!(shard_client_info.version, 0x101);
+    assert_eq!(shard_client_info.capabilities, 0xf);
+    assert_eq!(shard_client_info.last, shard_client_state.block_id().clone());
+    assert_eq!(
+        shard_client_info.state_root_hash,
+        shard_client_state.root_cell().repr_hash().clone()
+    );
+
+    let unsupported = LiteServerQuerySubscriber::get_masterchain_info_ext(&engine_dyn, 2).await;
+    assert!(unsupported
+        .unwrap_err()
+        .to_string()
+        .contains("unsupported getMasterchainInfoExt mode: 0x2"));
     Ok(())
 }
 

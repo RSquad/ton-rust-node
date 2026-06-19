@@ -21,7 +21,7 @@ use crate::{
     shard::ShardStateUnsplit,
     types::{ChildCell, Coins, CurrencyCollection, InRefValue, VarUInteger3, VarUInteger7},
     AccountId, BuilderData, Cell, Deserializable, HashmapType, IBitstring, Result, Serializable,
-    SliceData, UInt256, UsageTree,
+    SliceData, StorageRoots, UInt256, UsageTree,
 };
 use std::{fmt, sync::Arc};
 
@@ -1275,6 +1275,9 @@ pub struct Transaction {
     blackhole_burned: Coins,
     state_update: ChildCell<HashUpdate>,
     description: ChildCell<TransactionDescr>,
+    // Not serialized: storage roots the executor's stat ran over (tentative on a limit rollback).
+    // Collation-only; drives collated data.
+    account_updates: StorageRoots,
 }
 
 impl Transaction {
@@ -1296,6 +1299,7 @@ impl Transaction {
             blackhole_burned: Coins::default(),
             state_update: ChildCell::default(),
             description: ChildCell::default(),
+            account_updates: StorageRoots::new(),
         }
     }
 
@@ -1320,7 +1324,16 @@ impl Transaction {
             blackhole_burned: Coins::default(),
             state_update: ChildCell::default(),
             description: ChildCell::default(),
+            account_updates: StorageRoots::new(),
         })
+    }
+
+    pub fn account_updates(&self) -> &[Cell] {
+        &self.account_updates
+    }
+
+    pub fn set_account_updates(&mut self, roots: StorageRoots) {
+        self.account_updates = roots;
     }
 
     /// Get account address of transaction
@@ -1578,6 +1591,7 @@ impl Default for Transaction {
             blackhole_burned: Coins::default(),
             state_update: ChildCell::default(),
             description: ChildCell::default(),
+            account_updates: StorageRoots::new(),
         }
     }
 }

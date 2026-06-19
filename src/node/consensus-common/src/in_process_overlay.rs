@@ -292,7 +292,12 @@ impl ConsensusOverlay for OverlayClientImpl {
                     );
                 }
                 for listener in listeners_to_call {
-                    listener.on_broadcast(send_as.clone(), &payload);
+                    // In-process stub maps everything to the consensus overlay
+                    listener.on_broadcast(
+                        send_as.clone(),
+                        &payload,
+                        crate::BroadcastSource::ConsensusOverlay,
+                    );
                 }
             } else {
                 log::trace!(
@@ -484,6 +489,7 @@ impl ConsensusOverlayManager for OverlayManagerImpl {
         overlay_listener: ConsensusOverlayListenerPtr,
         _log_replay_listener: ConsensusOverlayLogReplayListenerPtr,
         _transport_type: OverlayTransportType,
+        _block_sync_params: Option<crate::BlockSyncOverlayParams>,
     ) -> Result<ConsensusOverlayPtr> {
         let local_id = local_validator_key.id();
         log::debug!(

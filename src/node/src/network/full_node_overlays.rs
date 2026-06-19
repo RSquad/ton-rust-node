@@ -68,13 +68,13 @@ use ton_block::{
 /// classes, overlays are physical entities not tied to shards or other blockchain entities.
 ///
 /// ValidatorManager  Collator  ValidatorQuery  etc.   <- high level node commponents
-///       ↓              ↓             ↓
+///       v              v             v
 ///                 Engine
-///                  ↓ ↑
+///                  v ^
 ///         **FullNodeOverlaysRouter** contains list of FullNodeOverlayClient
-///                    ↓
+///                    v
 ///               NodeNetwork                   <- low level node components
-///                    ↓
+///                    v
 ///            network protocols
 pub struct FullNodeOverlaysRouter {
     engine: Arc<dyn EngineOperations>,
@@ -588,9 +588,7 @@ impl FullNodeOverlaysRouter {
                             Ok(Some(CustomOverlayClient::new(
                                 config,
                                 self.network.cancellation_token().child_token(),
-                                self.network.context().stack.adnl.clone(),
-                                self.network.context().stack.overlay.clone(),
-                                self.network.context().stack.dht.clone(),
+                                self.network.context().stack.clone(),
                                 self.engine.clone(),
                             )?))
                         }
@@ -862,7 +860,7 @@ impl FullNodeOverlaysRouter {
                         }
                     }
                     for overlay in custom_overlays {
-                        overlay.send_broadcast(&broadcast, 0, AdnlSendMethod::Fast).await?;
+                        overlay.send_broadcast(&broadcast, 0).await?;
                     }
                 }
 
@@ -904,7 +902,7 @@ impl FullNodeOverlaysRouter {
                     }
                 }
                 for overlay in custom_overlays {
-                    overlay.send_broadcast(&broadcast, 0, AdnlSendMethod::Fast).await?;
+                    overlay.send_broadcast(&broadcast, 0).await?;
                 }
 
                 let client = self.overlay_client(block.id().shard()).await?;
@@ -959,7 +957,7 @@ impl FullNodeOverlaysRouter {
         for guard in self.custom_overlays.iter() {
             let overlay = guard.val();
             if overlay.sends_msgs_to(to) {
-                overlay.send_broadcast(&broadcast, 0, AdnlSendMethod::Fast).await?;
+                overlay.send_broadcast(&broadcast, 0).await?;
                 if overlay.skip_public_msg_send() {
                     skip_public = true;
                 }
@@ -991,7 +989,7 @@ impl FullNodeOverlaysRouter {
         }
         let fast_sync_client = self.fast_sync_overlay(id.shard());
         if !custom_overlays.is_empty() || fast_sync_client.is_some() {
-            log::debug!("Sending block candidate broadcast {}...", id);
+            log::debug!("Sending block candidate broadcast {id}...");
             let broadcast = build_block_candidate_broadcast_compressed(
                 id.clone(),
                 cc_seqno,
@@ -1005,7 +1003,7 @@ impl FullNodeOverlaysRouter {
                 tag: broadcast.bare_object().constructor(),
             };
             for overlay in custom_overlays {
-                overlay.send_broadcast(&broadcast, 0, AdnlSendMethod::Fast).await?;
+                overlay.send_broadcast(&broadcast, 0).await?;
             }
             if let Some(client) = fast_sync_client {
                 if client.use_twostep() {

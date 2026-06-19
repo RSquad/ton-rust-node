@@ -9,6 +9,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 pub mod accept_block;
+pub mod block_sync_observer;
 pub mod candidate_db;
 pub mod collator;
 pub mod consensus;

@@ -627,6 +627,16 @@ fn test_pruned_cell_load_tx() {
     )
 }
 
+#[test]
+fn test_pruned_cell() {
+    replay_transaction_by_files(
+        "real_boc/pruned_cell_account_old.boc",
+        "real_boc/pruned_cell_account_new.boc",
+        "real_boc/pruned_cell_transaction.boc",
+        "real_boc/config.boc",
+    )
+}
+
 // account has anycast in address
 #[test]
 fn test_with_anycast() {

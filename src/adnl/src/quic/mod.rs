@@ -92,6 +92,56 @@ fn key_id_from_spki(spki: &[u8]) -> Result<Arc<KeyId>> {
     Ok(KeyId::from_data(data))
 }
 
+/// SNI name used to route an inbound QUIC handshake to a specific ADNL identity
+/// when several identities share one UDP port. Matches the C++ node's
+/// `ServerIdentity::sni` the 32-byte ADNL short id is rendered as lowercase hex
+/// and split at the midpoint into two 32-char labels, joined by dots, with a
+/// trailing ".adnl" — "<hex[..32]>.<hex[32..]>.adnl".
+/// Splitting the hex keeps each label within the RFC 1035 63-octet DNS label
+/// limit so rustls accepts the name natively, with no patched dependency
+fn compute_sni_name(key_id: &KeyId) -> String {
+    let hex = hex::encode(key_id.data());
+    format!("{}.{}.adnl", &hex[..32], &hex[32..])
+}
+
+/// Inverse of `compute_sni_name`. Returns `None` if the SNI does not match
+/// the "<32-hex>.<32-hex>.adnl" shape
+fn key_id_from_sni(server_name: &str) -> Option<Arc<KeyId>> {
+    const SUFFIX: &str = ".adnl";
+    let prefix_len = server_name.len().checked_sub(SUFFIX.len())?;
+    let (prefix, suffix) = server_name.split_at(prefix_len);
+    if !suffix.eq_ignore_ascii_case(SUFFIX) {
+        return None;
+    }
+    let (h1, h2) = prefix.split_once('.')?;
+    if h1.len() != 32 || h2.len() != 32 {
+        return None;
+    }
+    let mut data = [0u8; 32];
+    hex::decode_to_slice(h1, &mut data[..16]).ok()?;
+    hex::decode_to_slice(h2, &mut data[16..]).ok()?;
+    Some(KeyId::from_data(data))
+}
+
+/// Look up a registered local identity by its SNI. Returns `None` if SNI is
+/// absent or does not parse to a known identity; the caller decides whether
+/// that means fall back to the active identity or reject the handshake
+fn match_identity_by_sni(
+    server_name: Option<&str>,
+    registered_keys: &Mutex<HashMap<Arc<KeyId>, Arc<rustls::sign::CertifiedKey>>>,
+) -> Option<(Arc<KeyId>, Arc<rustls::sign::CertifiedKey>)> {
+    let key_id = key_id_from_sni(server_name?)?;
+    let keys = registered_keys.lock().ok()?;
+    keys.get_key_value(&*key_id).map(|(k, v)| (k.clone(), v.clone()))
+}
+
+/// Read the SNI the client sent during the QUIC/TLS handshake (server side)
+fn negotiated_sni(conn: &quinn::Connection) -> Option<String> {
+    let data = conn.handshake_data()?;
+    let data = data.downcast::<quinn::crypto::rustls::HandshakeData>().ok()?;
+    data.server_name
+}
+
 struct QuicOutboundConnection {
     conn: Option<quinn::Connection>,
     send_queue: Arc<QuicSendQueue>,
@@ -242,15 +292,22 @@ impl rustls::client::danger::ServerCertVerifier for QuicServerCertVerifier {
     }
 }
 
-/// Presents the active RPK (Ed25519 SPKI, RFC 7250) to connecting peers.
-/// SNI is ignored — there is exactly one active identity per endpoint.
+/// Presents an RPK (Ed25519 SPKI, RFC 7250) to connecting peers.
+/// If the client sends an SNI matching a registered identity, that identity's
+/// cert is presented; otherwise the active identity is used as the default.
+/// This mirrors the C++ node's SNI-based identity dispatch and lets several
+/// validator identities share one UDP port.
 struct QuicServerCertResolver {
     active_identity: Arc<Mutex<Option<ActiveIdentity>>>,
+    registered_keys: Arc<Mutex<HashMap<Arc<KeyId>, Arc<rustls::sign::CertifiedKey>>>>,
 }
 
 impl QuicServerCertResolver {
-    fn new(active_identity: Arc<Mutex<Option<ActiveIdentity>>>) -> Arc<Self> {
-        Arc::new(Self { active_identity })
+    fn new(
+        active_identity: Arc<Mutex<Option<ActiveIdentity>>>,
+        registered_keys: Arc<Mutex<HashMap<Arc<KeyId>, Arc<rustls::sign::CertifiedKey>>>>,
+    ) -> Arc<Self> {
+        Arc::new(Self { active_identity, registered_keys })
     }
 }
 
@@ -263,8 +320,30 @@ impl Debug for QuicServerCertResolver {
 impl rustls::server::ResolvesServerCert for QuicServerCertResolver {
     fn resolve(
         &self,
-        _client_hello: rustls::server::ClientHello<'_>,
+        client_hello: rustls::server::ClientHello<'_>,
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        // 1. SNI names one of our registered identities -> present that cert.
+        if let Some((_, cert)) =
+            match_identity_by_sni(client_hello.server_name(), &self.registered_keys)
+        {
+            return Some(cert);
+        }
+        // 2. SNI present but did not match. "ton" is the legacy dummy older Rust
+        //    clients sent unconditionally; treat it as no SNI (silent fallback
+        //    to the active identity). Anything else is rejected: returning None
+        //    here makes rustls fail the handshake
+        if let Some(name) = client_hello.server_name() {
+            if !name.eq_ignore_ascii_case("ton") {
+                // handle_connection logs the resulting handshake failure with
+                // peer address; this only adds the SNI for diagnostics
+                log::debug!(
+                    target: TARGET,
+                    "QUIC inbound: rejecting unknown SNI {name:?}"
+                );
+                return None;
+            }
+        }
+        // 3. No SNI or legacy "ton" -> present the active identity
         self.active_identity
             .lock()
             .ok()
@@ -1005,8 +1084,12 @@ impl QuicNode {
                 .map(|s| s.endpoint.clone())
                 .ok_or_else(|| error!("No QUIC endpoint for port {}", state.bound_port))?
         };
+        // Send the peer's SNI so a node hosting several identities on this UDP
+        // port routes the handshake to the identity we actually want to reach
+        // (matches the C++ node). Peers hosting a single identity ignore it.
+        let server_name = compute_sni_name(dst);
         let conn = endpoint
-            .connect_with(state.client_config.clone(), addr, Self::OUTBOUND_SERVER_NAME)
+            .connect_with(state.client_config.clone(), addr, &server_name)
             .map_err(|e| error!("QUIC connect to {addr}: {e}"))?
             .await
             .map_err(|e| error!("QUIC handshake to {addr}: {e}"))?;
@@ -1119,7 +1202,8 @@ impl QuicNode {
         let active_identity: Arc<Mutex<Option<ActiveIdentity>>> = Arc::new(Mutex::new(None));
         let registered_keys = Arc::new(Mutex::new(HashMap::new()));
         let verifier = QuicClientCertVerifier::new();
-        let server_cert_resolver = QuicServerCertResolver::new(active_identity.clone());
+        let server_cert_resolver =
+            QuicServerCertResolver::new(active_identity.clone(), registered_keys.clone());
         let mut tls_config = rustls::ServerConfig::builder()
             .with_client_cert_verifier(verifier.clone())
             .with_cert_resolver(server_cert_resolver.clone());
@@ -1214,6 +1298,7 @@ impl QuicNode {
         Self::spawn_accept_loop(
             endpoint.clone(),
             active_identity.clone(),
+            registered_keys.clone(),
             self.subscribers.clone(),
             bind_addr,
             self.cancellation_token.clone(),
@@ -1358,6 +1443,7 @@ impl QuicNode {
     async fn handle_connection(
         incoming: quinn::Incoming,
         active_identity: Arc<Mutex<Option<ActiveIdentity>>>,
+        registered_keys: Arc<Mutex<HashMap<Arc<KeyId>, Arc<rustls::sign::CertifiedKey>>>>,
         inbound: Arc<QuicInboundMap>,
         ip_conn_count: Arc<QuicIpConnCount>,
         subscribers: Arc<Vec<Arc<dyn Subscriber>>>,
@@ -1399,20 +1485,28 @@ impl QuicNode {
             }
         };
 
-        let local_key_id = match active_identity
-            .lock()
-            .ok()
-            .and_then(|g| g.as_ref().map(|identity| identity.key_id.clone()))
-        {
-            Some(key_id) => key_id,
-            None => {
-                log::warn!(
-                    target: TARGET,
-                    "No active key on {bind_addr}, closing {addr}"
-                );
-                conn.close(0u32.into(), b"No active key");
-                return;
-            }
+        // Determine which local identity served this handshake. If the client
+        // sent an SNI matching a registered identity, the cert resolver presented
+        // that identity's cert, so bind the connection to it. Otherwise fall back
+        // to the active identity (the C++ "default" identity behavior).
+        let sni = negotiated_sni(&conn);
+        let local_key_id = match match_identity_by_sni(sni.as_deref(), &registered_keys) {
+            Some((key_id, _)) => key_id,
+            None => match active_identity
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().map(|identity| identity.key_id.clone()))
+            {
+                Some(key_id) => key_id,
+                None => {
+                    log::warn!(
+                        target: TARGET,
+                        "No active key on {bind_addr}, closing {addr}"
+                    );
+                    conn.close(0u32.into(), b"No active key");
+                    return;
+                }
+            },
         };
 
         log::info!(
@@ -1544,10 +1638,6 @@ impl QuicNode {
             (conn_id={conn_id}, streams={total_streams})"
         );
     }
-
-    /// Dummy server name for outbound QUIC connections. Quinn/TLS requires a
-    /// server_name parameter but neither side uses SNI for identity resolution.
-    const OUTBOUND_SERVER_NAME: &'static str = "ton";
 
     fn local_key_state(&self, src: &Arc<KeyId>) -> Result<Arc<LocalKeyState>> {
         self.local_keys
@@ -2067,6 +2157,7 @@ impl QuicNode {
     fn spawn_accept_loop(
         endpoint: quinn::Endpoint,
         active_identity: Arc<Mutex<Option<ActiveIdentity>>>,
+        registered_keys: Arc<Mutex<HashMap<Arc<KeyId>, Arc<rustls::sign::CertifiedKey>>>>,
         subscribers: Arc<Vec<Arc<dyn Subscriber>>>,
         bind_addr: SocketAddr,
         cancellation_token: tokio_util::sync::CancellationToken,
@@ -2156,6 +2247,7 @@ impl QuicNode {
                         transport_errors.accepted.fetch_add(1, Ordering::Relaxed);
                         let token = cancellation_token.clone();
                         let ai = active_identity.clone();
+                        let rk = registered_keys.clone();
                         let ib = inbound.clone();
                         let ipc = ip_conn_count.clone();
                         let subs = subscribers.clone();
@@ -2179,7 +2271,7 @@ impl QuicNode {
                                         log::debug!(target: TARGET, "QUIC connection handler for {addr} cancelled");
                                     }
                                     _ = Self::handle_connection(
-                                        incoming, ai, ib, ipc, subs, bind_addr, stats,
+                                        incoming, ai, rk, ib, ipc, subs, bind_addr, stats,
                                     ) => {}
                                 }
                             });
@@ -2190,7 +2282,7 @@ impl QuicNode {
                                         log::debug!(target: TARGET, "QUIC connection handler for {addr} cancelled");
                                     }
                                     _ = Self::handle_connection(
-                                        incoming, ai, ib, ipc, subs, bind_addr, stats,
+                                        incoming, ai, rk, ib, ipc, subs, bind_addr, stats,
                                     ) => {}
                                 }
                             });

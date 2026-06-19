@@ -17,6 +17,7 @@ use crate::{
     engine_traits::EngineAlloc,
     internal_db::{
         ARCHIVE_CELLS_CF_NAME, ARCHIVE_SHARDSTATE_CF_NAME, CURRENT_DB_VERSION, DB_VERSION,
+        SHARD_CLIENT_MC_BLOCK,
     },
     shard_state::ShardStateStuff,
 };
@@ -337,7 +338,15 @@ pub async fn run_import(config: ImportConfig) -> Result<Arc<RocksDb>> {
     let mut validator_state = ValidatorState::new(mc_zerostate.clone(), hardforks);
     let mut skip_count = 0;
 
-    let last_imported = if let Some(max_seqno) = archive_manager.get_max_mc_seqno().await {
+    let last_imported = if let Some(max_mc) = archive_manager.get_max_mc_seqno().await {
+        // Clamp resume to the shard client: the node may have
+        // applied MC blocks ahead of the shard client, whose shard tops have no handles
+        // yet — re-import those groups instead of skipping them.
+        let shard_client_seqno = block_handle_storage
+            .load_full_node_state(SHARD_CLIENT_MC_BLOCK)?
+            .map(|id| id.seq_no())
+            .unwrap_or(max_mc);
+        let max_seqno = max_mc.min(shard_client_seqno);
         if max_seqno > groups.last().unwrap().archive_id + ARCHIVE_PACKAGE_SIZE as u32 {
             log::warn!(target: TARGET,
                 "Existing import detected with max MC seqno {}, which is beyond the last archive group ({}), skipping all groups",

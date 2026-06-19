@@ -17,6 +17,16 @@ use ton_vm::{
 mod common;
 use common::*;
 
+fn test_continuation(code: &str) -> ContinuationData {
+    ContinuationData::with_code(compile_code(code).unwrap())
+}
+
+fn stack_with_cont(cont: ContinuationData) -> Stack {
+    let mut stack = Stack::new();
+    stack.push_cont(cont);
+    stack
+}
+
 #[ignore] // we should have c0, c1, c2 and other instantiated
 #[test]
 fn test_pushctr_uninitialized_register() {
@@ -723,6 +733,50 @@ fn setaltctr() {
 }
 
 #[test]
+fn setaltctr_setretctr_duplicate_savelist_slot_v14() {
+    let mut alt = test_continuation("NOP");
+    alt.put_to_savelist(0, StackItem::continuation(test_continuation("NOP"))).unwrap();
+
+    let setaltctr_case = "
+        PUSHCONT {
+            NOP
+        }
+        PUSHCONT {
+            NOP
+        }
+        SWAP
+        SETCONTCTR c0
+        POPCTR c1
+        PUSHINT 1
+        SETALTCTR c0
+    ";
+
+    test_case(setaltctr_case)
+        .expect_empty_stack()
+        .expect_ctrl(1, &StackItem::continuation(alt.clone()));
+
+    test_case(setaltctr_case).with_block_version(13).expect_failure(ExceptionCode::TypeCheckError);
+
+    let setretctr_case = "
+        PUSHCONT {
+            PUSHINT 7
+        }
+        PUSHCONT {
+            NOP
+        }
+        SWAP
+        SETCONTCTR c0
+        POPCTR c0
+        PUSHINT 1
+        SETRETCTR c0
+    ";
+
+    test_case(setretctr_case).expect_int_stack(&[7]);
+
+    test_case(setretctr_case).with_block_version(13).expect_failure(ExceptionCode::TypeCheckError);
+}
+
+#[test]
 fn setcontargs() {
     let mut cont = ContinuationData::with_code(compile_code("PUSH s0").unwrap());
     cont.nargs = 2;
@@ -794,6 +848,78 @@ fn setcontctrx() {
 }
 
 #[test]
+fn setcontctr_duplicate_savelist_slot_v14() {
+    let mut expected = test_continuation("PUSH s0");
+    expected.put_to_savelist(0, StackItem::continuation(test_continuation("NOP"))).unwrap();
+
+    test_case(
+        "PUSHCONT {
+             PUSH s0
+         }
+         PUSHCONT {
+             NOP
+         }
+         SWAP
+         SETCONTCTR c0
+         PUSHINT 1
+         SWAP
+         SETCONTCTR c0",
+    )
+    .expect_stack(Stack::new().push_cont(expected.clone()));
+
+    test_case(
+        "PUSHCONT {
+             PUSH s0
+         }
+         PUSHCONT {
+             NOP
+         }
+         SWAP
+         SETCONTCTR c0
+         PUSHINT 1
+         SWAP
+         SETCONTCTR c0",
+    )
+    .with_block_version(13)
+    .expect_failure(ExceptionCode::TypeCheckError);
+
+    test_case(
+        "PUSHCONT {
+             PUSH s0
+         }
+         PUSHCONT {
+             NOP
+         }
+         SWAP
+         PUSHINT 0
+         SETCONTCTRX
+         PUSHINT 1
+         SWAP
+         PUSHINT 0
+         SETCONTCTRX",
+    )
+    .expect_stack(Stack::new().push_cont(expected.clone()));
+
+    test_case(
+        "PUSHCONT {
+             PUSH s0
+         }
+         PUSHCONT {
+             NOP
+         }
+         SWAP
+         PUSHINT 0
+         SETCONTCTRX
+         PUSHINT 1
+         SWAP
+         PUSHINT 0
+         SETCONTCTRX",
+    )
+    .with_block_version(13)
+    .expect_failure(ExceptionCode::TypeCheckError);
+}
+
+#[test]
 fn setcontctrmany_normal() {
     let mut cont0 = ContinuationData::with_code(compile_code("PUSH s0").unwrap());
     test_case("PUSHCONT { DUP } SETCONTCTRMANY 0")
@@ -835,6 +961,50 @@ fn setcontctrmany_normal() {
         SETCONTCTRMANYX",
     )
     .expect_stack(Stack::new().push_cont(cont0.clone()).push_int(1));
+}
+
+#[test]
+fn setcontctrmany_duplicate_savelist_slot_v14() {
+    let old_c0 = test_continuation("ZERO");
+    let new_c0 = test_continuation("ONE");
+    let new_c1 = test_continuation("TWO");
+
+    let mut input = test_continuation("PUSH s0");
+    input.put_to_savelist(0, StackItem::continuation(old_c0.clone())).unwrap();
+
+    let mut expected_v14 = test_continuation("PUSH s0");
+    expected_v14.put_to_savelist(0, StackItem::continuation(old_c0.clone())).unwrap();
+    expected_v14.put_to_savelist(1, StackItem::continuation(new_c1.clone())).unwrap();
+
+    let mut expected_v13 = test_continuation("PUSH s0");
+    expected_v13.put_to_savelist(0, StackItem::continuation(new_c0.clone())).unwrap();
+    expected_v13.put_to_savelist(1, StackItem::continuation(new_c1.clone())).unwrap();
+
+    test_case("SETCONTCTRMANY 3")
+        .with_stack(stack_with_cont(input.clone()))
+        .with_ctrl(0, StackItem::continuation(new_c0.clone()))
+        .with_ctrl(1, StackItem::continuation(new_c1.clone()))
+        .expect_stack(Stack::new().push_cont(expected_v14.clone()).push_int(1));
+
+    test_case("SETCONTCTRMANY 3")
+        .with_stack(stack_with_cont(input.clone()))
+        .with_ctrl(0, StackItem::continuation(new_c0.clone()))
+        .with_ctrl(1, StackItem::continuation(new_c1.clone()))
+        .with_block_version(13)
+        .expect_stack(Stack::new().push_cont(expected_v13.clone()).push_int(1));
+
+    test_case("PUSHINT 3 SETCONTCTRMANYX")
+        .with_stack(stack_with_cont(input.clone()))
+        .with_ctrl(0, StackItem::continuation(new_c0.clone()))
+        .with_ctrl(1, StackItem::continuation(new_c1.clone()))
+        .expect_stack(Stack::new().push_cont(expected_v14).push_int(1));
+
+    test_case("PUSHINT 3 SETCONTCTRMANYX")
+        .with_stack(stack_with_cont(input))
+        .with_ctrl(0, StackItem::continuation(new_c0))
+        .with_ctrl(1, StackItem::continuation(new_c1))
+        .with_block_version(13)
+        .expect_stack(Stack::new().push_cont(expected_v13).push_int(1));
 }
 
 #[test]

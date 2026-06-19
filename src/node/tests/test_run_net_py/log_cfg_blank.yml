@@ -105,3 +105,12 @@ loggers:
   consensus_adnl_overlay:
     level: debug
 
+  block_sync_telemetry:
+    level: info
+
+  block_sync_observer:
+    level: debug
+
+  block_sync_precheck:
+    level: debug
+

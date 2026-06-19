@@ -11,14 +11,14 @@ use std::cmp::Ordering;
 use ton_block::{Result, SliceData};
 
 pub enum FixGasPrefix {
-    Number(u16),
-    Range(u16, u16),
+    Number(u32),
+    Range(u32, u32),
 }
 
 // this table is used to fix the bug with incorrect gas for short codes in C++ implementation of TVM
-pub static FIX_GAS: [&[(FixGasPrefix, u8)]; 16] = [
+pub static FIX_GAS: [&[(FixGasPrefix, u8)]; 15] = [
     &FIX_GAS1, &FIX_GAS2, &FIX_GAS3, &FIX_GAS4, &FIX_GAS5, &FIX_GAS6, &FIX_GAS7, &FIX_GAS8,
-    &FIX_GAS9, &FIX_GAS10, &FIX_GAS11, &FIX_GAS12, &FIX_GAS13, &FIX_GAS14, &FIX_GAS15, &FIX_GAS16,
+    &FIX_GAS9, &FIX_GAS10, &FIX_GAS11, &FIX_GAS12, &FIX_GAS13, &FIX_GAS14, &FIX_GAS15,
 ];
 static FIX_GAS1: [(FixGasPrefix, u8); 1] = [(FixGasPrefix::Number(0x1), 26)];
 static FIX_GAS2: [(FixGasPrefix, u8); 1] = [(FixGasPrefix::Range(0x1, 0x3), 26)];
@@ -1121,7 +1121,7 @@ static FIX_GAS15: [(FixGasPrefix, u8); 343] = [
     (FixGasPrefix::Range(0x7D85, 0x7EFF), 10),
     (FixGasPrefix::Range(0x7F00, 0x7FFF), 26),
 ];
-static FIX_GAS16: [(FixGasPrefix, u8); 26] = [
+static FIX_GAS16: [(FixGasPrefix, u8); 33] = [
     (FixGasPrefix::Number(0x6C), 28),
     (FixGasPrefix::Range(0x86, 0x87), 28),
     (FixGasPrefix::Number(0xAF), 28),
@@ -1148,16 +1148,44 @@ static FIX_GAS16: [(FixGasPrefix, u8); 26] = [
     (FixGasPrefix::Range(0x5400, 0x547F), 34),
     (FixGasPrefix::Range(0x5480, 0x54FF), 10),
     (FixGasPrefix::Number(0x686C), 28),
+    (FixGasPrefix::Range(0xA910, 0xA91F), 10),
+    (FixGasPrefix::Range(0xA930, 0xA93F), 34),
+    (FixGasPrefix::Range(0xA940, 0xA97F), 10),
+    (FixGasPrefix::Range(0xA990, 0xA99F), 10),
+    (FixGasPrefix::Range(0xA9B0, 0xA9BF), 34),
+    (FixGasPrefix::Range(0xA9D0, 0xA9DF), 34),
+    (FixGasPrefix::Range(0xA9E0, 0xA9FF), 10),
 ];
 
-pub fn check_too_short_code(code: &SliceData) -> Result<Option<(u16, u8, u8)>> {
-    let bits = code.remaining_bits();
-    if bits == 0 || bits > 16 {
-        return Ok(None);
-    }
-    let fix_gas = FIX_GAS[bits - 1];
-    let cmd = code.get_int(bits)? as u16;
-    let bits = bits as u8;
+static FIX_GAS24: [(FixGasPrefix, u8); 10] = [
+    (FixGasPrefix::Range(0xA91000, 0xA91FFF), 10),
+    (FixGasPrefix::Range(0xA94000, 0xA97FFF), 10),
+    (FixGasPrefix::Range(0xA99000, 0xA99FFF), 10),
+    (FixGasPrefix::Range(0xA9E000, 0xA9FFFF), 10),
+    (FixGasPrefix::Range(0xB7A910, 0xB7A91F), 10),
+    (FixGasPrefix::Range(0xB7A930, 0xB7A97F), 10),
+    (FixGasPrefix::Range(0xB7A990, 0xB7A99F), 10),
+    (FixGasPrefix::Range(0xB7A9B0, 0xB7A9BF), 10),
+    (FixGasPrefix::Range(0xB7A9D0, 0xB7A9DF), 10),
+    (FixGasPrefix::Range(0xB7A9E0, 0xB7A9FF), 10),
+];
+
+pub fn check_too_short_code(code: &SliceData) -> Result<Option<(u32, u8, u8)>> {
+    let mut bits = code.remaining_bits();
+    let fix_gas = match bits {
+        0 => return Ok(None),
+        1..16 => FIX_GAS[bits - 1],
+        16..24 => {
+            bits = 16;
+            &FIX_GAS16
+        }
+        24.. => {
+            bits = 24;
+            &FIX_GAS24
+        }
+    };
+    let cmd = code.get_int(bits)? as u32;
+    // println!("cmd: {cmd:#X}, bits: {bits}");
     let result = fix_gas.binary_search_by(|(prefix, _)| match prefix {
         FixGasPrefix::Number(n) => n.cmp(&cmd),
         FixGasPrefix::Range(start, end) => {
@@ -1172,7 +1200,7 @@ pub fn check_too_short_code(code: &SliceData) -> Result<Option<(u16, u8, u8)>> {
     });
     if let Ok(index) = result {
         let (_, gas) = fix_gas[index];
-        Ok(Some((cmd, bits, gas)))
+        Ok(Some((cmd, bits as u8, gas)))
     } else {
         Ok(None)
     }

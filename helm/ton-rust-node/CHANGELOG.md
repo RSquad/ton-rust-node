@@ -5,6 +5,19 @@ All notable changes to the Helm chart will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 Versions follow the Helm chart release tags (e.g. `helm/v0.3.0`).
 
+## [0.5.0] - 2026-05-27
+
+appVersion: `v0.8.0`
+
+### Changed
+
+- Default image tag and appVersion updated to `v0.8.0`
+
+### Documentation
+
+- Consolidated HashiCorp Vault setup guide in `docs/vault.md`
+- Documented vault-referenced key shape (`vault: "<name>"`) in `docs/node-config.md`, with schema, naming guidance, and a validator example
+
 ## [0.4.7] - 2026-04-21
 
 appVersion: `v0.5.2`

@@ -345,31 +345,6 @@ impl PipelineContext {
         self.states.push_back(state);
         self.blocks.push_back(block);
     }
-    pub fn states(&self) -> &VecDeque<Arc<ShardStateStuff>> {
-        &self.states
-    }
-    pub fn states_with_blocks(&self) -> impl Iterator<Item = (&Arc<ShardStateStuff>, &Block)> {
-        self.states.iter().zip(self.blocks.iter())
-    }
-    pub fn try_get_state(&self, id: &BlockIdExt) -> Option<Arc<ShardStateStuff>> {
-        for s in &self.states {
-            if s.block_id() == id {
-                return Some(s.clone());
-            }
-        }
-        None
-    }
-    #[cfg(feature = "xp25")]
-    pub fn get_prev_for(&self, id: &BlockIdExt) -> Option<Vec<BlockIdExt>> {
-        for i in 0..self.states.len() {
-            if self.states[i].block_id() == id {
-                if let Ok(info) = self.blocks[i].read_info() {
-                    return info.read_prev_ids().ok();
-                }
-            }
-        }
-        None
-    }
     pub fn is_empty(&self) -> bool {
         self.blocks.is_empty()
     }
@@ -594,10 +569,15 @@ impl ValidatorGroupImpl {
             .map(validatordescr_to_session_node)
             .collect::<Result<_>>()?;
 
+        let block_sync_params_with_identity = g
+            .block_sync_overlay_params
+            .clone()
+            .map(|p| p.with_identity(g.shard.clone(), g.session_id.clone()));
         let overlay_manager: ConsensusOverlayManagerPtr =
             Arc::new(ConsensusOverlayManagerImpl::new(
                 g.engine.validator_network(),
                 g.validator_list_id.clone(),
+                block_sync_params_with_identity,
             ));
 
         let db_root = format!("{}/catchains", g.engine.db_root_dir()?);
@@ -824,6 +804,9 @@ pub struct ValidatorGroup {
     accepted_mc_block_tx: tokio::sync::watch::Sender<Option<BlockIdExt>>,
     /// Set by the validation queue on prolonged inactivity, cleared on any action.
     pub stalled: Arc<AtomicBool>,
+    /// Block-sync overlay membership and authorization; `Some` only when this shard has
+    /// `simplex_config_v2.enable_observers=true`
+    block_sync_overlay_params: Option<consensus_common::BlockSyncOverlayParams>,
 }
 
 impl ResolverBackend for ValidatorGroup {
@@ -876,6 +859,7 @@ impl ValidatorGroup {
         consensus_options: ConsensusOptions,
         engine: Arc<dyn EngineOperations>,
         allow_unsafe_self_blocks_resync: bool,
+        block_sync_overlay_params: Option<consensus_common::BlockSyncOverlayParams>,
     ) -> Self {
         let consensus_type = consensus_options.consensus_type();
         let is_accelerated = consensus_options.is_accelerated_consensus_enabled();
@@ -922,6 +906,7 @@ impl ValidatorGroup {
             accepted_mc_seqno_tx,
             accepted_mc_block_tx,
             stalled: Arc::new(AtomicBool::new(false)),
+            block_sync_overlay_params,
         }
     }
 
@@ -1228,11 +1213,52 @@ impl ValidatorGroup {
             flags.body_present,
         );
 
+        // Pre-BlockSync the handle was written implicitly by
+        // `run_validate_query_any_candidate` -> `store_validated_block`, but only
+        // when this node actually validated the candidate. With the block-sync
+        // overlay carrying candidate bodies, simplex may receive a body it does
+        // not validate (consensus quorum already reached)
+        let block = if flags.body_present {
+            let block_bytes = data.data().to_vec();
+            match crate::block::BlockStuff::deserialize_block(
+                block_id.clone(),
+                std::sync::Arc::new(block_bytes),
+            ) {
+                Ok(block_stuff) => {
+                    if let Err(e) = self.engine.store_block(&block_stuff).await {
+                        log::debug!(
+                            target: "simplex_resolver",
+                            "on_candidate_observed: store_block failed (non-fatal) for {}: {}",
+                            block_id, e
+                        );
+                    } else {
+                        log::trace!(
+                            target: "simplex_resolver",
+                            "on_candidate_observed: stored block handle eagerly for {}",
+                            block_id
+                        );
+                    }
+                    block_stuff.block().ok().cloned()
+                }
+                Err(e) => {
+                    log::warn!(
+                        target: "simplex_resolver",
+                        "on_candidate_observed: deserialize_block failed for {}: {}",
+                        block_id, e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         self.state_resolver_cache.lock().await.upsert_observed_candidate(
             block_id,
             data,
             collated_data,
             flags,
+            block,
         );
     }
 
@@ -1440,8 +1466,6 @@ impl ValidatorGroup {
         let request_clone = request.clone();
         let cc_seqno = self.general_session_info.catchain_seqno;
         let is_masterchain = self.shard.is_masterchain();
-        let collate_pipeline_context =
-            if is_simplex { PipelineContext::new() } else { pipeline_context.clone() };
 
         let collation_task = tokio::spawn(async move {
             log::info!(
@@ -1477,7 +1501,6 @@ impl ValidatorGroup {
                                 min_ts,
                                 mc.seq_no,
                                 &prev_block_ids,
-                                collate_pipeline_context,
                                 state_resolver_cache.clone(),
                                 local_key,
                                 validator_set.clone(),
@@ -1573,6 +1596,7 @@ impl ValidatorGroup {
                                     parent_ready: true,
                                     local_collated: true,
                                 },
+                                Some(new_block.clone()),
                             );
                             cache.store_validated_state(&candidate_for_cache.id, new_state);
                         }
@@ -1685,18 +1709,16 @@ impl ValidatorGroup {
         let cc_seqno = self.general_session_info.catchain_seqno;
         let is_masterchain = self.shard.is_masterchain();
         let is_simplex = matches!(self.consensus_options, ConsensusOptions::Simplex(_));
-        let (expected_current_round, prev_block_ids, pipeline_context, mc_block_id_opt, min_ts) =
-            group_impl
-                .execute_sync(|group_impl| {
-                    (
-                        group_impl.expected_current_round,
-                        group_impl.prev_block_ids.clone(),
-                        group_impl.pipeline_context.clone(), //TODO: optimize
-                        group_impl.min_masterchain_block_id.clone(),
-                        group_impl.min_ts,
-                    )
-                })
-                .await;
+        let (expected_current_round, prev_block_ids, mc_block_id_opt, min_ts) = group_impl
+            .execute_sync(|group_impl| {
+                (
+                    group_impl.expected_current_round,
+                    group_impl.prev_block_ids.clone(),
+                    group_impl.min_masterchain_block_id.clone(),
+                    group_impl.min_ts,
+                )
+            })
+            .await;
         let accepted_mc_block_rx = self.accepted_mc_block_tx.subscribe();
 
         let validation_task = tokio::spawn(async move {
@@ -1786,7 +1808,6 @@ impl ValidatorGroup {
                     let validation_completion_time = run_validate_query_any_candidate(
                         candidate.clone(),
                         engine.clone(),
-                        pipeline_context,
                         state_resolver_cache.clone(),
                         is_simplex,
                     )
@@ -2197,11 +2218,10 @@ impl ValidatorGroup {
             return;
         }
 
-        self.state_resolver_cache.lock().await.prune_finalized(&block_id);
-
         // Important: do not block ValidationAction queue on out-of-order acceptance.
         // This path can involve downloads/apply and must run in detached task.
         let engine = self.engine.clone();
+        let state_resolver_cache = self.state_resolver_cache.clone();
         let validator_set = self.validator_set.clone();
         let group_impl = self.group_impl.clone();
         let accepted_mc_seqno_tx = self.accepted_mc_seqno_tx.clone();
@@ -2311,6 +2331,10 @@ impl ValidatorGroup {
                         "ValidatorGroup::on_block_finalized: \
                         accepted block_id={block_id} source={source_id} round={round}"
                     );
+
+                    // Prune only after apply, so the finalized block's state is in
+                    // the DB and can serve as the engine anchor for subsequent blocks.
+                    state_resolver_cache.lock().await.prune_finalized(&block_id);
 
                     let (accepted_mc_seqno, accepted_mc_block_id) = group_impl
                         .execute_sync(|group_impl| {

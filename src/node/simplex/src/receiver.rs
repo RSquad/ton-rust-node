@@ -95,7 +95,7 @@ use ton_api::{
         pub_::publickey::Overlay,
         rpc::consensus::simplex::RequestCandidate,
     },
-    IntoBoxed,
+    Constructor, IntoBoxed,
 };
 use ton_block::{base64_encode, error, fail, KeyId, Result, ShardIdent, UInt256};
 
@@ -191,6 +191,8 @@ pub(crate) struct ReceiverSettings {
     pub max_leader_window_desync: u32,
     /// Use QUIC overlay transport for this session (else ADNL UDP).
     pub use_quic: bool,
+    /// enable the dedicated block-sync overlay for candidate broadcasts.
+    pub enable_observers: bool,
     /// `requestCandidate` retry pacing and rate-limit configuration.
     pub candidate_resolve_config: CandidateResolveConfig,
     /// Label set attached to per-session metrics republished to the global
@@ -217,6 +219,7 @@ impl ReceiverSettings {
             slots_per_leader_window: options.slots_per_leader_window,
             max_leader_window_desync: options.max_leader_window_desync,
             use_quic: options.use_quic,
+            enable_observers: options.enable_observers,
             candidate_resolve_config: CandidateResolveConfig::from_session_options(options),
             prometheus_labels: options.prometheus_labels,
         }
@@ -4123,6 +4126,17 @@ impl Drop for ReceiverImpl {
     }
 }
 
+/// TL constructor sniff (first 4 bytes) to detect a candidate-data broadcast
+fn is_candidate_payload(data: &BlockPayloadPtr) -> bool {
+    let bytes = data.data();
+    if bytes.len() < 4 {
+        return false;
+    }
+    let tag = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    tag == ton_api::ton::consensus::candidatedata::Block::constructor_const()
+        || tag == ton_api::ton::consensus::candidatedata::Empty::constructor_const()
+}
+
 /*
     OverlayListenerImpl - implementation of CatchainOverlayListener
 */
@@ -4137,6 +4151,11 @@ struct OverlayListenerImpl {
     in_messages_count: metrics::Counter,
     in_broadcasts_count: metrics::Counter,
     in_queries_count: metrics::Counter,
+    /// When true, candidate broadcasts on the consensus private overlay are dropped
+    /// (block-sync overlay carries candidates exclusively)
+    enable_observers: bool,
+    /// Counter for dropped candidate broadcasts on the consensus overlay
+    in_broadcasts_dropped_observers: metrics::Counter,
 }
 
 impl ConsensusOverlayLogReplayListener for OverlayListenerImpl {
@@ -4175,12 +4194,32 @@ impl ConsensusOverlayListener for OverlayListenerImpl {
         }));
     }
 
-    fn on_broadcast(&self, source_key_hash: PublicKeyHash, data: &BlockPayloadPtr) {
+    fn on_broadcast(
+        &self,
+        source_key_hash: PublicKeyHash,
+        data: &BlockPayloadPtr,
+        source: consensus_common::BroadcastSource,
+    ) {
         instrument!();
 
         self.in_broadcasts_count.increment(1);
         self.in_broadcasts_bytes.increment(data.data().len() as u64);
         self.in_bytes.increment(data.data().len() as u64);
+
+        // Drop candidates on the consensus overlay when block-sync is the canonical path
+        // (C++ ref: `private-overlay.cpp` early-return when `enable_observers`)
+        if self.enable_observers
+            && source == consensus_common::BroadcastSource::ConsensusOverlay
+            && is_candidate_payload(data)
+        {
+            self.in_broadcasts_dropped_observers.increment(1);
+            log::warn!(
+                "SimplexReceiver {}: dropping candidate broadcast from {} on consensus overlay",
+                self.session_id.to_hex_string(),
+                key_to_base64(&source_key_hash),
+            );
+            return;
+        }
 
         let source_key_hash = source_key_hash.clone();
         let data = data.clone();
@@ -4191,10 +4230,11 @@ impl ConsensusOverlayListener for OverlayListenerImpl {
                 .unwrap_or_else(|_| Duration::new(0, 0))
                 .as_millis();
             log::trace!(
-                "SimplexReceiver {}: on_broadcast, size={}, source={}, timestamp={}",
+                "SimplexReceiver {}: on_broadcast, size={}, source={}, overlay={:?}, timestamp={}",
                 self.session_id.to_hex_string(),
                 data.data().len(),
                 key_to_base64(&source_key_hash),
+                source,
                 elapsed
             );
         }
@@ -4437,6 +4477,7 @@ impl ReceiverWrapper {
             slots_per_leader_window,
             max_leader_window_desync,
             use_quic,
+            enable_observers,
             candidate_resolve_config,
             prometheus_labels,
         } = settings;
@@ -4454,10 +4495,12 @@ impl ReceiverWrapper {
         let (overlay_id, overlay_short_id) = Self::compute_overlay_id(&session_id, ids)?;
 
         log::info!(
-            "SimplexReceiver {}: overlay_id={}, overlay_short_id={}",
+            "SimplexReceiver {}: overlay_id={}, overlay_short_id={}, quic={}, blocksync_overlay={}",
             session_id.to_hex_string(),
             overlay_id.to_hex_string(),
-            overlay_short_id
+            overlay_short_id,
+            use_quic,
+            enable_observers,
         );
 
         // Create task queues
@@ -4496,6 +4539,9 @@ impl ReceiverWrapper {
             metrics_receiver.sink().register_counter(&"simplex_receiver_in_queries_count".into());
 
         // Create overlay listener
+        let in_broadcasts_dropped_observers = metrics_receiver
+            .sink()
+            .register_counter(&"simplex_receiver_in_broadcasts_dropped_observers".into());
         let overlay_listener = Arc::new(OverlayListenerImpl {
             session_id: session_id.clone(),
             task_queues: task_queues.clone(),
@@ -4506,6 +4552,8 @@ impl ReceiverWrapper {
             in_messages_count,
             in_broadcasts_count,
             in_queries_count,
+            enable_observers,
+            in_broadcasts_dropped_observers,
         });
 
         let overlay_data_listener: Arc<dyn ConsensusOverlayListener + Send + Sync> =
@@ -4525,6 +4573,8 @@ impl ReceiverWrapper {
         } else {
             consensus_common::OverlayTransportType::Simplex
         };
+        // Block-sync overlay params (including overlay_id) live on the
+        // validator-side ConsensusOverlayManagerImpl; simplex passes None.
         let overlay = overlay_manager.start_overlay(
             local_key,
             &overlay_short_id,
@@ -4532,6 +4582,7 @@ impl ReceiverWrapper {
             Arc::downgrade(&overlay_data_listener),
             Arc::downgrade(&overlay_replay_listener),
             transport_type,
+            None,
         )?;
 
         // Find local index
@@ -4889,6 +4940,13 @@ impl ReceiverWrapper {
         Ok(Arc::new(wrapper))
     }
 
+    /// Compute block-sync overlay short id from `session_id`
+    /// (C++ `block-sync-overlay.cpp:48-50`; seed excludes the node list,
+    /// so the short id differs from the consensus overlay's)
+    fn compute_block_sync_overlay_short_id(session_id: &SessionId) -> Result<PublicKeyHash> {
+        crate::utils::compute_block_sync_overlay_short_id(session_id)
+    }
+
     /// Compute overlay ID matching C++ consensus.overlayId
     ///
     /// CRITICAL: Must match C++ implementation exactly.
@@ -4941,3 +4999,74 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/test_slot_bounds.rs"]
 mod slot_bounds_tests;
+
+#[cfg(test)]
+mod payload_classifier_tests {
+    //! `is_candidate_payload` must match `consensus.block` / `consensus.empty` only;
+    //! other consensus TL (votes, certs) and truncated payloads must not match
+
+    use super::*;
+    use consensus_common::ConsensusCommonFactory;
+    use ton_api::ton::consensus::{
+        broadcastextra::BroadcastExtra,
+        candidatedata::{Block as ConsensusBlock, Empty as ConsensusEmpty},
+    };
+
+    fn serialize<T: ton_api::BareSerialize + ton_api::IntoBoxed>(obj: T) -> Vec<u8>
+    where
+        <T as ton_api::IntoBoxed>::Boxed: ton_api::BoxedSerialize,
+    {
+        ton_api::serialize_boxed(&obj.into_boxed()).unwrap()
+    }
+
+    #[test]
+    fn consensus_block_is_candidate() {
+        let block: ConsensusBlock = Default::default();
+        let bytes = serialize(block);
+        let payload = ConsensusCommonFactory::create_block_payload(bytes);
+        assert!(
+            is_candidate_payload(&payload),
+            "consensus.block must be classified as a candidate"
+        );
+    }
+
+    #[test]
+    fn consensus_empty_is_candidate() {
+        let empty: ConsensusEmpty = Default::default();
+        let bytes = serialize(empty);
+        let payload = ConsensusCommonFactory::create_block_payload(bytes);
+        assert!(
+            is_candidate_payload(&payload),
+            "consensus.empty must be classified as a candidate"
+        );
+    }
+
+    #[test]
+    fn broadcast_extra_is_not_candidate() {
+        // broadcastExtra is the envelope, not a candidate
+        let extra: BroadcastExtra = Default::default();
+        let bytes = serialize(extra);
+        let payload = ConsensusCommonFactory::create_block_payload(bytes);
+        assert!(!is_candidate_payload(&payload));
+    }
+
+    #[test]
+    fn empty_payload_is_not_candidate() {
+        let payload = ConsensusCommonFactory::create_block_payload(Vec::new());
+        assert!(!is_candidate_payload(&payload));
+    }
+
+    #[test]
+    fn truncated_payload_is_not_candidate() {
+        // Less than 4 bytes => no constructor tag to read
+        let payload = ConsensusCommonFactory::create_block_payload(vec![0x12, 0x22, 0x79]);
+        assert!(!is_candidate_payload(&payload));
+    }
+
+    #[test]
+    fn random_4_bytes_is_not_candidate() {
+        // Some random 4-byte tag that isn't either constructor
+        let payload = ConsensusCommonFactory::create_block_payload(vec![0xde, 0xad, 0xbe, 0xef]);
+        assert!(!is_candidate_payload(&payload));
+    }
+}

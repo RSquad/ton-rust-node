@@ -191,7 +191,7 @@ impl TransactionExecutor for TickTockTransactionExecutor {
             }
         };
 
-        log::debug!(target: "executor", "Desciption.aborted {}", description.aborted);
+        log::debug!(target: "executor", "Description.aborted {}", description.aborted);
         tr.set_end_status(account.status());
         account.set_balance(acc_balance);
         if description.aborted {

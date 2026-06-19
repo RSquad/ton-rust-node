@@ -1223,6 +1223,7 @@ fn test_serialize_new_consensus_config_all_includes_new_timing_fields() {
                 no_empty_blocks_on_error_timeout_ms: 21_000,
                 ..Default::default()
             },
+            ..Default::default()
         }),
         shard: Some(SimplexConfig {
             use_quic: false,
@@ -1232,6 +1233,7 @@ fn test_serialize_new_consensus_config_all_includes_new_timing_fields() {
                 no_empty_blocks_on_error_timeout_ms: 22_000,
                 ..Default::default()
             },
+            ..Default::default()
         }),
     };
 

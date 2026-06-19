@@ -17,8 +17,8 @@ use ton_assembler::compile_code_to_cell;
 use ton_block::{
     AccStatusChange, AccountStatus, AnycastInfo, Coins, CurrencyCollection, InternalMessageHeader,
     Message, MsgAddressInt, MsgAddressIntOrNone, Serializable, SliceData, StorageUsed,
-    TrBouncePhase, TrBouncePhase::Nofunds, TrBouncePhaseNofunds, TrBouncePhaseOk,
-    SENDMSG_BOUNCE_IF_FAIL, SENDMSG_ORDINARY,
+    TrBouncePhase, TrBouncePhase::Nofunds, TrBouncePhaseNofunds, TrBouncePhaseOk, TransactionDescr,
+    SENDMSG_BOUNCE_IF_FAIL, SENDMSG_ORDINARY, SENDMSG_REMAINING_MSG_BALANCE,
 };
 
 #[test]
@@ -179,6 +179,64 @@ fn test_action_phase_failed_with_flag_16() {
     message.set_body(SliceData::load_builder(builder).unwrap());
     good_trans.add_out_message(&message).unwrap();
     compare_transaction(&trans, &good_trans);
+}
+
+#[test]
+fn test_action_bounce_uses_pre_action_message_balance_in_v14() {
+    let code = compile_code_to_cell(&format!(
+        "
+        ACCEPT
+        PUSHROOT
+        CTOS
+        LDREF
+        PLDREF
+        PUSHINT {SENDMSG_REMAINING_MSG_BALANCE} ; carry remaining inbound message balance and clear it
+        SENDRAWMSG
+        PUSHINT {SENDMSG_BOUNCE_IF_FAIL} ; bounce if action failed
+        SENDRAWMSG
+    ",
+    ))
+    .unwrap();
+    let data = create_two_messages_data();
+    let msg_income = 150_000_000;
+    let start_balance = 100_000_000;
+
+    let execute_with_version = |version| {
+        let acc_id = SENDER_ACCOUNT.clone();
+        let mut acc =
+            create_test_account(start_balance, acc_id.clone(), code.clone(), data.clone());
+        acc.set_last_paid(BLOCK_UT - 100);
+        let acc_before = acc.clone();
+        let msg = create_int_msg(THIRD_ACCOUNT.clone(), acc_id, msg_income, true, PREV_BLOCK_LT);
+        let params = execute_params(BLOCK_LT + 1);
+        let trans = try_replay_transaction(
+            &mut acc,
+            Some(&msg),
+            custom_config(Some(version), None),
+            &params,
+        )
+        .unwrap();
+        check_account_and_transaction_balances(&acc_before, &acc, &msg, Some(&trans));
+        trans
+    };
+
+    let legacy_trans = execute_with_version(13);
+    let TransactionDescr::Ordinary(legacy_descr) = legacy_trans.read_description().unwrap() else {
+        panic!("ordinary description expected");
+    };
+    assert_eq!(legacy_trans.out_msgs.len().unwrap(), 0);
+    assert!(matches!(legacy_descr.bounce, Some(TrBouncePhase::Nofunds(_))));
+
+    let v14_trans = execute_with_version(14);
+    let TransactionDescr::Ordinary(v14_descr) = v14_trans.read_description().unwrap() else {
+        panic!("ordinary description expected");
+    };
+    assert_eq!(v14_trans.out_msgs.len().unwrap(), 1);
+    assert!(matches!(v14_descr.bounce, Some(TrBouncePhase::Ok(_))));
+
+    let bounce_msg = v14_trans.get_out_msg(0).unwrap().expect("bounce message expected");
+    assert!(bounce_msg.int_header().unwrap().bounced);
+    assert_eq!(bounce_msg.int_header().unwrap().value.coins.as_u128(), 126_770_000);
 }
 
 #[test]

@@ -16,7 +16,7 @@ command: []
 ##
 image:
   repository: ghcr.io/rsquad/ton-rust-node/node
-  tag: v0.5.2
+  tag: v0.8.0
   pullPolicy: IfNotPresent
 
 ## @param imagePullSecrets [array] Image pull secrets for private registries

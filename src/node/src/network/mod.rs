@@ -33,6 +33,7 @@ use ton_api::{
             broadcast::{
                 BlockBroadcast, BlockBroadcastCompressed, BlockBroadcastCompressedV2,
                 NewBlockCandidateBroadcast, NewBlockCandidateBroadcastCompressed,
+                NewBlockCandidateBroadcastCompressedV2,
             },
             signature_set::signatureset::{Ordinary as TlOrdinary, Simplex as TlSimplex},
             SignatureSet,
@@ -327,6 +328,34 @@ fn build_block_candidate_broadcast_compressed(
         collator_signature: BlockSignature { who: UInt256::ZERO, signature: vec![] },
         compressed,
     })
+}
+
+/// Decompress V2 candidate broadcast. Mirrors C++
+/// `deserialize_block_candidate_broadcast(tonNode_newBlockCandidateBroadcastCompressedV2&)`
+/// in `full-node-serializer.cpp`: the compressed payload carries a leading
+/// algorithm byte (handled by `boc_decompress`), unlike V1 which is plain LZ4.
+pub(crate) fn decompress_and_check_candidate_data_v2(
+    broadcast: &NewBlockCandidateBroadcastCompressedV2,
+) -> Result<Vec<u8>> {
+    if broadcast.compressed.len() > MAX_COMPRESSED_SIZE {
+        fail!("Invalid BlockCandidateBroadcastCompressedV2: compressed size exceeds limit");
+    }
+
+    let mut roots = boc_decompress(&broadcast.compressed, MAX_COMPRESSED_SIZE)?;
+    if roots.len() != 1 {
+        fail!("Invalid BlockCandidateBroadcastCompressedV2: expected 1 root, got {}", roots.len());
+    }
+    let block_root = roots.remove(0);
+    if *broadcast.id.root_hash() != *block_root.repr_hash() {
+        fail!("Invalid BlockCandidateBroadcastCompressedV2: root hash mismatch");
+    }
+
+    let mut canonical_boc = Vec::new();
+    BocWriter::with_flags([block_root], BocFlags::all())?.write(&mut canonical_boc)?;
+    if canonical_boc.len() > MAX_BLOCK_SIZE {
+        fail!("Invalid BlockCandidateBroadcastCompressedV2: decompressed size exceeds limit");
+    }
+    Ok(canonical_boc)
 }
 
 fn decompress_and_check_candidate_data(

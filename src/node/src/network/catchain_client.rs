@@ -89,7 +89,13 @@ impl CatchainClient {
             overlay_id,
             runtime: Some(runtime_handle.clone()),
         };
-        network_context.stack.overlay.add_private_overlay(params, local_adnl_key, &peers, false)?;
+        network_context.stack.overlay.add_private_overlay(
+            params,
+            local_adnl_key,
+            &peers,
+            false,
+            None,
+        )?;
         let consumer = Arc::new(CatchainClientConsumer::new(overlay_id.clone(), catchain_listener));
         network_context.stack.overlay.add_consumer(overlay_id, consumer.clone())?;
 
@@ -298,6 +304,7 @@ impl CatchainClient {
                         listener.on_broadcast(
                             message.recv_from,
                             &catchain::CatchainFactory::create_block_payload(message.data),
+                            consensus_common::BroadcastSource::ConsensusOverlay,
                         ); // Test id!
                     }
                 }
